@@ -1,0 +1,38 @@
+# immich-auto-dumper — configuration
+# Copiez ce fichier en config.conf et remplissez les valeurs,
+# ou utilisez : immich-auto-dumper setup
+
+# --- Immich ---
+IMMICH_UPLOAD_LOCATION="/path/to/immich/library"   # Chemin hôte vers UPLOAD_LOCATION
+IMMICH_DB_CONTAINER="immich_postgres"
+IMMICH_SERVER_CONTAINER="immich_server"
+IMMICH_DB_NAME="immich"
+IMMICH_DB_USER="postgres"
+IMMICH_API_URL="http://localhost:2283"
+IMMICH_API_KEY=""
+
+# --- Stockage externe ---
+# Chemin hôte du stockage externe, monté dans le conteneur immich_server.
+ARCHIVE_DEST_PATH="/mnt/external"
+# Même chemin vu depuis le conteneur Docker.
+ARCHIVE_CONTAINER_PATH="/external"
+# Les backups BDD seront dans : $ARCHIVE_DEST_PATH/.immich-backup/
+# Les photos archivées :        $ARCHIVE_DEST_PATH/<NomUtilisateur>/YYYY/MM/...
+
+# --- Archivage photos ---
+ARCHIVE_THRESHOLD_HIGH=60          # % d'utilisation déclenchant l'archivage
+ARCHIVE_THRESHOLD_LOW=40           # % cible après archivage
+
+# --- Backup BDD ---
+BACKUP_RETENTION=14                # Nombre de fichiers backup à conserver
+
+# --- Correspondance userID/storage_label → nom de dossier sur le stockage externe ---
+# Générée automatiquement par "setup", modifiable manuellement.
+# Format : USER_MAP["storage_label_ou_uuid"]="NomDossier"
+declare -A USER_MAP
+# USER_MAP["alice"]="Alice"
+# USER_MAP["bob"]="Bob"
+
+# --- Logs ---
+LOG_DIR="/var/log/immich-auto-dumper"
+LOG_MAX_LINES=1000

@@ -1,0 +1,5 @@
+# immich-auto-dumper — archivage automatique (quotidien à 2h)
+0 2 * * * /usr/local/bin/immich-auto-dumper dump_now >> /var/log/immich-auto-dumper/cron.log 2>&1
+
+# immich-auto-dumper — copie des backups BDD (hebdomadaire, dimanche à 3h)
+0 3 * * 0 /usr/local/bin/immich-auto-dumper sync_now >> /var/log/immich-auto-dumper/cron.log 2>&1
