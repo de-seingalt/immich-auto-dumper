@@ -3,6 +3,9 @@ set -euo pipefail
 
 readonly LOCK_FILE="/tmp/immich-auto-dumper.lock"
 
+# Global docker command determined by detect_docker_cmd.
+DOCKER_CMD=""
+
 # ── Logging ──────────────────────────────────────────────────────────────────
 
 _log() {
@@ -25,7 +28,6 @@ _log() {
     esac
   fi
 
-  # LOG_DIR peut venir de config.conf, évalué à l'appel et non à la source.
   local log_file="${LOG_DIR:-/var/log/immich-auto-dumper}/immich-auto-dumper.log"
   mkdir -p "$(dirname "$log_file")"
   printf '%s\n' "$line" >> "$log_file"
@@ -45,25 +47,40 @@ log_info()  { _log INFO  "$1"; }
 log_warn()  { _log WARN  "$1"; }
 log_error() { _log ERROR "$1"; }
 
-# ── Prérequis ─────────────────────────────────────────────────────────────────
+# ── Prerequisites ─────────────────────────────────────────────────────────────
+
+# Detect whether docker runs without privileges and set DOCKER_CMD accordingly.
+detect_docker_cmd() {
+  if docker ps &>/dev/null; then
+    DOCKER_CMD="docker"
+  elif sudo docker ps &>/dev/null; then
+    DOCKER_CMD="sudo docker"
+  else
+    log_error "Cannot run docker. Add yourself to the docker group: sudo usermod -aG docker \$USER (then re-login)."
+    exit 1
+  fi
+}
 
 check_prereqs() {
+  detect_docker_cmd
+
   local missing=()
-  for cmd in docker jq bc curl; do
+  for cmd in jq bc curl; do
     if ! command -v "$cmd" &>/dev/null; then
       missing+=("$cmd")
     fi
   done
 
   if (( ${#missing[@]} > 0 )); then
-    log_error "Dépendances manquantes : ${missing[*]}"
-    log_error "Installez-les avant de continuer."
+    log_error "Missing dependencies: ${missing[*]}"
+    log_error "Install them before continuing."
     exit 1
   fi
 }
 
-# ── Stockage externe ───────────────────────────────────────────────────────────
+# ── External storage ──────────────────────────────────────────────────────────
 
+# Returns 0 if ARCHIVE_DEST_PATH is an active mount point, 1 otherwise.
 check_archive_dest_mounted() {
   if mountpoint -q "$ARCHIVE_DEST_PATH"; then
     return 0
@@ -71,7 +88,7 @@ check_archive_dest_mounted() {
   return 1
 }
 
-# ── Disque ────────────────────────────────────────────────────────────────────
+# ── Disk ──────────────────────────────────────────────────────────────────────
 
 disk_usage_percent() {
   local path="$1"
@@ -81,13 +98,13 @@ disk_usage_percent() {
 bytes_to_human() {
   local bytes="$1"
   if (( bytes < 1024 )); then
-    printf '%d o\n' "$bytes"
+    printf '%d B\n' "$bytes"
   elif (( bytes < 1048576 )); then
-    printf '%.1f Ko\n' "$(echo "scale=1; $bytes / 1024" | bc)"
+    printf '%.1f KB\n' "$(echo "scale=1; $bytes / 1024" | bc)"
   elif (( bytes < 1073741824 )); then
-    printf '%.1f Mo\n' "$(echo "scale=1; $bytes / 1048576" | bc)"
+    printf '%.1f MB\n' "$(echo "scale=1; $bytes / 1048576" | bc)"
   else
-    printf '%.2f Go\n' "$(echo "scale=2; $bytes / 1073741824" | bc)"
+    printf '%.2f GB\n' "$(echo "scale=2; $bytes / 1073741824" | bc)"
   fi
 }
 
@@ -98,11 +115,11 @@ acquire_lock() {
     local pid
     pid=$(cat "$LOCK_FILE")
     if kill -0 "$pid" 2>/dev/null; then
-      log_warn "Une opération est déjà en cours (PID $pid)."
+      log_warn "Another operation is already running (PID $pid)."
       return 1
     fi
-    # PID mort : lock orphelin, on le nettoie
-    log_warn "Lock orphelin trouvé (PID $pid), nettoyage."
+    # Stale lock — clean it up
+    log_warn "Stale lock found (PID $pid), removing."
     rm -f "$LOCK_FILE"
   fi
 

@@ -18,15 +18,20 @@ fi
 
 _usage() {
   cat <<'EOF'
-Usage: immich-auto-dumper <commande>
+Usage: immich-auto-dumper <command> [--dry-run]
 
-Commandes :
-  setup     Configuration assistée (création ou mise à jour de config.conf)
-  status    État du service, espace disque, dernières opérations
-  start     Active les crons
-  stop      Désactive les crons, attend la fin de l'opération en cours
-  dump_now  Force un archivage immédiat jusqu'au seuil bas
-  sync_now  Force une copie immédiate des backups BDD vers le stockage externe
+Commands:
+  setup      Interactive configuration wizard (creates or updates config.conf)
+  status     Show service status, disk usage, and last operations
+  start      Enable cron jobs
+  stop       Disable cron jobs and wait for any running operation to finish
+  dump_now   Force an immediate archive run until the low threshold is reached
+  sync_now   Force an immediate copy of DB backups to external storage
+  test_run   Simulate dump_now + sync_now without making any changes (implies --dry-run)
+
+Flags:
+  --dry-run  Suppress all destructive operations (cp, rm, DB UPDATE).
+             Compatible with dump_now and sync_now.
 EOF
 }
 
@@ -44,7 +49,7 @@ _ask() {
 
 _require_config() {
   if [[ ! -f "$CONFIG_FILE" ]]; then
-    printf 'Erreur : config.conf introuvable. Lancez : immich-auto-dumper setup\n' >&2
+    printf 'Error: config.conf not found. Run: immich-auto-dumper setup\n' >&2
     exit 1
   fi
 }
@@ -55,115 +60,153 @@ _setup() {
   echo "=== immich-auto-dumper — configuration ==="
   echo
 
+  # Detect docker command first; all DB queries below depend on it.
+  detect_docker_cmd
+
   local db_container="${IMMICH_DB_CONTAINER:-immich_postgres}"
   local server_container="${IMMICH_SERVER_CONTAINER:-immich_server}"
   local upload_location="${IMMICH_UPLOAD_LOCATION:-}"
   local db_name="${IMMICH_DB_NAME:-immich}"
   local db_user="${IMMICH_DB_USER:-postgres}"
-  local api_url="${IMMICH_API_URL:-http://localhost:2283}"
-  local api_key="${IMMICH_API_KEY:-}"
   local archive_dest="${ARCHIVE_DEST_PATH:-}"
   local archive_container_path="${ARCHIVE_CONTAINER_PATH:-}"
+  local db_library_prefix="${IMMICH_DB_LIBRARY_PREFIX:-}"
   local threshold_high="${ARCHIVE_THRESHOLD_HIGH:-60}"
   local threshold_low="${ARCHIVE_THRESHOLD_LOW:-40}"
   local backup_retention="${BACKUP_RETENTION:-14}"
   local log_dir="${LOG_DIR:-/var/log/immich-auto-dumper}"
   local log_max_lines="${LOG_MAX_LINES:-1000}"
 
-  # Détection des conteneurs Docker Immich actifs
+  # Auto-detect active Immich containers
   local detected
-  detected=$(docker ps --format '{{.Names}}' 2>/dev/null || true)
+  detected=$($DOCKER_CMD ps --format '{{.Names}}' 2>/dev/null || true)
   local d_db d_server
   d_db=$(printf '%s\n' "$detected" | grep -i 'postgres\|immich.*db\|db.*immich' | head -1 || true)
   d_server=$(printf '%s\n' "$detected" | grep -i 'immich.server\|immich-server' | head -1 || true)
   [[ -n "$d_db" ]] && db_container="$d_db"
   [[ -n "$d_server" ]] && server_container="$d_server"
 
-  echo "── Conteneurs Docker ──"
-  db_container=$(_ask    "Conteneur PostgreSQL"     "$db_container")
-  server_container=$(_ask "Conteneur immich_server" "$server_container")
+  echo "── Docker containers ──"
+  db_container=$(_ask    "PostgreSQL container"     "$db_container")
+  server_container=$(_ask "immich_server container" "$server_container")
 
   echo
-  echo "── Stockage Immich ──"
-  upload_location=$(_ask "IMMICH_UPLOAD_LOCATION (chemin hôte)" "$upload_location")
+  echo "── Immich storage ──"
+  upload_location=$(_ask "IMMICH_UPLOAD_LOCATION (host path)" "$upload_location")
 
   echo
-  echo "── Stockage externe ──"
-  archive_dest=$(_ask           "ARCHIVE_DEST_PATH (chemin hôte)"             "$archive_dest")
-  archive_container_path=$(_ask "ARCHIVE_CONTAINER_PATH (chemin dans le conteneur)" "$archive_container_path")
+  echo "── External storage ──"
+  archive_dest=$(_ask           "ARCHIVE_DEST_PATH (host path)"            "$archive_dest")
+  archive_container_path=$(_ask "ARCHIVE_CONTAINER_PATH (container path)"  "$archive_container_path")
 
   echo
-  echo "── API Immich ──"
-  api_url=$(_ask "IMMICH_API_URL" "$api_url")
-  api_key=$(_ask "IMMICH_API_KEY" "$api_key")
+  echo "── Library prefix detection ──"
+  # Try to auto-detect IMMICH_DB_LIBRARY_PREFIX from a sample asset path.
+  local detected_prefix=""
+  if $DOCKER_CMD exec -i "$db_container" psql \
+       -U "$db_user" -d "$db_name" -t -A -c "SELECT 1;" &>/dev/null 2>&1; then
+    local sample_path
+    sample_path=$($DOCKER_CMD exec -i "$db_container" psql \
+      -U "$db_user" -d "$db_name" -t -A \
+      -c "SELECT \"originalPath\" FROM \"asset\" LIMIT 1;" 2>/dev/null | head -1 || true)
+    if [[ -n "$sample_path" ]]; then
+      local candidate
+      candidate=$(printf '%s' "$sample_path" | sed 's|\(/[^/]*/library\)/.*|\1|')
+      [[ "$candidate" != "$sample_path" ]] && detected_prefix="$candidate"
+    fi
+  fi
+
+  if [[ -n "$detected_prefix" ]]; then
+    printf 'Auto-detected: %s\n' "$detected_prefix"
+    [[ -z "$db_library_prefix" ]] && db_library_prefix="$detected_prefix"
+  else
+    printf 'Could not auto-detect (DB unreachable or no assets yet).\n'
+    [[ -z "$db_library_prefix" ]] && db_library_prefix="/data/library"
+  fi
+  db_library_prefix=$(_ask "IMMICH_DB_LIBRARY_PREFIX" "$db_library_prefix")
 
   echo
-  echo "── Correspondance utilisateurs → dossiers ──"
+  echo "── User → folder mapping ──"
 
   declare -A new_user_map=()
 
-  if docker exec -i "$db_container" psql -U "$db_user" -d "$db_name" -t -A \
-       -c "SELECT 1;" &>/dev/null 2>&1; then
+  if $DOCKER_CMD exec -i "$db_container" psql \
+       -U "$db_user" -d "$db_name" -t -A -c "SELECT 1;" &>/dev/null 2>&1; then
     local users_raw
-    users_raw=$(docker exec -i "$db_container" psql \
+    users_raw=$($DOCKER_CMD exec -i "$db_container" psql \
       -U "$db_user" -d "$db_name" -t -A \
-      -c "SELECT id, name, storage_label FROM users ORDER BY created_at;" 2>/dev/null || true)
+      -c "SELECT \"id\", \"name\", \"storageLabel\" FROM \"user\" ORDER BY \"createdAt\";" \
+      2>/dev/null || true)
 
     if [[ -n "$users_raw" ]]; then
-      echo "Utilisateurs détectés :"
+      echo "Detected users:"
       while IFS='|' read -r uid name storage_label; do
         [[ -z "$uid" ]] && continue
         local key="${storage_label:-$uid}"
         local current_mapped="${USER_MAP["$key"]:-}"
         local default_folder="${current_mapped:-${storage_label:-$name}}"
-        printf '  %-36s  %s  (storage_label: %s)\n' "$uid" "$name" "${storage_label:-<vide>}"
+        printf '  %-36s  %s  (storageLabel: %s)\n' "$uid" "$name" "${storage_label:-<empty>}"
         local folder
-        folder=$(_ask "  Dossier pour \"$name\" (clé BDD: $key)" "$default_folder")
+        folder=$(_ask "  Folder for \"$name\" (DB key: $key)" "$default_folder")
         new_user_map["$key"]="$folder"
       done <<< "$users_raw"
     else
-      echo "Aucun utilisateur trouvé — USER_MAP laissée vide."
-      echo "Relancez 'setup' une fois Immich démarré pour la remplir."
+      echo "No users found — USER_MAP left empty."
+      echo "Re-run 'setup' once Immich is running to populate it."
     fi
   else
-    echo "Impossible de joindre la BDD — USER_MAP laissée vide."
-    echo "Relancez 'setup' une fois Immich démarré pour la remplir."
+    echo "Cannot reach DB — USER_MAP left empty."
+    echo "Re-run 'setup' once Immich is running to populate it."
   fi
 
   echo
-  echo "── Seuils d'archivage ──"
-  threshold_high=$(_ask "ARCHIVE_THRESHOLD_HIGH (% déclenchement)" "$threshold_high")
-  threshold_low=$(_ask  "ARCHIVE_THRESHOLD_LOW (% cible)"          "$threshold_low")
+  echo "── Archive thresholds ──"
+  threshold_high=$(_ask "ARCHIVE_THRESHOLD_HIGH (% trigger)" "$threshold_high")
+  threshold_low=$(_ask  "ARCHIVE_THRESHOLD_LOW  (% target)"  "$threshold_low")
 
   echo
-  echo "── Backup BDD ──"
-  backup_retention=$(_ask "BACKUP_RETENTION (fichiers à conserver)" "$backup_retention")
+  echo "── DB backup ──"
+  backup_retention=$(_ask "BACKUP_RETENTION (files to keep)" "$backup_retention")
 
   echo
   echo "── Logs ──"
   log_dir=$(_ask       "LOG_DIR"       "$log_dir")
   log_max_lines=$(_ask "LOG_MAX_LINES" "$log_max_lines")
 
+  # Schema check (non-blocking warning).
   echo
-  echo "── Récapitulatif ──"
-  printf '  %-26s = %s\n' \
-    IMMICH_DB_CONTAINER     "$db_container" \
-    IMMICH_SERVER_CONTAINER "$server_container" \
-    IMMICH_UPLOAD_LOCATION  "$upload_location" \
-    IMMICH_DB_NAME          "$db_name" \
-    IMMICH_DB_USER          "$db_user" \
-    IMMICH_API_URL          "$api_url" \
-    IMMICH_API_KEY          "${api_key:0:8}..." \
-    ARCHIVE_DEST_PATH       "$archive_dest" \
-    ARCHIVE_CONTAINER_PATH  "$archive_container_path" \
-    ARCHIVE_THRESHOLD_HIGH  "$threshold_high" \
-    ARCHIVE_THRESHOLD_LOW   "$threshold_low" \
-    BACKUP_RETENTION        "$backup_retention" \
-    LOG_DIR                 "$log_dir" \
-    LOG_MAX_LINES           "$log_max_lines"
+  IMMICH_DB_CONTAINER="$db_container"
+  IMMICH_DB_USER="$db_user"
+  IMMICH_DB_NAME="$db_name"
+  if $DOCKER_CMD exec -i "$db_container" psql \
+       -U "$db_user" -d "$db_name" -t -A -c "SELECT 1;" &>/dev/null 2>&1; then
+    if ! db_check_schema 2>/dev/null; then
+      echo "WARNING: Schema check failed — the Immich DB schema may have changed."
+      echo "         Review the script before using it against this Immich version."
+    else
+      echo "Schema check: OK"
+    fi
+  fi
+
+  echo
+  echo "── Summary ──"
+  printf '  %-28s = %s\n' \
+    IMMICH_DB_CONTAINER      "$db_container" \
+    IMMICH_SERVER_CONTAINER  "$server_container" \
+    IMMICH_UPLOAD_LOCATION   "$upload_location" \
+    IMMICH_DB_LIBRARY_PREFIX "$db_library_prefix" \
+    IMMICH_DB_NAME           "$db_name" \
+    IMMICH_DB_USER           "$db_user" \
+    ARCHIVE_DEST_PATH        "$archive_dest" \
+    ARCHIVE_CONTAINER_PATH   "$archive_container_path" \
+    ARCHIVE_THRESHOLD_HIGH   "$threshold_high" \
+    ARCHIVE_THRESHOLD_LOW    "$threshold_low" \
+    BACKUP_RETENTION         "$backup_retention" \
+    LOG_DIR                  "$log_dir" \
+    LOG_MAX_LINES            "$log_max_lines"
 
   if [[ ${#new_user_map[@]} -gt 0 ]]; then
-    echo "  USER_MAP :"
+    echo "  USER_MAP:"
     for k in "${!new_user_map[@]}"; do
       printf '    ["%s"] = "%s"\n' "$k" "${new_user_map[$k]}"
     done
@@ -171,9 +214,9 @@ _setup() {
 
   echo
   local confirm
-  confirm=$(_ask "Écrire config.conf ? [o/N]" "N")
-  if [[ "$confirm" != "o" && "$confirm" != "O" ]]; then
-    echo "Annulé."
+  confirm=$(_ask "Write config.conf? [y/N]" "N")
+  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+    echo "Cancelled."
     return 0
   fi
 
@@ -184,41 +227,40 @@ _setup() {
 
   cat > "$CONFIG_FILE" <<CONF
 # immich-auto-dumper — configuration
-# Généré le $(date '+%Y-%m-%d %H:%M:%S')
+# Generated on $(date '+%Y-%m-%d %H:%M:%S')
 
 # --- Immich ---
 IMMICH_UPLOAD_LOCATION="${upload_location}"
+IMMICH_DB_LIBRARY_PREFIX="${db_library_prefix}"
 IMMICH_DB_CONTAINER="${db_container}"
 IMMICH_SERVER_CONTAINER="${server_container}"
 IMMICH_DB_NAME="${db_name}"
 IMMICH_DB_USER="${db_user}"
-IMMICH_API_URL="${api_url}"
-IMMICH_API_KEY="${api_key}"
 
-# --- Stockage externe ---
+# --- External storage ---
 ARCHIVE_DEST_PATH="${archive_dest}"
 ARCHIVE_CONTAINER_PATH="${archive_container_path}"
 
-# --- Archivage photos ---
+# --- Archive thresholds ---
 ARCHIVE_THRESHOLD_HIGH=${threshold_high}
 ARCHIVE_THRESHOLD_LOW=${threshold_low}
 
-# --- Backup BDD ---
+# --- DB backup ---
 BACKUP_RETENTION=${backup_retention}
 
-# --- Correspondance userID/storage_label → nom de dossier ---
+# --- User → external folder mapping ---
 ${user_map_block}
 # --- Logs ---
 LOG_DIR="${log_dir}"
 LOG_MAX_LINES=${log_max_lines}
 CONF
 
-  echo "config.conf écrit."
+  echo "config.conf written."
   echo
 
   local install_cron
-  install_cron=$(_ask "Installer les crons ? [o/N]" "N")
-  if [[ "$install_cron" == "o" || "$install_cron" == "O" ]]; then
+  install_cron=$(_ask "Install cron jobs? [y/N]" "N")
+  if [[ "$install_cron" == "y" || "$install_cron" == "Y" ]]; then
     _start
   fi
 }
@@ -232,71 +274,71 @@ _status() {
   if [[ -d "$library_path" ]]; then
     local usage
     usage=$(disk_usage_percent "$library_path/")
-    printf 'Espace library/      : %s%% utilisé  [seuil haut: %s%% — seuil bas: %s%%]\n' \
+    printf 'Library space        : %s%% used  [high: %s%% — low: %s%%]\n' \
       "$usage" "${ARCHIVE_THRESHOLD_HIGH:-?}" "${ARCHIVE_THRESHOLD_LOW:-?}"
   else
-    printf 'Espace library/      : indisponible (%s absent)\n' "$library_path"
+    printf 'Library space        : unavailable (%s not found)\n' "$library_path"
   fi
 
   if check_archive_dest_mounted 2>/dev/null; then
-    printf 'Stockage externe     : monté  (%s)\n' "${ARCHIVE_DEST_PATH:-?}"
+    printf 'External storage     : mounted  (%s)\n' "${ARCHIVE_DEST_PATH:-?}"
   else
-    printf 'Stockage externe     : NON MONTÉ  (%s)\n' "${ARCHIVE_DEST_PATH:-?}"
+    printf 'External storage     : NOT MOUNTED  (%s)\n' "${ARCHIVE_DEST_PATH:-?}"
   fi
 
   local backup_dir="${ARCHIVE_DEST_PATH:-}/.immich-backup"
   if [[ -d "$backup_dir" ]]; then
     local n
     n=$(find "$backup_dir" -maxdepth 1 -type f | wc -l)
-    printf 'Backups BDD          : %s fichier(s) dans .immich-backup/\n' "$n"
+    printf 'DB backups           : %s file(s) in .immich-backup/\n' "$n"
   else
-    printf 'Backups BDD          : dossier .immich-backup/ absent\n'
+    printf 'DB backups           : .immich-backup/ directory absent\n'
   fi
 
-  local cron_status="inactifs"
+  local cron_status="disabled"
   if crontab -l 2>/dev/null | grep 'immich-auto-dumper' | grep -qv '^#' 2>/dev/null; then
-    cron_status="actifs"
+    cron_status="active"
   fi
-  printf 'Crons                : %s\n' "$cron_status"
+  printf 'Cron jobs            : %s\n' "$cron_status"
 
   local log_file="${LOG_DIR:-/var/log/immich-auto-dumper}/immich-auto-dumper.log"
   if [[ -f "$log_file" ]]; then
     local last_archive last_backup
-    last_archive=$(grep 'Archivage terminé' "$log_file" | tail -1 || true)
-    last_backup=$(grep 'Backup BDD :' "$log_file" | tail -1 || true)
+    last_archive=$(grep 'Archive complete' "$log_file" | tail -1 || true)
+    last_backup=$(grep 'DB backup:' "$log_file" | tail -1 || true)
 
     if [[ -n "$last_archive" ]]; then
       local ts detail
       ts=$(printf '%s' "$last_archive" | grep -oP '(?<=\[)[^\]]+' | head -1)
-      detail=$(printf '%s' "$last_archive" | sed 's/.*Archivage terminé\. //')
-      printf 'Dernière archive     : %s — %s\n' "$ts" "$detail"
+      detail=$(printf '%s' "$last_archive" | sed 's/.*Archive complete\. //')
+      printf 'Last archive         : %s — %s\n' "$ts" "$detail"
     else
-      printf 'Dernière archive     : aucune\n'
+      printf 'Last archive         : none\n'
     fi
 
     if [[ -n "$last_backup" ]]; then
       local ts2 detail2
       ts2=$(printf '%s' "$last_backup" | grep -oP '(?<=\[)[^\]]+' | head -1)
-      detail2=$(printf '%s' "$last_backup" | sed 's/.*Backup BDD : //')
-      printf 'Dernier backup BDD   : %s — %s\n' "$ts2" "$detail2"
+      detail2=$(printf '%s' "$last_backup" | sed 's/.*DB backup: //')
+      printf 'Last DB backup       : %s — %s\n' "$ts2" "$detail2"
     else
-      printf 'Dernier backup BDD   : aucun\n'
+      printf 'Last DB backup       : none\n'
     fi
   else
-    printf 'Dernière archive     : log absent\n'
-    printf 'Dernier backup BDD   : log absent\n'
+    printf 'Last archive         : log file absent\n'
+    printf 'Last DB backup       : log file absent\n'
   fi
 
   if [[ -f "$LOCK_FILE" ]]; then
     local pid
     pid=$(cat "$LOCK_FILE")
     if kill -0 "$pid" 2>/dev/null; then
-      printf 'Lock                 : actif (PID %s)\n' "$pid"
+      printf 'Lock                 : active (PID %s)\n' "$pid"
     else
-      printf 'Lock                 : orphelin (PID %s mort)\n' "$pid"
+      printf 'Lock                 : stale (PID %s dead)\n' "$pid"
     fi
   else
-    printf 'Lock                 : inactif\n'
+    printf 'Lock                 : inactive\n'
   fi
 }
 
@@ -305,7 +347,7 @@ _status() {
 _start() {
   local crontab_example="$SCRIPT_DIR/cron/crontab.example"
   if [[ ! -f "$crontab_example" ]]; then
-    printf 'Fichier crontab.example introuvable : %s\n' "$crontab_example" >&2
+    printf 'crontab.example not found: %s\n' "$crontab_example" >&2
     return 1
   fi
 
@@ -321,12 +363,12 @@ _start() {
   done < "$crontab_example"
 
   if [[ -z "$new_entries" ]]; then
-    echo "Les crons sont déjà installés."
+    echo "Cron jobs already installed."
     return 0
   fi
 
   printf '%s\n%s' "$current_crontab" "$new_entries" | crontab -
-  echo "Crons installés."
+  echo "Cron jobs installed."
 }
 
 # ── stop ──────────────────────────────────────────────────────────────────────
@@ -339,47 +381,80 @@ _stop() {
     printf '%s\n' "$current_crontab" \
       | sed 's|^\([^#].*immich-auto-dumper.*\)|#\1|' \
       | crontab -
-    echo "Crons désactivés."
+    echo "Cron jobs disabled."
   else
-    echo "Aucune entrée immich-auto-dumper dans le crontab."
+    echo "No immich-auto-dumper entries in crontab."
   fi
 
   if [[ -f "$LOCK_FILE" ]]; then
     local pid
     pid=$(cat "$LOCK_FILE")
     if kill -0 "$pid" 2>/dev/null; then
-      echo "Opération en cours (PID $pid), attente (max 60s)..."
+      echo "Operation in progress (PID $pid), waiting (max 60s)..."
       local elapsed=0
       while [[ -f "$LOCK_FILE" ]] && kill -0 "$pid" 2>/dev/null && (( elapsed < 60 )); do
         sleep 2
         elapsed=$(( elapsed + 2 ))
       done
       if kill -0 "$pid" 2>/dev/null; then
-        echo "Avertissement : l'opération n'est pas terminée après 60s." >&2
+        echo "Warning: operation still running after 60s." >&2
       else
-        echo "Opération terminée."
+        echo "Operation finished."
       fi
     fi
   fi
 }
 
-# ── Point d'entrée ────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 main() {
-  local cmd="${1:-}"
+  local dry_run=false
+  local cmd=""
+  local args=()
 
-  if [[ "$cmd" != "setup" && "$cmd" != "" ]]; then
+  for arg in "$@"; do
+    case "$arg" in
+      --dry-run) dry_run=true ;;
+      *)         args+=("$arg") ;;
+    esac
+  done
+
+  cmd="${args[0]:-}"
+
+  if [[ "$cmd" != "setup" && -n "$cmd" ]]; then
     _require_config
   fi
 
+  local dry_flag=()
+  "$dry_run" && dry_flag=(--dry-run)
+
   case "$cmd" in
-    setup)    _setup ;;
-    status)   _status ;;
-    start)    _start ;;
-    stop)     _stop ;;
-    dump_now) archive_run ;;
-    sync_now) backup_db_run ;;
-    *)        _usage; [[ -z "$cmd" ]] && exit 0 || exit 1 ;;
+    setup)
+      _setup
+      ;;
+    status)
+      _status
+      ;;
+    start)
+      _start
+      ;;
+    stop)
+      _stop
+      ;;
+    dump_now)
+      archive_run "${dry_flag[@]}"
+      ;;
+    sync_now)
+      backup_db_run "${dry_flag[@]}"
+      ;;
+    test_run)
+      archive_run --dry-run
+      backup_db_run --dry-run
+      ;;
+    *)
+      _usage
+      [[ -z "$cmd" ]] && exit 0 || exit 1
+      ;;
   esac
 }
 

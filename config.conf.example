@@ -1,34 +1,34 @@
 # immich-auto-dumper — configuration
-# Copiez ce fichier en config.conf et remplissez les valeurs,
-# ou utilisez : immich-auto-dumper setup
+# Copy this file to config.conf and fill in the values,
+# or use: immich-auto-dumper setup
 
 # --- Immich ---
-IMMICH_UPLOAD_LOCATION="/path/to/immich/library"   # Chemin hôte vers UPLOAD_LOCATION
+IMMICH_UPLOAD_LOCATION="/path/to/immich/upload"  # Host path to UPLOAD_LOCATION
+IMMICH_DB_LIBRARY_PREFIX="/data/library"         # Absolute prefix of "originalPath" in the DB
+                                                 # (auto-detected by setup; default: /data/library)
 IMMICH_DB_CONTAINER="immich_postgres"
 IMMICH_SERVER_CONTAINER="immich_server"
 IMMICH_DB_NAME="immich"
 IMMICH_DB_USER="postgres"
-IMMICH_API_URL="http://localhost:2283"
-IMMICH_API_KEY=""
 
-# --- Stockage externe ---
-# Chemin hôte du stockage externe, monté dans le conteneur immich_server.
+# --- External storage ---
+# Host path of the external storage, mounted inside the immich_server container.
 ARCHIVE_DEST_PATH="/mnt/external"
-# Même chemin vu depuis le conteneur Docker.
+# Same path as seen from the Docker container.
 ARCHIVE_CONTAINER_PATH="/external"
-# Les backups BDD seront dans : $ARCHIVE_DEST_PATH/.immich-backup/
-# Les photos archivées :        $ARCHIVE_DEST_PATH/<NomUtilisateur>/YYYY/MM/...
+# DB backups will be placed in : $ARCHIVE_DEST_PATH/.immich-backup/
+# Archived photos will be in   : $ARCHIVE_DEST_PATH/<FolderName>/...
 
-# --- Archivage photos ---
-ARCHIVE_THRESHOLD_HIGH=60          # % d'utilisation déclenchant l'archivage
-ARCHIVE_THRESHOLD_LOW=40           # % cible après archivage
+# --- Archive thresholds ---
+ARCHIVE_THRESHOLD_HIGH=60          # % usage that triggers archiving
+ARCHIVE_THRESHOLD_LOW=40           # % usage target after archiving
 
-# --- Backup BDD ---
-BACKUP_RETENTION=14                # Nombre de fichiers backup à conserver
+# --- DB backup ---
+BACKUP_RETENTION=14                # Number of backup files to keep
 
-# --- Correspondance userID/storage_label → nom de dossier sur le stockage externe ---
-# Générée automatiquement par "setup", modifiable manuellement.
-# Format : USER_MAP["storage_label_ou_uuid"]="NomDossier"
+# --- User → external folder mapping ---
+# Generated automatically by "setup"; can be edited manually.
+# Key: storageLabel (or UUID if storageLabel is empty).
 declare -A USER_MAP
 # USER_MAP["alice"]="Alice"
 # USER_MAP["bob"]="Bob"

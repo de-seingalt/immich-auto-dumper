@@ -2,16 +2,19 @@
 set -euo pipefail
 
 backup_db_run() {
+  local dry_run=false
+  [[ "${1:-}" == "--dry-run" ]] && dry_run=true
+
   check_prereqs
 
   if ! check_archive_dest_mounted; then
-    log_warn "Stockage externe non monté ($ARCHIVE_DEST_PATH) — backup BDD ignoré."
+    log_warn "External storage not mounted ($ARCHIVE_DEST_PATH) — DB backup skipped."
     return 0
   fi
 
   local src_dir="$IMMICH_UPLOAD_LOCATION/backups"
   if [[ ! -d "$src_dir" ]]; then
-    log_warn "Dossier source introuvable : $src_dir"
+    log_warn "Backup source directory not found: $src_dir"
     return 0
   fi
 
@@ -21,21 +24,31 @@ backup_db_run() {
   done < <(find "$src_dir" -maxdepth 1 -type f -print0)
 
   if (( ${#files[@]} == 0 )); then
-    log_warn "Aucun fichier de backup dans $src_dir."
+    log_warn "No backup files found in $src_dir."
     return 0
   fi
 
   local dest_dir="$ARCHIVE_DEST_PATH/.immich-backup"
+
+  if "$dry_run"; then
+    log_info "DRY-RUN: would create $dest_dir if missing"
+    for src in "${files[@]}"; do
+      log_info "DRY-RUN: would copy $(basename "$src") → $dest_dir/"
+    done
+    log_info "DRY-RUN: would apply retention policy (keep $BACKUP_RETENTION files)"
+    return 0
+  fi
+
   mkdir -p "$dest_dir"
 
   for src in "${files[@]}"; do
     local filename
     filename=$(basename "$src")
     cp "$src" "$dest_dir/$filename"
-    log_info "Backup copié : $filename"
+    log_info "Backup copied: $filename"
   done
 
-  # Rotation : supprime les fichiers les plus anciens au-delà de BACKUP_RETENTION.
+  # Retention: delete oldest files beyond BACKUP_RETENTION.
   local all_backups=()
   while IFS= read -r -d '' f; do
     all_backups+=("$f")
@@ -45,7 +58,7 @@ backup_db_run() {
   if (( count > BACKUP_RETENTION )); then
     local to_delete=$(( count - BACKUP_RETENTION ))
     for (( i = count - to_delete; i < count; i++ )); do
-      log_info "Rotation : suppression de $(basename "${all_backups[$i]}")"
+      log_info "Rotation: removing $(basename "${all_backups[$i]}")"
       rm -f "${all_backups[$i]}"
     done
   fi
@@ -62,5 +75,5 @@ backup_db_run() {
     total_bytes=$(( total_bytes + size ))
   done
 
-  log_info "Backup BDD : ${#kept[@]} fichier(s) conservé(s), $(bytes_to_human "$total_bytes") au total."
+  log_info "DB backup: ${#kept[@]} file(s) retained, $(bytes_to_human "$total_bytes") total."
 }
