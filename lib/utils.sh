@@ -3,8 +3,9 @@ set -euo pipefail
 
 readonly LOCK_FILE="/tmp/immich-auto-dumper.lock"
 
-# Global docker command determined by detect_docker_cmd.
-DOCKER_CMD=""
+# Docker command used throughout. This tool runs strictly as the invoking user and
+# never escalates privileges (no sudo): it is a matter of trust for its users.
+DOCKER_CMD="docker"
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -49,24 +50,34 @@ log_error() { _log ERROR "$1"; }
 
 # ── Prerequisites ─────────────────────────────────────────────────────────────
 
-# Probe whether docker runs (with or without sudo) and set DOCKER_CMD.
+# Probe whether docker runs as the current (unprivileged) user.
 # Non-fatal: returns 0 on success, 1 on failure. Used where exiting is undesirable
 # (e.g. status). detect_docker_cmd wraps it and exits on failure.
+# This tool never uses sudo: if the user cannot reach the daemon directly, it is
+# advised to join the docker group rather than having the script escalate for them.
 probe_docker_cmd() {
-  if docker ps &>/dev/null; then
-    DOCKER_CMD="docker"
-  elif sudo docker ps &>/dev/null; then
-    DOCKER_CMD="sudo docker"
-  else
-    return 1
-  fi
-  return 0
+  docker ps &>/dev/null
 }
 
-# Detect whether docker runs without privileges and set DOCKER_CMD accordingly.
+# Build advice explaining why docker is unreachable and how to fix it without sudo.
+_docker_access_advice() {
+  if id -nG 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+    # Already in the group: either the daemon is down or the group membership has
+    # not taken effect in this session yet.
+    log_error "Cannot reach the Docker daemon although '$USER' is in the docker group."
+    log_error "Check the daemon is running (systemctl status docker), or open a new"
+    log_error "session if you joined the docker group during this one."
+  else
+    log_error "Cannot run docker as '$USER'. This tool runs without sudo on purpose."
+    log_error "Grant your user direct Docker access, then re-login:"
+    log_error "  sudo usermod -aG docker $USER"
+  fi
+}
+
+# Verify docker runs as the current user. Exits on failure with actionable advice.
 detect_docker_cmd() {
   if ! probe_docker_cmd; then
-    log_error "Cannot run docker. Add yourself to the docker group: sudo usermod -aG docker \$USER (then re-login)."
+    _docker_access_advice
     exit 1
   fi
 }
