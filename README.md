@@ -10,7 +10,8 @@ Two backup policies:
 ## Requirements
 
 - Ubuntu 22.04+ or Debian 12+
-- `docker`, `jq`, `bc`, `curl`
+- Runtime: `docker`, `bc`, plus `mountpoint`/`df` (util-linux, coreutils). `psql` runs inside the Immich Postgres container.
+- `curl` is only needed to run the one-line installer below, not by the tool at runtime.
 - Immich deployed via Docker Compose
 - External storage mounted locally and accessible by the `immich_server` container
 
@@ -38,16 +39,36 @@ The wizard detects active Docker containers, reads users from the database and b
 
 Values are written to `config.conf` (gitignored). See `config.conf.example` for the full structure.
 
+> Upgrading from an older version? Re-run `immich-auto-dumper setup` once: it creates the storage marker (see below) that newer versions require before writing.
+
 ### External storage structure
 
 ```
 /mnt/external/
+  .immich-auto-dumper.id   ← storage marker (proves the storage is reachable)
   .immich-backup/          ← DB dumps (mirror of UPLOAD_LOCATION/backups/)
   Alice/                   ← archived photos, per user
     2022/06/...
   Bob/
     2023/04/...
 ```
+
+### Storage availability (any storage type)
+
+The external storage is whatever Immich treats as an *external library* — a plain local
+folder, an OS mount, a FUSE/rclone mount, an NFS share, or an external disk attached now
+and then. The tool is **agnostic to its nature**: at `setup` it writes a marker file
+(`.immich-auto-dumper.id`) **on the storage itself**, and before every run it checks that
+the marker is reachable.
+
+- If the storage is **not available** (e.g. an external disk is unplugged, or a network
+  mount dropped), the run is **skipped without writing anything** and resumes
+  automatically next time — no data is ever copied into an empty mount point.
+- If you **move the external library** to a new host path, just re-run `setup`: the marker
+  travels with the data and is recognized automatically (or re-created for a new target).
+- If the library path changes **inside Immich** (the container-side path), the tool
+  detects the mismatch, **pauses the cron jobs**, and asks you to fix it in Immich and
+  re-run `setup`. It never rewrites Immich's database — Immich is the source of truth.
 
 ## Usage
 
@@ -60,22 +81,36 @@ immich-auto-dumper <command>
   stop      Disable cron jobs, wait for current operation to finish
   dump_now  Force an immediate archive run down to the low threshold
   sync_now  Force an immediate copy of DB backups
+  test_run  Dry-run simulation of dump_now + sync_now (no changes)
+
+Flags:
+  --dry-run  Inhibit all destructive operations (cp, rm, DB UPDATE). Works with
+             dump_now and sync_now.
 ```
 
 ## How archiving works
 
-The archiving unit is the **monthly folder** (`<user>/<year>/<month>/`). A folder is never partially archived — if the free-space target is reached mid-folder, archiving completes the current folder before stopping.
+The archiving unit is the **immediate parent directory** of each asset, whatever the
+Immich storage template is — no fixed `<year>/<month>` structure is assumed. A directory
+is never partially archived: if the free-space target is reached mid-directory, archiving
+completes the current directory before stopping.
+
+Before any database change, the tool verifies that a recent (< 7 days) Immich DB backup
+exists in `UPLOAD_LOCATION/backups/`; otherwise it aborts without touching anything.
 
 For each file moved:
 1. Copy to external storage
 2. Verify the destination file exists
-3. Update `original_path` in the database (transaction)
+3. Update `originalPath` in the database (transaction)
 4. Verify accessibility from the `immich_server` container
 5. Delete the source file
 
 If any step fails, the database is rolled back to its previous state and the destination file is deleted. The source file remains intact.
 
-A rescan of the external library is triggered via the Immich API at the end of archiving to refresh thumbnails, without creating duplicates or losing metadata.
+No rescan is triggered by this tool: updating `originalPath` before deleting the source
+guarantees Immich finds the file at its new path on its next scheduled scan. The external
+library rescan is handled by Immich's own internal cron (Administration → Settings →
+Library), so no Immich API call is made and no metadata is lost.
 
 ## Logs
 

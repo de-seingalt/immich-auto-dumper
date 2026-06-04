@@ -140,3 +140,59 @@ db_update_asset_path() {
     return 1
   fi
 }
+
+# ── Path consistency (case B detection — read-only) ───────────────────────────
+#
+# Immich's DB is the source of truth; these functions only READ it to detect that
+# the external library path changed in Immich and that our config is now stale.
+
+# Echoes the internal library prefix (/.../library) derived from a current,
+# non-archived asset. Empty if undeterminable.
+db_current_library_prefix() {
+  local sample
+  sample=$(_db_exec "SELECT \"originalPath\" FROM \"asset\"
+                     WHERE \"originalPath\" LIKE '%/library/%'
+                       AND \"deletedAt\" IS NULL
+                     LIMIT 1;" 2>/dev/null | head -1 || true)
+  [[ -z "$sample" ]] && return 0
+  printf '%s' "$sample" | sed 's|\(/[^/]*/library\)/.*|\1|'
+}
+
+# Echoes the number of active assets we archived (under ARCHIVE_CONTAINER_PATH)
+# that Immich currently reports offline. Meaningful as a "container path changed"
+# signal ONLY when the external storage is ready (files physically present).
+db_count_offline_archived() {
+  local escaped
+  escaped=$(_db_escape "${ARCHIVE_CONTAINER_PATH%/}")
+  _db_exec "SELECT count(*) FROM \"asset\"
+            WHERE \"deletedAt\" IS NULL
+              AND \"isOffline\" = true
+              AND \"originalPath\" LIKE '${escaped}/%';" 2>/dev/null | head -1
+}
+
+# Read-only consistency check between our config and Immich's DB reality.
+# Echoes a human-readable report and returns 1 on inconsistency, 0 if consistent.
+# The offline-archived signal must only be trusted when the storage is ready
+# (callers gate on check_archive_dest_ready first).
+db_check_path_consistency() {
+  local issues=()
+
+  local current_prefix
+  current_prefix=$(db_current_library_prefix)
+  if [[ -n "$current_prefix" && -n "${IMMICH_DB_LIBRARY_PREFIX:-}" \
+        && "$current_prefix" != "$IMMICH_DB_LIBRARY_PREFIX" ]]; then
+    issues+=("Internal library prefix changed in DB: config='${IMMICH_DB_LIBRARY_PREFIX}' but DB shows '${current_prefix}'.")
+  fi
+
+  local offline
+  offline=$(db_count_offline_archived)
+  if [[ "$offline" =~ ^[0-9]+$ ]] && (( offline > 0 )); then
+    issues+=("${offline} archived asset(s) under '${ARCHIVE_CONTAINER_PATH}' are offline while the storage is reachable — the external library path likely changed in Immich.")
+  fi
+
+  if (( ${#issues[@]} > 0 )); then
+    printf '%s\n' "${issues[@]}"
+    return 1
+  fi
+  return 0
+}

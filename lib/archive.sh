@@ -137,15 +137,41 @@ _archive_move_sidecar() {
 
 # ── Main function ─────────────────────────────────────────────────────────────
 
+# Aborts (and pauses the cron) when Immich's DB no longer matches our config —
+# i.e. the external library path changed in Immich (case B). Immich is the source
+# of truth: we never rewrite the DB. The user must fix the path in Immich and
+# re-run setup. Returns 1 on inconsistency, 0 otherwise.
+guard_path_consistency() {
+  local report
+  if report=$(db_check_path_consistency); then
+    return 0
+  fi
+  log_error "Path inconsistency detected — Immich DB no longer matches config:"
+  local line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && log_error "  - $line"
+  done <<< "$report"
+  if disable_cron; then
+    log_error "Cron jobs disabled to avoid acting on a stale configuration."
+  fi
+  log_error "Fix the external library path in Immich, then run: immich-auto-dumper setup"
+  return 1
+}
+
 archive_run() {
   local dry_run=false
   [[ "${1:-}" == "--dry-run" ]] && dry_run=true
 
   check_prereqs
 
-  if ! check_archive_dest_mounted; then
-    log_warn "External storage not mounted ($ARCHIVE_DEST_PATH) — archive skipped."
+  # Storage availability — agnostic to the storage type (marker-based).
+  if ! check_archive_dest_ready; then
     return 0
+  fi
+
+  # Case B: external library path changed in Immich → pause, never touch the DB.
+  if ! guard_path_consistency; then
+    return 1
   fi
 
   if ! acquire_lock; then
@@ -162,6 +188,14 @@ archive_run() {
   fi
 
   log_info "Archive triggered: ${usage}% used (high: ${ARCHIVE_THRESHOLD_HIGH}%, target: ${ARCHIVE_THRESHOLD_LOW}%)."
+
+  # Safety: never modify the database unless a recent (<7 days) Immich DB backup
+  # exists. Archiving rewrites "originalPath" rows, so a fresh dump is the safety net.
+  if ! find "$IMMICH_UPLOAD_LOCATION/backups" -type f -mtime -7 2>/dev/null | grep -q .; then
+    log_error "No recent DB backup (<7 days) in $IMMICH_UPLOAD_LOCATION/backups — archive aborted."
+    release_lock
+    return 1
+  fi
 
   local total_kb
   total_kb=$(df --output=size "$IMMICH_UPLOAD_LOCATION" | tail -1 | tr -d ' ')

@@ -54,6 +54,103 @@ _require_config() {
   fi
 }
 
+# Generates a random storage id (no external dependency).
+_new_storage_id() { cat /proc/sys/kernel/random/uuid; }
+
+# Interactive liveness gate before writing the storage marker: makes sure the
+# storage is actually active, so we never write the marker into an empty local
+# mount point. Auto-detects when possible (findmnt) and only asks when ambiguous.
+# Returns 0 when it is safe to write, 1 when the user chose to skip.
+_ensure_storage_live() {
+  local dest="$1"
+  if archive_dest_is_mounted "$dest"; then
+    return 0   # confident: active non-root mount
+  fi
+  printf '  "%s" is not detected as a separate active mount point.\n' "$dest"
+  local kind
+  kind=$(_ask "  Is it a local folder, or a remote mount (rclone/NFS/SMB/external disk) that should be active? [local/mount]" "local")
+  if [[ "$kind" == "local" ]]; then
+    return 0
+  fi
+  while true; do
+    local ans
+    ans=$(_ask "  Not mounted. Mount it now, then press Enter to re-check (or 's' to skip marker creation)" "")
+    [[ "$ans" == "s" || "$ans" == "S" ]] && return 1
+    if archive_dest_is_mounted "$dest"; then
+      return 0
+    fi
+    echo "  Still not detected as an active mount."
+  done
+}
+
+# Reconciles the storage marker for the destination. Handles install, relocation,
+# recognition and conflict (case A). Sets the global STORAGE_ID_RESULT.
+# Prompts/echo go to the terminal (not captured) — we use a global on purpose.
+_resolve_storage_marker() {
+  local dest="$1" config_id="$2"
+  local marker="${dest%/}/.immich-auto-dumper.id"
+  local found_id
+  found_id=$(timeout 10 cat "$marker" 2>/dev/null || true)
+
+  # Make write_archive_marker (which uses the global) target this destination.
+  ARCHIVE_DEST_PATH="$dest"
+
+  if [[ -n "$config_id" && "$found_id" == "$config_id" ]]; then
+    echo "Storage recognized (marker matches config). No change."
+    STORAGE_ID_RESULT="$config_id"
+    return 0
+  fi
+
+  if [[ -n "$found_id" && "$found_id" != "$config_id" ]]; then
+    echo "A different storage marker is already present here:"
+    printf '  in storage : %s\n' "$found_id"
+    printf '  in config  : %s\n' "${config_id:-<none>}"
+    local choice
+    choice=$(_ask "Adopt found id [a], keep config id and overwrite [k], or cancel [c]?" "a")
+    case "$choice" in
+      k|K)
+        local id="${config_id:-$(_new_storage_id)}"
+        if _ensure_storage_live "$dest" && write_archive_marker "$id"; then
+          echo "Marker overwritten with config id."
+          STORAGE_ID_RESULT="$id"
+        else
+          echo "Could not write marker — keeping the id already on the storage."
+          STORAGE_ID_RESULT="$found_id"
+        fi
+        ;;
+      c|C)
+        echo "Marker left unchanged."
+        STORAGE_ID_RESULT="${config_id:-$found_id}"
+        ;;
+      *)
+        echo "Adopted the id already present on the storage."
+        STORAGE_ID_RESULT="$found_id"
+        ;;
+    esac
+    return 0
+  fi
+
+  # No marker at destination: fresh install, relocation to an empty target, or
+  # storage temporarily offline.
+  local id="${config_id:-$(_new_storage_id)}"
+  if _ensure_storage_live "$dest"; then
+    if write_archive_marker "$id"; then
+      if [[ -n "$config_id" ]]; then
+        echo "Storage relocated — marker re-created at the new location (same id)."
+      else
+        echo "Storage initialized — marker created."
+      fi
+    else
+      echo "WARNING: could not write the marker (read-only or inactive mount?)."
+      echo "         Archiving stays paused until the marker exists."
+    fi
+  else
+    echo "Storage not active now — marker NOT created. Mount it and re-run setup."
+  fi
+  STORAGE_ID_RESULT="$id"
+  return 0
+}
+
 # ── setup ─────────────────────────────────────────────────────────────────────
 
 _setup() {
@@ -98,6 +195,16 @@ _setup() {
   echo "── External storage ──"
   archive_dest=$(_ask           "ARCHIVE_DEST_PATH (host path)"            "$archive_dest")
   archive_container_path=$(_ask "ARCHIVE_CONTAINER_PATH (container path)"  "$archive_container_path")
+
+  echo
+  echo "── External storage marker ──"
+  # Establishes/recognizes the storage identity (install, relocation, conflict).
+  local storage_id
+  STORAGE_ID_RESULT=""
+  _resolve_storage_marker "$archive_dest" "${ARCHIVE_STORAGE_ID:-}"
+  storage_id="$STORAGE_ID_RESULT"
+  # Keep the global in sync so later readiness/consistency checks use this id.
+  ARCHIVE_STORAGE_ID="$storage_id"
 
   echo
   echo "── Library prefix detection ──"
@@ -178,6 +285,9 @@ _setup() {
   IMMICH_DB_CONTAINER="$db_container"
   IMMICH_DB_USER="$db_user"
   IMMICH_DB_NAME="$db_name"
+  # Make path-consistency helpers see the values entered in this wizard.
+  IMMICH_DB_LIBRARY_PREFIX="$db_library_prefix"
+  ARCHIVE_CONTAINER_PATH="$archive_container_path"
   if $DOCKER_CMD exec -i "$db_container" psql \
        -U "$db_user" -d "$db_name" -t -A -c "SELECT 1;" &>/dev/null 2>&1; then
     if ! db_check_schema 2>/dev/null; then
@@ -185,6 +295,16 @@ _setup() {
       echo "         Review the script before using it against this Immich version."
     else
       echo "Schema check: OK"
+    fi
+    # Case B: surface an external-library path change recorded in Immich's DB.
+    if archive_dest_ready 2>/dev/null; then
+      local consistency_report
+      if ! consistency_report=$(db_check_path_consistency 2>/dev/null); then
+        echo "NOTE: Immich DB path inconsistency detected:"
+        printf '%s\n' "$consistency_report" | sed 's/^/  - /'
+        echo "      Make sure ARCHIVE_CONTAINER_PATH above matches the external"
+        echo "      library path now configured in Immich."
+      fi
     fi
   fi
 
@@ -199,6 +319,7 @@ _setup() {
     IMMICH_DB_USER           "$db_user" \
     ARCHIVE_DEST_PATH        "$archive_dest" \
     ARCHIVE_CONTAINER_PATH   "$archive_container_path" \
+    ARCHIVE_STORAGE_ID       "$storage_id" \
     ARCHIVE_THRESHOLD_HIGH   "$threshold_high" \
     ARCHIVE_THRESHOLD_LOW    "$threshold_low" \
     BACKUP_RETENTION         "$backup_retention" \
@@ -240,6 +361,7 @@ IMMICH_DB_USER="${db_user}"
 # --- External storage ---
 ARCHIVE_DEST_PATH="${archive_dest}"
 ARCHIVE_CONTAINER_PATH="${archive_container_path}"
+ARCHIVE_STORAGE_ID="${storage_id}"
 
 # --- Archive thresholds ---
 ARCHIVE_THRESHOLD_HIGH=${threshold_high}
@@ -280,10 +402,21 @@ _status() {
     printf 'Library space        : unavailable (%s not found)\n' "$library_path"
   fi
 
-  if check_archive_dest_mounted 2>/dev/null; then
-    printf 'External storage     : mounted  (%s)\n' "${ARCHIVE_DEST_PATH:-?}"
+  local storage_ready=false
+  if archive_dest_ready 2>/dev/null; then
+    storage_ready=true
+    printf 'External storage     : ready  (%s)\n' "${ARCHIVE_DEST_PATH:-?}"
   else
-    printf 'External storage     : NOT MOUNTED  (%s)\n' "${ARCHIVE_DEST_PATH:-?}"
+    printf 'External storage     : NOT READY  (%s)\n' "${ARCHIVE_DEST_PATH:-?}"
+  fi
+
+  # Path consistency vs Immich DB (requires docker; best-effort, never fatal).
+  if "$storage_ready" && probe_docker_cmd 2>/dev/null; then
+    if db_check_path_consistency >/dev/null 2>&1; then
+      printf 'Path consistency     : OK\n'
+    else
+      printf 'Path consistency     : INCONSISTENT — fix the path in Immich, then run setup\n'
+    fi
   fi
 
   local backup_dir="${ARCHIVE_DEST_PATH:-}/.immich-backup"
@@ -374,13 +507,7 @@ _start() {
 # ── stop ──────────────────────────────────────────────────────────────────────
 
 _stop() {
-  local current_crontab
-  current_crontab=$(crontab -l 2>/dev/null || true)
-
-  if printf '%s\n' "$current_crontab" | grep -q 'immich-auto-dumper' 2>/dev/null; then
-    printf '%s\n' "$current_crontab" \
-      | sed 's|^\([^#].*immich-auto-dumper.*\)|#\1|' \
-      | crontab -
+  if disable_cron; then
     echo "Cron jobs disabled."
   else
     echo "No immich-auto-dumper entries in crontab."

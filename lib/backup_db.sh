@@ -7,8 +7,11 @@ backup_db_run() {
 
   check_prereqs
 
-  if ! check_archive_dest_mounted; then
-    log_warn "External storage not mounted ($ARCHIVE_DEST_PATH) — DB backup skipped."
+  # Storage availability — agnostic to the storage type (marker-based).
+  # Note: we intentionally do NOT run the path-consistency guard here — mirroring
+  # DB dumps stays useful (and safe, it never touches the Immich DB) even while an
+  # external library path change is being resolved.
+  if ! check_archive_dest_ready; then
     return 0
   fi
 
