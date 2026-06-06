@@ -30,9 +30,10 @@ Commands:
   status     Show service status, disk usage, and last operations
   start      Enable cron jobs
   stop       Disable cron jobs and wait for any running operation to finish
-  dump_now   Force an immediate archive run until the low threshold is reached
+  dump_now   Force an immediate archive run until the target size is reached
   sync_now   Force an immediate copy of DB backups to external storage
   test_run   Simulate dump_now + sync_now without making any changes (implies --dry-run)
+  uninstall  Remove the tool's local footprint (keeps Immich and external storage intact)
 
 Flags:
   --dry-run  Suppress all destructive operations (cp, rm, DB UPDATE).
@@ -623,7 +624,8 @@ main() {
 
   cmd="${args[0]:-}"
 
-  if [[ "$cmd" != "setup" && -n "$cmd" ]]; then
+  # setup creates the config; uninstall must work even when no config exists.
+  if [[ "$cmd" != "setup" && "$cmd" != "uninstall" && -n "$cmd" ]]; then
     _require_config
   fi
 
@@ -652,6 +654,11 @@ main() {
     test_run)
       archive_run --dry-run
       backup_db_run --dry-run
+      ;;
+    uninstall)
+      # Hand off to the standalone uninstaller (self-relocates before deleting the
+      # install dir). Pass through any -y/--yes flag.
+      exec bash "$SCRIPT_DIR/uninstall.sh" "${args[@]:1}"
       ;;
     *)
       _usage

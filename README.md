@@ -82,11 +82,28 @@ immich-auto-dumper <command>
   dump_now  Force an immediate archive run down to the target size
   sync_now  Force an immediate copy of DB backups
   test_run  Dry-run simulation of dump_now + sync_now (no changes)
+  uninstall Remove the local footprint (keeps Immich and external storage intact)
 
 Flags:
   --dry-run  Inhibit all destructive operations (cp, rm, DB UPDATE). Works with
              dump_now and sync_now.
 ```
+
+## Uninstall
+
+```bash
+immich-auto-dumper uninstall
+```
+
+Removes only the tool's own local footprint: the `~/.local/bin` symlink, the install
+directory (including `config.conf`), the cron entries, the logs and the lock file. It
+asks for confirmation first (use `-y` to skip).
+
+It **never** touches Immich (database, assets, containers) nor anything on the external
+storage — the `.immich-auto-dumper.id` marker, the `.immich-backup/` dumps and the
+archived photos all remain, since those archived files are live Immich assets. For the
+same reason it is safe to run with the external library offline. Reinstall any time with
+the one-line installer above.
 
 ## How archiving works
 
