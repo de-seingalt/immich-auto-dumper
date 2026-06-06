@@ -13,6 +13,12 @@ _db_escape() {
   printf '%s' "$1" | sed "s/'/''/g"
 }
 
+# Escapes LIKE wildcards so a path is matched literally. Backslash is the escape
+# char; the result must be used with `ESCAPE '\'`. Apply BEFORE _db_escape.
+_db_escape_like() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/%/\\%/g' -e 's/_/\\_/g'
+}
+
 # ── Schema validation ─────────────────────────────────────────────────────────
 
 # Verifies that required tables and columns exist in the Immich schema.
@@ -20,7 +26,7 @@ _db_escape() {
 db_check_schema() {
   local expected_asset_columns=(
     "id" "originalPath" "isOffline" "isExternal" "libraryId"
-    "deletedAt" "ownerId" "visibility"
+    "deletedAt" "ownerId" "visibility" "fileCreatedAt"
   )
   local expected_exif_columns=("assetId" "fileSizeInByte")
 
@@ -86,12 +92,12 @@ db_get_users() {
 db_get_folder_assets() {
   local parent_dir_db_path="$1"
   local escaped_prefix
-  escaped_prefix=$(_db_escape "$parent_dir_db_path")
+  escaped_prefix=$(_db_escape "$(_db_escape_like "$parent_dir_db_path")")
 
   _db_exec "SELECT a.\"id\", a.\"originalPath\", e.\"fileSizeInByte\"
             FROM \"asset\" a
             LEFT JOIN \"asset_exif\" e ON a.\"id\" = e.\"assetId\"
-            WHERE a.\"originalPath\" LIKE '${escaped_prefix}/%'
+            WHERE a.\"originalPath\" LIKE '${escaped_prefix}/%' ESCAPE '\\'
               AND a.\"deletedAt\" IS NULL
               AND a.\"isOffline\" = false
               AND a.\"isExternal\" = false;"
@@ -103,8 +109,11 @@ db_get_archive_candidates() {
   local escaped_library_prefix
   escaped_library_prefix=$(_db_escape "${IMMICH_DB_LIBRARY_PREFIX}/")
   local escaped_archive_prefix
-  escaped_archive_prefix=$(_db_escape "${ARCHIVE_CONTAINER_PATH}")
+  escaped_archive_prefix=$(_db_escape "$(_db_escape_like "${ARCHIVE_CONTAINER_PATH}")")
 
+  # Order by the oldest capture date in each directory so the genuinely oldest photos
+  # are archived first, regardless of the storage template (template-agnostic). The
+  # ordering key is an aggregate and need not appear in the SELECT list.
   _db_exec "
     SELECT
       split_part(
@@ -118,9 +127,9 @@ db_get_archive_candidates() {
     WHERE a.\"deletedAt\" IS NULL
       AND a.\"isOffline\" = false
       AND a.\"isExternal\" = false
-      AND a.\"originalPath\" NOT LIKE '${escaped_archive_prefix}%'
+      AND a.\"originalPath\" NOT LIKE '${escaped_archive_prefix}%' ESCAPE '\\'
     GROUP BY user_folder, parent_dir
-    ORDER BY parent_dir ASC;"
+    ORDER BY MIN(a.\"fileCreatedAt\") ASC;"
 }
 
 # Updates originalPath for an asset in a transaction. Returns 0 on success, 1 on failure.
@@ -163,11 +172,11 @@ db_current_library_prefix() {
 # signal ONLY when the external storage is ready (files physically present).
 db_count_offline_archived() {
   local escaped
-  escaped=$(_db_escape "${ARCHIVE_CONTAINER_PATH%/}")
+  escaped=$(_db_escape "$(_db_escape_like "${ARCHIVE_CONTAINER_PATH%/}")")
   _db_exec "SELECT count(*) FROM \"asset\"
             WHERE \"deletedAt\" IS NULL
               AND \"isOffline\" = true
-              AND \"originalPath\" LIKE '${escaped}/%';" 2>/dev/null | head -1
+              AND \"originalPath\" LIKE '${escaped}/%' ESCAPE '\\';" 2>/dev/null | head -1
 }
 
 # Read-only consistency check between our config and Immich's DB reality.

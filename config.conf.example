@@ -24,9 +24,12 @@ ARCHIVE_STORAGE_ID=""
 # DB backups will be placed in : $ARCHIVE_DEST_PATH/.immich-backup/
 # Archived photos will be in   : $ARCHIVE_DEST_PATH/<FolderName>/...
 
-# --- Archive thresholds ---
-ARCHIVE_THRESHOLD_HIGH=60          # % usage that triggers archiving
-ARCHIVE_THRESHOLD_LOW=40           # % usage target after archiving
+# --- Archive boundaries (library size, in GB; 1 GB = 1024^3 bytes) ---
+# Driven by the actual size of UPLOAD_LOCATION/library (not whole-disk usage).
+# `setup` shows the current library size and free disk, and can convert a
+# percentage of the disk into these absolute GB values for you.
+ARCHIVE_LIBRARY_MAX_GB=200         # archiving starts when library/ exceeds this
+ARCHIVE_LIBRARY_TARGET_GB=150      # archiving runs until library/ drops to this
 
 # --- DB backup ---
 BACKUP_RETENTION=14                # Number of backup files to keep
@@ -39,5 +42,7 @@ declare -A USER_MAP
 # USER_MAP["bob"]="Bob"
 
 # --- Logs ---
-LOG_DIR="/var/log/immich-auto-dumper"
+# Must be writable by the user running the tool (no sudo). Defaults to the XDG
+# state dir when unset.
+LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper"
 LOG_MAX_LINES=1000

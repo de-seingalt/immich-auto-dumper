@@ -14,6 +14,11 @@ if [[ -f "$CONFIG_FILE" ]]; then
   source "$CONFIG_FILE"
 fi
 
+# Ensure USER_MAP exists even if a hand-edited config dropped its declaration, so
+# `${USER_MAP[x]:-...}` lookups don't trip set -u. Declaring an existing assoc array
+# does not clear it.
+declare -A USER_MAP 2>/dev/null || true
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 _usage() {
@@ -56,6 +61,36 @@ _require_config() {
 
 # Generates a random storage id (no external dependency).
 _new_storage_id() { cat /proc/sys/kernel/random/uuid; }
+
+# Absolute path used in cron lines: prefer the stable ~/.local/bin symlink created by
+# install.sh, and fall back to the script's own location. Cron has a minimal PATH, so
+# a bare command name would not resolve.
+_resolve_self_bin() {
+  local link="$HOME/.local/bin/immich-auto-dumper"
+  if [[ -x "$link" ]]; then
+    printf '%s\n' "$link"
+  else
+    printf '%s\n' "$SCRIPT_DIR/immich-auto-dumper.sh"
+  fi
+}
+
+# Converts a user-entered size to an integer number of GB (1 GB = 1024^3 bytes).
+# Accepts "200", "200G", "200GB" or "80%" (percentage of <total_disk_bytes>). Echoes
+# nothing on a parse error, or when a percentage is given with no disk size to apply to.
+_size_input_to_gb() {
+  local input="${1// /}" total_bytes="${2:-0}"
+  if [[ "$input" =~ ^([0-9]+)%$ ]]; then
+    local pct="${BASH_REMATCH[1]}"
+    (( total_bytes > 0 )) || return 0
+    printf '%s\n' "$(( total_bytes * pct / 100 / 1073741824 ))"
+  elif [[ "$input" =~ ^([0-9]+)([Gg][Bb]?)?$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  fi
+}
+
+# True if the configured Immich Postgres container answers a trivial query. Requires
+# IMMICH_DB_CONTAINER / IMMICH_DB_USER / IMMICH_DB_NAME to be set first.
+_db_reachable() { _db_exec "SELECT 1;" &>/dev/null; }
 
 # Interactive liveness gate before writing the storage marker: makes sure the
 # storage is actually active, so we never write the marker into an empty local
@@ -168,10 +203,10 @@ _setup() {
   local archive_dest="${ARCHIVE_DEST_PATH:-}"
   local archive_container_path="${ARCHIVE_CONTAINER_PATH:-}"
   local db_library_prefix="${IMMICH_DB_LIBRARY_PREFIX:-}"
-  local threshold_high="${ARCHIVE_THRESHOLD_HIGH:-60}"
-  local threshold_low="${ARCHIVE_THRESHOLD_LOW:-40}"
+  local library_max_gb="${ARCHIVE_LIBRARY_MAX_GB:-}"
+  local library_target_gb="${ARCHIVE_LIBRARY_TARGET_GB:-}"
   local backup_retention="${BACKUP_RETENTION:-14}"
-  local log_dir="${LOG_DIR:-/var/log/immich-auto-dumper}"
+  local log_dir="${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper}"
   local log_max_lines="${LOG_MAX_LINES:-1000}"
 
   # Auto-detect active Immich containers
@@ -186,6 +221,13 @@ _setup() {
   echo "── Docker containers ──"
   db_container=$(_ask    "PostgreSQL container"     "$db_container")
   server_container=$(_ask "immich_server container" "$server_container")
+
+  # Expose the DB connection settings as globals so the lib/db.sh helpers
+  # (_db_reachable, db_detect_library_prefix, db_get_users, db_check_schema...) can be
+  # reused below instead of re-implementing inline psql calls.
+  IMMICH_DB_CONTAINER="$db_container"
+  IMMICH_DB_USER="$db_user"
+  IMMICH_DB_NAME="$db_name"
 
   echo
   echo "── Immich storage ──"
@@ -208,19 +250,10 @@ _setup() {
 
   echo
   echo "── Library prefix detection ──"
-  # Try to auto-detect IMMICH_DB_LIBRARY_PREFIX from a sample asset path.
+  # Auto-detect IMMICH_DB_LIBRARY_PREFIX from a sample asset path (reuses lib/db.sh).
   local detected_prefix=""
-  if $DOCKER_CMD exec -i "$db_container" psql \
-       -U "$db_user" -d "$db_name" -t -A -c "SELECT 1;" &>/dev/null 2>&1; then
-    local sample_path
-    sample_path=$($DOCKER_CMD exec -i "$db_container" psql \
-      -U "$db_user" -d "$db_name" -t -A \
-      -c "SELECT \"originalPath\" FROM \"asset\" LIMIT 1;" 2>/dev/null | head -1 || true)
-    if [[ -n "$sample_path" ]]; then
-      local candidate
-      candidate=$(printf '%s' "$sample_path" | sed 's|\(/[^/]*/library\)/.*|\1|')
-      [[ "$candidate" != "$sample_path" ]] && detected_prefix="$candidate"
-    fi
+  if _db_reachable && db_detect_library_prefix 2>/dev/null; then
+    detected_prefix="$IMMICH_DB_LIBRARY_PREFIX"
   fi
 
   if [[ -n "$detected_prefix" ]]; then
@@ -237,39 +270,68 @@ _setup() {
 
   declare -A new_user_map=()
 
-  if $DOCKER_CMD exec -i "$db_container" psql \
-       -U "$db_user" -d "$db_name" -t -A -c "SELECT 1;" &>/dev/null 2>&1; then
-    local users_raw
-    users_raw=$($DOCKER_CMD exec -i "$db_container" psql \
-      -U "$db_user" -d "$db_name" -t -A \
-      -c "SELECT \"id\", \"name\", \"storageLabel\" FROM \"user\" ORDER BY \"createdAt\";" \
-      2>/dev/null || true)
+  local users_raw=""
+  if _db_reachable; then
+    users_raw=$(db_get_users 2>/dev/null || true)
+  fi
 
-    if [[ -n "$users_raw" ]]; then
-      echo "Detected users:"
-      while IFS='|' read -r uid name storage_label; do
-        [[ -z "$uid" ]] && continue
-        local key="${storage_label:-$uid}"
-        local current_mapped="${USER_MAP["$key"]:-}"
-        local default_folder="${current_mapped:-${storage_label:-$name}}"
-        printf '  %-36s  %s  (storageLabel: %s)\n' "$uid" "$name" "${storage_label:-<empty>}"
-        local folder
-        folder=$(_ask "  Folder for \"$name\" (DB key: $key)" "$default_folder")
-        new_user_map["$key"]="$folder"
-      done <<< "$users_raw"
-    else
-      echo "No users found — USER_MAP left empty."
-      echo "Re-run 'setup' once Immich is running to populate it."
-    fi
+  if [[ -n "$users_raw" ]]; then
+    echo "Detected users:"
+    while IFS='|' read -r uid name storage_label; do
+      [[ -z "$uid" ]] && continue
+      local key="${storage_label:-$uid}"
+      local current_mapped="${USER_MAP["$key"]:-}"
+      local default_folder="${current_mapped:-${storage_label:-$name}}"
+      printf '  %-36s  %s  (storageLabel: %s)\n' "$uid" "$name" "${storage_label:-<empty>}"
+      local folder
+      folder=$(_ask "  Folder for \"$name\" (DB key: $key)" "$default_folder")
+      new_user_map["$key"]="$folder"
+    done <<< "$users_raw"
   else
-    echo "Cannot reach DB — USER_MAP left empty."
+    echo "No users found / DB unreachable — USER_MAP left empty."
     echo "Re-run 'setup' once Immich is running to populate it."
   fi
 
   echo
-  echo "── Archive thresholds ──"
-  threshold_high=$(_ask "ARCHIVE_THRESHOLD_HIGH (% trigger)" "$threshold_high")
-  threshold_low=$(_ask  "ARCHIVE_THRESHOLD_LOW  (% target)"  "$threshold_low")
+  echo "── Archive boundaries (library size) ──"
+  # Show the current footprint and the host disk so the user can pick sensible limits.
+  local lib_path="${upload_location}/library"
+  local cur_lib_bytes=0 disk_total=0 disk_free=0
+  [[ -d "$lib_path" ]] && cur_lib_bytes=$(dir_size_bytes "$lib_path")
+  if [[ -n "$upload_location" && -d "$upload_location" ]]; then
+    disk_total=$(disk_total_bytes "$upload_location")
+    disk_free=$(disk_free_bytes "$upload_location")
+  fi
+  printf '  Library size now : %s\n' "$(bytes_to_human "${cur_lib_bytes:-0}")"
+  printf '  Disk hosting it  : %s total, %s free\n' \
+    "$(bytes_to_human "${disk_total:-0}")" "$(bytes_to_human "${disk_free:-0}")"
+  echo '  Set each boundary as GB (e.g. 200) or % of total disk (e.g. 80%).'
+  echo '  Archiving starts when the library exceeds HIGH and runs down to LOW.'
+
+  while true; do
+    local high_in
+    high_in=$(_ask "  HIGH boundary — max library size" "$library_max_gb")
+    library_max_gb=$(_size_input_to_gb "$high_in" "${disk_total:-0}")
+    if [[ -n "$library_max_gb" ]] && (( library_max_gb > 0 )); then
+      [[ "$high_in" == *% ]] && printf '    -> %s of %s = %s GB\n' \
+        "$high_in" "$(bytes_to_human "${disk_total:-0}")" "$library_max_gb"
+      break
+    fi
+    echo "  Invalid value. Enter a positive number of GB, or a % (needs a detectable disk)."
+  done
+
+  while true; do
+    local low_in
+    low_in=$(_ask "  LOW boundary — target after archiving" "$library_target_gb")
+    library_target_gb=$(_size_input_to_gb "$low_in" "${disk_total:-0}")
+    if [[ -n "$library_target_gb" ]] && (( library_target_gb > 0 )) \
+       && (( library_target_gb < library_max_gb )); then
+      [[ "$low_in" == *% ]] && printf '    -> %s of %s = %s GB\n' \
+        "$low_in" "$(bytes_to_human "${disk_total:-0}")" "$library_target_gb"
+      break
+    fi
+    echo "  Invalid value. Must be a positive size below HIGH (${library_max_gb} GB)."
+  done
 
   echo
   echo "── DB backup ──"
@@ -282,14 +344,10 @@ _setup() {
 
   # Schema check (non-blocking warning).
   echo
-  IMMICH_DB_CONTAINER="$db_container"
-  IMMICH_DB_USER="$db_user"
-  IMMICH_DB_NAME="$db_name"
-  # Make path-consistency helpers see the values entered in this wizard.
+  # Make schema/path-consistency helpers see the values entered in this wizard.
   IMMICH_DB_LIBRARY_PREFIX="$db_library_prefix"
   ARCHIVE_CONTAINER_PATH="$archive_container_path"
-  if $DOCKER_CMD exec -i "$db_container" psql \
-       -U "$db_user" -d "$db_name" -t -A -c "SELECT 1;" &>/dev/null 2>&1; then
+  if _db_reachable; then
     if ! db_check_schema 2>/dev/null; then
       echo "WARNING: Schema check failed — the Immich DB schema may have changed."
       echo "         Review the script before using it against this Immich version."
@@ -319,10 +377,10 @@ _setup() {
     IMMICH_DB_USER           "$db_user" \
     ARCHIVE_DEST_PATH        "$archive_dest" \
     ARCHIVE_CONTAINER_PATH   "$archive_container_path" \
-    ARCHIVE_STORAGE_ID       "$storage_id" \
-    ARCHIVE_THRESHOLD_HIGH   "$threshold_high" \
-    ARCHIVE_THRESHOLD_LOW    "$threshold_low" \
-    BACKUP_RETENTION         "$backup_retention" \
+    ARCHIVE_STORAGE_ID        "$storage_id" \
+    ARCHIVE_LIBRARY_MAX_GB    "$library_max_gb" \
+    ARCHIVE_LIBRARY_TARGET_GB "$library_target_gb" \
+    BACKUP_RETENTION          "$backup_retention" \
     LOG_DIR                  "$log_dir" \
     LOG_MAX_LINES            "$log_max_lines"
 
@@ -363,9 +421,10 @@ ARCHIVE_DEST_PATH="${archive_dest}"
 ARCHIVE_CONTAINER_PATH="${archive_container_path}"
 ARCHIVE_STORAGE_ID="${storage_id}"
 
-# --- Archive thresholds ---
-ARCHIVE_THRESHOLD_HIGH=${threshold_high}
-ARCHIVE_THRESHOLD_LOW=${threshold_low}
+# --- Archive boundaries (library size, in GB; 1 GB = 1024^3 bytes) ---
+# Archiving starts when library/ exceeds MAX and runs until it drops to TARGET.
+ARCHIVE_LIBRARY_MAX_GB=${library_max_gb}
+ARCHIVE_LIBRARY_TARGET_GB=${library_target_gb}
 
 # --- DB backup ---
 BACKUP_RETENTION=${backup_retention}
@@ -394,12 +453,16 @@ _status() {
 
   local library_path="${IMMICH_UPLOAD_LOCATION:-}/library"
   if [[ -d "$library_path" ]]; then
-    local usage
-    usage=$(disk_usage_percent "$library_path/")
-    printf 'Library space        : %s%% used  [high: %s%% — low: %s%%]\n' \
-      "$usage" "${ARCHIVE_THRESHOLD_HIGH:-?}" "${ARCHIVE_THRESHOLD_LOW:-?}"
+    local lib_bytes disk_total disk_free
+    lib_bytes=$(dir_size_bytes "$library_path")
+    disk_total=$(disk_total_bytes "${IMMICH_UPLOAD_LOCATION}")
+    disk_free=$(disk_free_bytes "${IMMICH_UPLOAD_LOCATION}")
+    printf 'Library size         : %s  [max: %s GB — target: %s GB]\n' \
+      "$(bytes_to_human "$lib_bytes")" "${ARCHIVE_LIBRARY_MAX_GB:-?}" "${ARCHIVE_LIBRARY_TARGET_GB:-?}"
+    printf 'Disk (library FS)    : %s total, %s free\n' \
+      "$(bytes_to_human "${disk_total:-0}")" "$(bytes_to_human "${disk_free:-0}")"
   else
-    printf 'Library space        : unavailable (%s not found)\n' "$library_path"
+    printf 'Library size         : unavailable (%s not found)\n' "$library_path"
   fi
 
   local storage_ready=false
@@ -434,7 +497,7 @@ _status() {
   fi
   printf 'Cron jobs            : %s\n' "$cron_status"
 
-  local log_file="${LOG_DIR:-/var/log/immich-auto-dumper}/immich-auto-dumper.log"
+  local log_file="${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper}/immich-auto-dumper.log"
   if [[ -f "$log_file" ]]; then
     local last_archive last_backup
     last_archive=$(grep 'Archive complete' "$log_file" | tail -1 || true)
@@ -484,23 +547,35 @@ _start() {
     return 1
   fi
 
-  local current_crontab
-  current_crontab=$(crontab -l 2>/dev/null || true)
+  # Render the template with the real binary path and log directory, so cron does not
+  # depend on PATH or on a fixed /usr/local/bin or /var/log location.
+  local bin logdir rendered
+  bin=$(_resolve_self_bin)
+  logdir="${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper}"
+  mkdir -p "$logdir" 2>/dev/null || true
+  rendered=$(sed -e "s|__BIN__|${bin}|g" -e "s|__LOGDIR__|${logdir}|g" "$crontab_example")
+
+  # Re-enable any entries a previous 'stop' commented out (symmetric to disable_cron),
+  # then append any that are still missing. Without the un-comment step, a commented
+  # line would match the substring check below and 'start' after 'stop' would no-op.
+  local current
+  current=$(crontab -l 2>/dev/null | sed 's|^#\(.*immich-auto-dumper.*\)|\1|' || true)
 
   local new_entries=""
   while IFS= read -r line; do
     [[ "$line" =~ ^# || -z "$line" ]] && continue
-    if ! printf '%s\n' "$current_crontab" | grep -qF "$line"; then
+    if ! printf '%s\n' "$current" | grep -qF -- "$line"; then
       new_entries+="$line"$'\n'
     fi
-  done < "$crontab_example"
+  done <<< "$rendered"
 
   if [[ -z "$new_entries" ]]; then
-    echo "Cron jobs already installed."
+    printf '%s\n' "$current" | crontab -
+    echo "Cron jobs enabled."
     return 0
   fi
 
-  printf '%s\n%s' "$current_crontab" "$new_entries" | crontab -
+  printf '%s\n%s' "$current" "$new_entries" | crontab -
   echo "Cron jobs installed."
 }
 

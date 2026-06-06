@@ -178,16 +178,27 @@ archive_run() {
     return 0
   fi
 
-  local usage
-  usage=$(disk_usage_percent "$IMMICH_UPLOAD_LOCATION/library/")
+  # Drive archiving by the library's actual size (du of library/), compared against
+  # absolute boundaries in GB. This is independent of any unrelated data sharing the
+  # same filesystem. 1 GB = 1024^3 bytes (matches bytes_to_human / du -B G).
+  local lib_bytes
+  lib_bytes=$(dir_size_bytes "$IMMICH_UPLOAD_LOCATION/library")
+  local max_bytes=$(( ${ARCHIVE_LIBRARY_MAX_GB:-0} * 1073741824 ))
+  local target_bytes=$(( ${ARCHIVE_LIBRARY_TARGET_GB:-0} * 1073741824 ))
 
-  if (( usage < ARCHIVE_THRESHOLD_HIGH )); then
-    log_info "Sufficient space: ${usage}% used (high threshold: ${ARCHIVE_THRESHOLD_HIGH}%)."
+  if (( max_bytes <= 0 )); then
+    log_error "ARCHIVE_LIBRARY_MAX_GB is not configured — run: immich-auto-dumper setup"
+    release_lock
+    return 1
+  fi
+
+  if (( lib_bytes <= max_bytes )); then
+    log_info "Library $(bytes_to_human "$lib_bytes") within limit (max $(bytes_to_human "$max_bytes")) — nothing to archive."
     release_lock
     return 0
   fi
 
-  log_info "Archive triggered: ${usage}% used (high: ${ARCHIVE_THRESHOLD_HIGH}%, target: ${ARCHIVE_THRESHOLD_LOW}%)."
+  log_info "Archive triggered: library $(bytes_to_human "$lib_bytes") exceeds max $(bytes_to_human "$max_bytes") (target $(bytes_to_human "$target_bytes"))."
 
   # Safety: never modify the database unless a recent (<7 days) Immich DB backup
   # exists. Archiving rewrites "originalPath" rows, so a fresh dump is the safety net.
@@ -197,10 +208,7 @@ archive_run() {
     return 1
   fi
 
-  local total_kb
-  total_kb=$(df --output=size "$IMMICH_UPLOAD_LOCATION" | tail -1 | tr -d ' ')
-  local bytes_to_free
-  bytes_to_free=$(echo "($usage - $ARCHIVE_THRESHOLD_LOW) * $total_kb * 1024 / 100" | bc)
+  local bytes_to_free=$(( lib_bytes - target_bytes ))
 
   local freed_bytes=0
 

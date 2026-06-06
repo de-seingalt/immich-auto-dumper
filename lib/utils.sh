@@ -29,18 +29,25 @@ _log() {
     esac
   fi
 
-  local log_file="${LOG_DIR:-/var/log/immich-auto-dumper}/immich-auto-dumper.log"
-  mkdir -p "$(dirname "$log_file")"
-  printf '%s\n' "$line" >> "$log_file"
+  # File logging must never abort the program (set -e). If the log directory is not
+  # writable — e.g. the old /var/log default under a non-root, no-sudo install — we
+  # simply skip file logging instead of killing the run. Default lives under the
+  # user's XDG state dir so it works without privileges.
+  local log_file="${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper}/immich-auto-dumper.log"
+  mkdir -p "$(dirname "$log_file")" 2>/dev/null || return 0
+  printf '%s\n' "$line" >> "$log_file" 2>/dev/null || return 0
 
   local max_lines="${LOG_MAX_LINES:-1000}"
   local current_lines
-  current_lines=$(wc -l < "$log_file")
+  current_lines=$(wc -l < "$log_file" 2>/dev/null || echo 0)
   if (( current_lines > max_lines )); then
     local tmp
-    tmp=$(mktemp)
-    tail -n "$max_lines" "$log_file" > "$tmp"
-    mv "$tmp" "$log_file"
+    tmp=$(mktemp 2>/dev/null) || return 0
+    if tail -n "$max_lines" "$log_file" > "$tmp" 2>/dev/null; then
+      mv "$tmp" "$log_file" 2>/dev/null || rm -f "$tmp"
+    else
+      rm -f "$tmp"
+    fi
   fi
 }
 
@@ -188,10 +195,19 @@ disable_cron() {
 
 # ── Disk ──────────────────────────────────────────────────────────────────────
 
-disk_usage_percent() {
+# Apparent size (sum of file sizes) of a directory, in bytes. 0 if absent/unreadable.
+# Measures the library directory itself rather than the whole filesystem, so archiving
+# is driven by Immich's actual footprint, not by unrelated data on the same disk.
+dir_size_bytes() {
   local path="$1"
-  df --output=pcent "$path" | tail -1 | tr -d ' %'
+  [[ -d "$path" ]] || { printf '0\n'; return 0; }
+  du -sb "$path" 2>/dev/null | cut -f1 || printf '0\n'
 }
+
+# Total / available size, in bytes, of the filesystem hosting <path>. Used only to
+# show hints and to translate a percentage boundary into an absolute GB value.
+disk_total_bytes() { df -B1 --output=size  "$1" 2>/dev/null | tail -1 | tr -d ' '; }
+disk_free_bytes()  { df -B1 --output=avail "$1" 2>/dev/null | tail -1 | tr -d ' '; }
 
 bytes_to_human() {
   local bytes="$1"
