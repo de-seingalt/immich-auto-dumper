@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve through a possible symlink (e.g. ~/.local/bin/immich-auto-dumper) so the
+# lib/, config.conf and cron/ paths below are found relative to the real install
+# dir, not the symlink's directory. Cron and PATH invocations go through that link.
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/config.conf"
 
 source "$SCRIPT_DIR/lib/utils.sh"
@@ -559,8 +562,11 @@ _start() {
   # Re-enable any entries a previous 'stop' commented out (symmetric to disable_cron),
   # then append any that are still missing. Without the un-comment step, a commented
   # line would match the substring check below and 'start' after 'stop' would no-op.
+  # Only un-comment lines whose payload looks like a cron schedule (starts with a
+  # digit, '*' or '@'), so a plain user comment mentioning immich-auto-dumper is
+  # never turned into an invalid crontab line.
   local current
-  current=$(crontab -l 2>/dev/null | sed 's|^#\(.*immich-auto-dumper.*\)|\1|' || true)
+  current=$(crontab -l 2>/dev/null | sed 's|^#\([0-9*@].*immich-auto-dumper.*\)|\1|' || true)
 
   local new_entries=""
   while IFS= read -r line; do

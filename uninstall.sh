@@ -13,7 +13,9 @@ set -euo pipefail
 # while running, so we relocate a copy to a temp path and re-exec from there before
 # removing anything. INSTALL_DIR carries the original location across the re-exec.
 if [[ "${IAD_RELOCATED:-}" != "1" ]]; then
-  src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # pwd -P (physical) so INSTALL_DIR is canonical and comparable to the readlink -f
+  # symlink target below, even when a component of $HOME is itself a symlink.
+  src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
   tmp_self="$(mktemp)"
   cp -- "${BASH_SOURCE[0]}" "$tmp_self"
   IAD_RELOCATED=1 INSTALL_DIR="$src_dir" TMP_SELF="$tmp_self" \

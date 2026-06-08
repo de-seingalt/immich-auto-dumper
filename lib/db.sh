@@ -19,6 +19,12 @@ _db_escape_like() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/%/\\%/g' -e 's/_/\\_/g'
 }
 
+# Escapes POSIX-regex metacharacters so a path is matched literally inside a
+# regexp_replace/`~` pattern. Apply BEFORE _db_escape (same ordering as _db_escape_like).
+_db_escape_regex() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/[][(){}.*+?^$|]/\\&/g'
+}
+
 # ── Schema validation ─────────────────────────────────────────────────────────
 
 # Verifies that required tables and columns exist in the Immich schema.
@@ -107,7 +113,8 @@ db_get_folder_assets() {
 # Groups by the immediate parent directory of each asset (template-agnostic).
 db_get_archive_candidates() {
   local escaped_library_prefix
-  escaped_library_prefix=$(_db_escape "${IMMICH_DB_LIBRARY_PREFIX}/")
+  # regexp_replace below treats this as a regex anchor, so escape regex metachars first.
+  escaped_library_prefix=$(_db_escape "$(_db_escape_regex "${IMMICH_DB_LIBRARY_PREFIX}/")")
   local escaped_archive_prefix
   escaped_archive_prefix=$(_db_escape "$(_db_escape_like "${ARCHIVE_CONTAINER_PATH}")")
 

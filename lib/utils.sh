@@ -201,7 +201,14 @@ disable_cron() {
 dir_size_bytes() {
   local path="$1"
   [[ -d "$path" ]] || { printf '0\n'; return 0; }
-  du -sb "$path" 2>/dev/null | cut -f1 || printf '0\n'
+  # Capture then validate. du can exit non-zero (e.g. an unreadable subdir under a
+  # no-sudo install) while still printing a partial total; with pipefail that would
+  # trip set -e, and chaining `|| printf 0` onto the pipeline would emit a SECOND
+  # line on top of du's output, corrupting later arithmetic. Keep one clean integer.
+  local size
+  size=$(du -sb "$path" 2>/dev/null | cut -f1) || true
+  [[ "$size" =~ ^[0-9]+$ ]] || size=0
+  printf '%s\n' "$size"
 }
 
 # Total / available size, in bytes, of the filesystem hosting <path>. Used only to
