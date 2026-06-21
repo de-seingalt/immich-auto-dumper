@@ -179,15 +179,20 @@ archive_run() {
   fi
 
   # Drive archiving by the library's actual size (du of library/), compared against
-  # absolute boundaries in GB. This is independent of any unrelated data sharing the
-  # same filesystem. 1 GB = 1024^3 bytes (matches bytes_to_human / du -B G).
+  # absolute boundaries. This is independent of any unrelated data sharing the same
+  # filesystem. Boundaries are stored in MiB (1 MiB = 1024^2 bytes) so fractional-GB
+  # limits are expressible; the deprecated *_GB keys are still honored for configs
+  # written before the switch (1 GiB = 1024 MiB).
   local lib_bytes
   lib_bytes=$(dir_size_bytes "$IMMICH_UPLOAD_LOCATION/library")
-  local max_bytes=$(( ${ARCHIVE_LIBRARY_MAX_GB:-0} * 1073741824 ))
-  local target_bytes=$(( ${ARCHIVE_LIBRARY_TARGET_GB:-0} * 1073741824 ))
+  local max_mb="${ARCHIVE_LIBRARY_MAX_MB:-}" target_mb="${ARCHIVE_LIBRARY_TARGET_MB:-}"
+  [[ -z "$max_mb"    && -n "${ARCHIVE_LIBRARY_MAX_GB:-}"    ]] && max_mb=$(( ARCHIVE_LIBRARY_MAX_GB * 1024 ))
+  [[ -z "$target_mb" && -n "${ARCHIVE_LIBRARY_TARGET_GB:-}" ]] && target_mb=$(( ARCHIVE_LIBRARY_TARGET_GB * 1024 ))
+  local max_bytes=$(( ${max_mb:-0} * 1048576 ))
+  local target_bytes=$(( ${target_mb:-0} * 1048576 ))
 
   if (( max_bytes <= 0 )); then
-    log_error "ARCHIVE_LIBRARY_MAX_GB is not configured — run: immich-auto-dumper setup"
+    log_error "Archive size limit is not configured — run: immich-auto-dumper setup"
     release_lock
     return 1
   fi

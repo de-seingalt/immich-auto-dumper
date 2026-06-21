@@ -24,12 +24,14 @@ ARCHIVE_STORAGE_ID=""
 # DB backups will be placed in : $ARCHIVE_DEST_PATH/.immich-backup/
 # Archived photos will be in   : $ARCHIVE_DEST_PATH/<FolderName>/...
 
-# --- Archive boundaries (library size, in GB; 1 GB = 1024^3 bytes) ---
+# --- Archive boundaries (library size, in MiB; 1 GiB = 1024 MiB) ---
 # Driven by the actual size of UPLOAD_LOCATION/library (not whole-disk usage).
-# `setup` shows the current library size and free disk, and can convert a
-# percentage of the disk into these absolute GB values for you.
-ARCHIVE_LIBRARY_MAX_GB=200         # archiving starts when library/ exceeds this
-ARCHIVE_LIBRARY_TARGET_GB=150      # archiving runs until library/ drops to this
+# `setup` accepts GB, MB or a percentage of the disk (e.g. 200, 1.5G, 500M, 80%)
+# and stores the result here in MiB, so fractional-GB limits are possible.
+# (The older ARCHIVE_LIBRARY_MAX_GB / ARCHIVE_LIBRARY_TARGET_GB keys are still
+#  honored for backward compatibility if the *_MB keys are absent.)
+ARCHIVE_LIBRARY_MAX_MB=204800      # archiving starts when library/ exceeds this (=200 GiB)
+ARCHIVE_LIBRARY_TARGET_MB=153600   # archiving runs until library/ drops to this (=150 GiB)
 
 # --- DB backup ---
 BACKUP_RETENTION=14                # Number of backup files to keep

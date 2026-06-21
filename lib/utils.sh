@@ -212,9 +212,23 @@ dir_size_bytes() {
 }
 
 # Total / available size, in bytes, of the filesystem hosting <path>. Used only to
-# show hints and to translate a percentage boundary into an absolute GB value.
-disk_total_bytes() { df -B1 --output=size  "$1" 2>/dev/null | tail -1 | tr -d ' '; }
-disk_free_bytes()  { df -B1 --output=avail "$1" 2>/dev/null | tail -1 | tr -d ' '; }
+# show hints and to translate a percentage boundary into an absolute size.
+#
+# Uses POSIX `df -kP` (1K-blocks, portable column layout) rather than GNU-only
+# `df -B1 --output=...`, which silently produced empty output on non-GNU df and
+# left the wizard showing "0 B total". The -P "portable" format guarantees one
+# data line even when the device name is long enough to wrap. Output is 0 when
+# the path is empty/missing so callers can detect "no disk info".
+disk_total_bytes() {
+  local v
+  v=$(df -kP "$1" 2>/dev/null | awk 'NR==2 {printf "%.0f", $2 * 1024}')
+  [[ "$v" =~ ^[0-9]+$ ]] && printf '%s\n' "$v" || printf '0\n'
+}
+disk_free_bytes() {
+  local v
+  v=$(df -kP "$1" 2>/dev/null | awk 'NR==2 {printf "%.0f", $4 * 1024}')
+  [[ "$v" =~ ^[0-9]+$ ]] && printf '%s\n' "$v" || printf '0\n'
+}
 
 bytes_to_human() {
   local bytes="$1"
