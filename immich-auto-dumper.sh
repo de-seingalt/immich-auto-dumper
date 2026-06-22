@@ -9,6 +9,7 @@ CONFIG_FILE="$SCRIPT_DIR/config.conf"
 
 source "$SCRIPT_DIR/lib/utils.sh"
 source "$SCRIPT_DIR/lib/ui.sh"
+source "$SCRIPT_DIR/lib/detect.sh"
 source "$SCRIPT_DIR/lib/db.sh"
 source "$SCRIPT_DIR/lib/backup_db.sh"
 source "$SCRIPT_DIR/lib/archive.sh"
@@ -173,100 +174,167 @@ _resolve_storage_marker() {
 
 _setup() {
   ui_detect
-  ui_banner "immich-auto-dumper — configuration"
-  ui_info "Welcome" \
-    "This wizard will configure immich-auto-dumper.\n\nEach question shows a suggested value (auto-detected when possible) that you can accept or edit. Choose Cancel at any prompt to abort without writing anything.\n\nSizes accept GB, MB or a percentage of the disk — e.g. 200, 1.5G, 500M, 80%."
+  ui_banner "immich-auto-dumper — guided setup"
 
-  # Detect docker command first; all DB queries below depend on it.
+  # Detect docker command first; everything below depends on it.
   detect_docker_cmd
 
-  local db_container="${IMMICH_DB_CONTAINER:-immich_postgres}"
-  local server_container="${IMMICH_SERVER_CONTAINER:-immich_server}"
-  local upload_location="${IMMICH_UPLOAD_LOCATION:-}"
-  local db_name="${IMMICH_DB_NAME:-immich}"
-  local db_user="${IMMICH_DB_USER:-postgres}"
-  local archive_dest="${ARCHIVE_DEST_PATH:-}"
-  local archive_container_path="${ARCHIVE_CONTAINER_PATH:-}"
-  local db_library_prefix="${IMMICH_DB_LIBRARY_PREFIX:-}"
-  local backup_retention="${BACKUP_RETENTION:-14}"
-  local log_dir="${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper}"
-  local log_max_lines="${LOG_MAX_LINES:-1000}"
+  # ── 1. Containers (auto-detected) ───────────────────────────────────────────
+  detect_immich_containers
+  local db_container="$DET_DB_CONTAINER" server_container="$DET_SERVER_CONTAINER"
+  if [[ -z "$server_container" || -z "$db_container" ]]; then
+    ui_info "Immich not found" \
+      "Could not find the running Immich containers (server and/or PostgreSQL).\n\nimmich-auto-dumper configures itself from your live Immich install, so Immich must be running.\n\nStart Immich, then run setup again. Nothing was changed."
+    return 0
+  fi
 
-  # Archive boundaries, internally in MiB. Honor either the new *_MB keys or the
-  # deprecated *_GB keys when seeding the defaults from an existing config.
-  local def_max_mb="${ARCHIVE_LIBRARY_MAX_MB:-}" def_target_mb="${ARCHIVE_LIBRARY_TARGET_MB:-}"
-  [[ -z "$def_max_mb"    && -n "${ARCHIVE_LIBRARY_MAX_GB:-}"    ]] && def_max_mb=$(( ARCHIVE_LIBRARY_MAX_GB * 1024 ))
-  [[ -z "$def_target_mb" && -n "${ARCHIVE_LIBRARY_TARGET_GB:-}" ]] && def_target_mb=$(( ARCHIVE_LIBRARY_TARGET_GB * 1024 ))
-
-  # Auto-detect active Immich containers so the defaults are pre-filled.
-  local detected
-  detected=$($DOCKER_CMD ps --format '{{.Names}}' 2>/dev/null || true)
-  local d_db d_server
-  d_db=$(printf '%s\n' "$detected" | grep -i 'postgres\|immich.*db\|db.*immich' | head -1 || true)
-  d_server=$(printf '%s\n' "$detected" | grep -i 'immich.server\|immich-server' | head -1 || true)
-  [[ -n "$d_db" ]] && db_container="$d_db"
-  [[ -n "$d_server" ]] && server_container="$d_server"
-
-  ui_section "Docker containers"
-  ui_input "$(_wiz_title "PostgreSQL container")" \
-    "Name of the Immich PostgreSQL container.\n\n${d_db:+Auto-detected from running containers.}" \
-    "$db_container" || { ui_info "Setup" "Cancelled. Nothing written."; return 0; }
-  db_container="$UI_VALUE"
-  ui_input "$(_wiz_title "immich_server container")" \
-    "Name of the Immich server container.\n\n${d_server:+Auto-detected from running containers.}" \
-    "$server_container" || { ui_info "Setup" "Cancelled. Nothing written."; return 0; }
-  server_container="$UI_VALUE"
-
-  # Expose the DB connection settings as globals so the lib/db.sh helpers
-  # (_db_reachable, db_detect_library_prefix, db_get_users, db_check_schema...) can be
-  # reused below instead of re-implementing inline psql calls.
+  # DB credentials — read from the server container env when Immich exposes them.
+  detect_db_credentials "$server_container"
+  local db_user="${DET_DB_USER:-${IMMICH_DB_USER:-postgres}}"
+  local db_name="${DET_DB_NAME:-${IMMICH_DB_NAME:-immich}}"
   IMMICH_DB_CONTAINER="$db_container"
   IMMICH_DB_USER="$db_user"
   IMMICH_DB_NAME="$db_name"
 
-  ui_section "Immich storage"
-  ui_input "$(_wiz_title "Upload location")" \
-    "Host path of Immich's UPLOAD_LOCATION (the folder that contains library/, backups/, ...).\n\nThis is read from your Immich docker-compose .env file." \
-    "$upload_location" || { ui_info "Setup" "Cancelled. Nothing written."; return 0; }
-  upload_location="$UI_VALUE"
+  ui_info "Immich detected" \
+    "Found your Immich installation:\n\n  server container   : $server_container\n  postgres container : $db_container\n  database           : $db_name (user: $db_user)\n\nThe next steps confirm what the wizard detected from this install."
 
-  ui_section "External storage"
-  ui_input "$(_wiz_title "External storage (host path)")" \
-    "Host path where archived photos and DB backups are written (your big/cold disk or remote mount)." \
-    "$archive_dest" || { ui_info "Setup" "Cancelled. Nothing written."; return 0; }
-  archive_dest="$UI_VALUE"
-  ui_input "$(_wiz_title "External storage (container path)")" \
-    "The SAME external storage, but as seen from inside the immich_server container (its mount point in docker-compose)." \
-    "$archive_container_path" || { ui_info "Setup" "Cancelled. Nothing written."; return 0; }
-  archive_container_path="$UI_VALUE"
+  # ── 2. Library prefix (from the DB) and upload mount (from docker) ───────────
+  local db_library_prefix=""
+  if _db_reachable && db_detect_library_prefix 2>/dev/null; then
+    db_library_prefix="$IMMICH_DB_LIBRARY_PREFIX"
+  fi
 
-  # Establishes/recognizes the storage identity (install, relocation, conflict).
+  detect_upload_mount "$server_container" "$db_library_prefix"
+  local upload_location="$DET_UPLOAD_LOCATION"
+  # Derive the DB prefix from the upload mount when the DB held no sample asset.
+  if [[ -z "$db_library_prefix" && -n "$DET_UPLOAD_CONTAINER" ]]; then
+    db_library_prefix="${DET_UPLOAD_CONTAINER%/}/library"
+  fi
+  [[ -z "$db_library_prefix" ]] && db_library_prefix="/usr/src/app/upload/library"
+  IMMICH_DB_LIBRARY_PREFIX="$db_library_prefix"
+
+  # ── 3. External library — REQUIRED ──────────────────────────────────────────
+  # immich-auto-dumper moves photos into an Immich external library that Immich
+  # keeps reading. With no external library it has nothing to do and cannot work.
+  local -a ext_list=()
+  mapfile -t ext_list < <(detect_external_libraries "$server_container" "$DET_UPLOAD_CONTAINER")
+  # Drop any empty lines mapfile may have captured.
+  local -a ext_clean=()
+  local e
+  for e in "${ext_list[@]}"; do [[ -n "$e" ]] && ext_clean+=("$e"); done
+  ext_list=("${ext_clean[@]}")
+
+  if (( ${#ext_list[@]} == 0 )); then
+    ui_info "No external library found" \
+      "No Immich *external library* is mounted in '$server_container'.\n\nThis tool moves photos OUT of Immich's internal library and INTO an external library that Immich still reads. Without one, it has nothing to archive to and cannot run.\n\nAdd an external library to your Immich docker-compose (a host bind-mount, then register it in Immich's admin UI), and run setup again.\n\nNothing was changed and no jobs were scheduled."
+    return 0
+  fi
+
+  local archive_dest="" archive_container_path=""
+  if (( ${#ext_list[@]} == 1 )); then
+    IFS='|' read -r archive_dest archive_container_path <<< "${ext_list[0]}"
+    if ! ui_yesno "External library" \
+      "Detected one Immich external library — archived photos will be moved here:\n\n  host path      : $archive_dest\n  container path : $archive_container_path\n\nUse this external library?"; then
+      ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."
+      return 0
+    fi
+  else
+    # Several external libraries: let the user choose the destination.
+    local -a menu_args=()
+    local idx=1 host cont
+    for e in "${ext_list[@]}"; do
+      IFS='|' read -r host cont <<< "$e"
+      menu_args+=("$idx" "$host  →  $cont")
+      idx=$(( idx + 1 ))
+    done
+    ui_menu "Choose external library" \
+      "Your Immich install has several external libraries. Pick the one immich-auto-dumper should move archived photos into:" \
+      "${menu_args[@]}" || { ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."; return 0; }
+    IFS='|' read -r archive_dest archive_container_path <<< "${ext_list[$(( UI_VALUE - 1 ))]}"
+  fi
+  ARCHIVE_CONTAINER_PATH="$archive_container_path"
+
+  # ── 4. Confirm the upload location (host path of the internal library) ───────
+  if [[ -z "$upload_location" || ! -d "$upload_location" ]]; then
+    ui_input "$(_wiz_title "Immich upload location")" \
+      "Could not auto-detect Immich's upload location on this host (the folder that holds library/, backups/, thumbs/...).\n\nEnter it manually, or leave empty to abort." \
+      "$upload_location" || { ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."; return 0; }
+    upload_location="$UI_VALUE"
+  fi
+  if [[ -z "$upload_location" || ! -d "$upload_location/library" ]]; then
+    if ! ui_yesno "Upload location unusable" \
+      "'$upload_location' does not look like an Immich upload location (no library/ folder found).\n\nWithout it the current library size cannot be measured and archiving cannot run.\n\nContinue anyway? (Choose No to abort without writing or scheduling anything.)" no; then
+      ui_info "Setup" "Aborted — nothing was written and no jobs were scheduled."
+      return 0
+    fi
+  fi
+  IMMICH_UPLOAD_LOCATION="$upload_location"
+
+  # ── 5. Storage marker (install / relocation / conflict) ─────────────────────
   local storage_id
   STORAGE_ID_RESULT=""
   _resolve_storage_marker "$archive_dest" "${ARCHIVE_STORAGE_ID:-}"
   storage_id="$STORAGE_ID_RESULT"
-  # Keep the global in sync so later readiness/consistency checks use this id.
   ARCHIVE_STORAGE_ID="$storage_id"
 
-  ui_section "Library prefix detection"
-  # Auto-detect IMMICH_DB_LIBRARY_PREFIX from a sample asset path (reuses lib/db.sh).
-  local detected_prefix="" prefix_note=""
-  if _db_reachable && db_detect_library_prefix 2>/dev/null; then
-    detected_prefix="$IMMICH_DB_LIBRARY_PREFIX"
+  # ── 6. Archive boundaries with a visual disk gauge ──────────────────────────
+  local cur_lib_bytes=0 disk_total=0 disk_free=0 disk_used=0
+  [[ -d "$upload_location/library" ]] && cur_lib_bytes=$(dir_size_bytes "$upload_location/library")
+  if [[ -n "$upload_location" && -d "$upload_location" ]]; then
+    disk_total=$(disk_total_bytes "$upload_location")
+    disk_free=$(disk_free_bytes "$upload_location")
+    disk_used=$(( disk_total - disk_free )); (( disk_used < 0 )) && disk_used=0
   fi
-  if [[ -n "$detected_prefix" ]]; then
-    prefix_note="Auto-detected from the Immich database: $detected_prefix"
-    [[ -z "$db_library_prefix" ]] && db_library_prefix="$detected_prefix"
-  else
-    prefix_note="Could not auto-detect (DB unreachable or no assets yet). Using the common default."
-    [[ -z "$db_library_prefix" ]] && db_library_prefix="/data/library"
-  fi
-  ui_input "$(_wiz_title "DB library prefix")" \
-    "Absolute prefix of asset paths stored in the Immich DB (originalPath).\n\n$prefix_note" \
-    "$db_library_prefix" || { ui_info "Setup" "Cancelled. Nothing written."; return 0; }
-  db_library_prefix="$UI_VALUE"
 
-  ui_section "User → folder mapping"
+  # Seed sensible defaults: from an existing config, else from the disk size.
+  local def_max_mb="${ARCHIVE_LIBRARY_MAX_MB:-}" def_target_mb="${ARCHIVE_LIBRARY_TARGET_MB:-}"
+  [[ -z "$def_max_mb"    && -n "${ARCHIVE_LIBRARY_MAX_GB:-}"    ]] && def_max_mb=$(( ARCHIVE_LIBRARY_MAX_GB * 1024 ))
+  [[ -z "$def_target_mb" && -n "${ARCHIVE_LIBRARY_TARGET_GB:-}" ]] && def_target_mb=$(( ARCHIVE_LIBRARY_TARGET_GB * 1024 ))
+  if [[ -z "$def_max_mb" || "$def_max_mb" -le 0 ]]; then
+    if (( disk_total > 0 )); then
+      def_max_mb=$(( disk_total * 80 / 100 / 1048576 ))
+    else
+      def_max_mb=$(( 200 * 1024 ))
+    fi
+  fi
+  (( def_max_mb > 0 )) || def_max_mb=$(( 200 * 1024 ))
+  if [[ -z "$def_target_mb" ]] || (( def_target_mb <= 0 || def_target_mb >= def_max_mb )); then
+    def_target_mb=$(( def_max_mb * 3 / 4 ))
+  fi
+
+  local max_mb="$def_max_mb" target_mb="$def_target_mb" gauge v
+  while true; do
+    gauge=$(render_library_gauge "$disk_total" "$disk_used" "$cur_lib_bytes" "$max_mb" "$target_mb")
+    ui_input "$(_wiz_title "MAX — start archiving above")" \
+      "$gauge\n\nMAX: when the library grows ABOVE this, archiving begins.\nEnter a size — 200, 1.5G, 500M, or 80% of the disk." \
+      "$(mb_to_input "$max_mb")" || { ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."; return 0; }
+    v=$(parse_size_to_mb "$UI_VALUE" "$disk_total")
+    if [[ -z "$v" ]] || (( v <= 0 )); then
+      ui_info "Invalid value" "Enter a positive size, e.g. 200, 1.5G, 500M, 80% (the % needs a detectable disk)."
+      continue
+    fi
+    max_mb="$v"
+    (( target_mb >= max_mb )) && target_mb=$(( max_mb * 3 / 4 ))
+
+    gauge=$(render_library_gauge "$disk_total" "$disk_used" "$cur_lib_bytes" "$max_mb" "$target_mb")
+    ui_input "$(_wiz_title "MIN — archive down to")" \
+      "$gauge\n\nMIN: after archiving, the library is reduced back DOWN to this size.\nMust be below MAX ($(mb_to_human "$max_mb"))." \
+      "$(mb_to_input "$target_mb")" || { ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."; return 0; }
+    v=$(parse_size_to_mb "$UI_VALUE" "$disk_total")
+    if [[ -z "$v" ]] || (( v <= 0 || v >= max_mb )); then
+      ui_info "Invalid value" "MIN must be a positive size BELOW MAX ($(mb_to_human "$max_mb"))."
+      continue
+    fi
+    target_mb="$v"
+
+    gauge=$(render_library_gauge "$disk_total" "$disk_used" "$cur_lib_bytes" "$max_mb" "$target_mb")
+    if ui_yesno "Confirm boundaries" "$gauge\n\nKeep these two boundaries?"; then
+      break
+    fi
+  done
+
+  # ── 7. User → folder mapping (auto-suggested) ───────────────────────────────
   declare -A new_user_map=()
   local users_raw=""
   if _db_reachable; then
@@ -279,110 +347,43 @@ _setup() {
       local current_mapped="${USER_MAP["$key"]:-}"
       local default_folder="${current_mapped:-${storage_label:-$name}}"
       ui_input "$(_wiz_title "Folder for $name")" \
-        "Destination folder on the external storage for this user's photos.\n\nUser        : $name\nstorageLabel: ${storage_label:-<empty>}\nDB key      : $key" \
-        "$default_folder" || { ui_info "Setup" "Cancelled. Nothing written."; return 0; }
+        "Sub-folder name on the external library for this user's archived photos.\n\nUser        : $name\nstorageLabel: ${storage_label:-<empty>}" \
+        "$default_folder" || { ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."; return 0; }
       new_user_map["$key"]="$UI_VALUE"
     done <<< "$users_raw"
-  else
-    ui_info "$(_wiz_title "User mapping")" \
-      "No Immich users found (DB unreachable or empty).\n\nUSER_MAP will be left empty. Re-run setup once Immich is running to populate it."
   fi
 
-  ui_section "Archive boundaries (library size)"
-  # Show the current footprint and the host disk so the user can pick sensible limits.
-  local lib_path="${upload_location}/library"
-  local cur_lib_bytes=0 disk_total=0 disk_free=0
-  [[ -d "$lib_path" ]] && cur_lib_bytes=$(dir_size_bytes "$lib_path")
-  if [[ -n "$upload_location" && -d "$upload_location" ]]; then
-    disk_total=$(disk_total_bytes "$upload_location")
-    disk_free=$(disk_free_bytes "$upload_location")
-  fi
-  local lib_line="Current library size : $(bytes_to_human "${cur_lib_bytes:-0}")"
-  local disk_line
-  if (( disk_total > 0 )); then
-    disk_line="Disk hosting it      : $(bytes_to_human "$disk_total") total, $(bytes_to_human "$disk_free") free"
-  else
-    disk_line="Disk hosting it      : unknown (set an existing upload path to enable % and hints)"
-  fi
+  # Advanced knobs keep sensible defaults (or existing config); no extra prompts.
+  local backup_retention="${BACKUP_RETENTION:-14}"
+  local log_dir="${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper}"
+  local log_max_lines="${LOG_MAX_LINES:-1000}"
 
-  local max_mb=""
-  while true; do
-    ui_input "$(_wiz_title "Max library size")" \
-      "$lib_line\n$disk_line\n\nArchiving STARTS when the library grows past this size.\nAccepted: 200 (GB) · 1.5G · 500M · 80%" \
-      "$(mb_to_input "${def_max_mb:-0}")" || { ui_info "Setup" "Cancelled. Nothing written."; return 0; }
-    max_mb=$(parse_size_to_mb "$UI_VALUE" "$disk_total")
-    if [[ -n "$max_mb" ]] && (( max_mb > 0 )); then
-      break
-    fi
-    ui_info "Invalid value" "Enter a positive size.\nExamples: 200, 1.5G, 500M, 80% (the % needs a detectable disk)."
-  done
-
-  # Suggest a sensible target (75% of max) when none is set or it is no longer valid.
-  if [[ -z "$def_target_mb" ]] || (( def_target_mb >= max_mb )); then
-    def_target_mb=$(( max_mb * 3 / 4 ))
-  fi
-  local target_mb=""
-  while true; do
-    ui_input "$(_wiz_title "Target library size")" \
-      "Max is $(mb_to_human "$max_mb").\n\nAfter archiving, the library is brought back DOWN to this size.\nMust be smaller than the max.\nAccepted: 150 (GB) · 1G · 500M · 60%" \
-      "$(mb_to_input "$def_target_mb")" || { ui_info "Setup" "Cancelled. Nothing written."; return 0; }
-    target_mb=$(parse_size_to_mb "$UI_VALUE" "$disk_total")
-    if [[ -n "$target_mb" ]] && (( target_mb > 0 && target_mb < max_mb )); then
-      break
-    fi
-    ui_info "Invalid value" "The target must be a positive size BELOW the max ($(mb_to_human "$max_mb"))."
-  done
-
-  ui_section "DB backup"
-  ui_input "$(_wiz_title "DB backups to keep")" \
-    "How many Immich database backup files to keep before the oldest are rotated out." \
-    "$backup_retention" || { ui_info "Setup" "Cancelled. Nothing written."; return 0; }
-  backup_retention="$UI_VALUE"
-
-  ui_section "Logs"
-  ui_input "$(_wiz_title "Log directory")" \
-    "Where to write the tool's log file (must be writable without sudo)." \
-    "$log_dir" || { ui_info "Setup" "Cancelled. Nothing written."; return 0; }
-  log_dir="$UI_VALUE"
-  ui_input "$(_wiz_title "Log max lines")" \
-    "Maximum number of lines kept in the log file (older lines are trimmed)." \
-    "$log_max_lines" || { ui_info "Setup" "Cancelled. Nothing written."; return 0; }
-  log_max_lines="$UI_VALUE"
-
-  # Schema / path-consistency checks (non-blocking). Make the helpers see the values
-  # entered in this wizard.
-  IMMICH_DB_LIBRARY_PREFIX="$db_library_prefix"
-  ARCHIVE_CONTAINER_PATH="$archive_container_path"
+  # Schema / path-consistency checks (non-blocking).
   if _db_reachable; then
     if ! db_check_schema 2>/dev/null; then
       ui_info "Schema check" "WARNING: Schema check failed — the Immich DB schema may have changed.\n\nReview the script before using it against this Immich version."
     fi
-    # Case B: surface an external-library path change recorded in Immich's DB.
     if archive_dest_ready 2>/dev/null; then
       local consistency_report
       if ! consistency_report=$(db_check_path_consistency 2>/dev/null); then
-        ui_info "Path consistency" "NOTE: Immich DB path inconsistency detected:\n\n$(printf '%s\n' "$consistency_report" | sed 's/^/  - /')\n\nMake sure the external (container) path matches the external library path now configured in Immich."
+        ui_info "Path consistency" "NOTE: Immich DB path inconsistency detected:\n\n$(printf '%s\n' "$consistency_report" | sed 's/^/  - /')\n\nMake sure the external library path still matches the one configured in Immich."
       fi
     fi
   fi
 
-  # ── Summary & confirmation ──────────────────────────────────────────────────
+  # ── 8. Summary & confirmation ───────────────────────────────────────────────
   local summary
   printf -v summary '%s\n' \
     "Review your configuration:" \
     "" \
-    "PostgreSQL container : $db_container" \
-    "immich_server        : $server_container" \
-    "Upload location      : $upload_location" \
-    "DB library prefix    : $db_library_prefix" \
-    "External (host)      : $archive_dest" \
-    "External (container) : $archive_container_path" \
-    "Storage id           : $storage_id" \
-    "Archive starts above : $(mb_to_human "$max_mb")" \
-    "Archive down to      : $(mb_to_human "$target_mb")" \
-    "DB backups kept      : $backup_retention" \
-    "Log directory        : $log_dir" \
-    "Log max lines        : $log_max_lines"
+    "Immich server      : $server_container" \
+    "PostgreSQL         : $db_container ($db_name / $db_user)" \
+    "Upload location    : $upload_location" \
+    "Internal library   : $db_library_prefix" \
+    "External library   : $archive_dest" \
+    "  (container path)   $archive_container_path" \
+    "Start archiving at : $(mb_to_human "$max_mb")" \
+    "Archive down to    : $(mb_to_human "$target_mb")"
   if (( ${#new_user_map[@]} > 0 )); then
     summary+=$'\nUser → folder:\n'
     for k in "${!new_user_map[@]}"; do
@@ -392,7 +393,7 @@ _setup() {
   summary+=$'\nWrite this to config.conf?'
 
   if ! ui_yesno "Confirm configuration" "$summary" no; then
-    ui_info "Setup" "Cancelled. Nothing written."
+    ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."
     return 0
   fi
 

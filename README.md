@@ -36,7 +36,11 @@ INSTALL_DIR="$HOME/apps/immich-auto-dumper" curl -fsSL .../install.sh | bash
 immich-auto-dumper setup
 ```
 
-The wizard detects active Docker containers, reads users from the database and builds the `storage_label → folder name` mapping on external storage. It can be re-run to update an existing configuration.
+The wizard is **detection-first**: it inspects your running Immich containers (`docker inspect`) and database to determine the server/PostgreSQL containers, the DB credentials, the upload location (host path of the internal library), the asset-path prefix, the users, and the **Immich external library** to archive into. You are only asked to confirm those values, to choose when there is a genuine choice (e.g. several external libraries), and to set the two size boundaries. It can be re-run to update an existing configuration.
+
+Because the tool moves photos into an Immich external library that Immich keeps reading, **an external library is required**: if none is mounted in `immich_server`, the wizard explains this and exits without writing a config or scheduling any job.
+
+The boundaries are chosen on a visual gauge that shows, on the scale of the whole disk, how much is used, how much the Immich library occupies, and where the **MAX** (start archiving) and **MIN** (archive down to) thresholds fall — both set together. Sizes accept GB, MB or a percentage (`200`, `1.5G`, `500M`, `80%`).
 
 Values are written to `config.conf` (gitignored). See `config.conf.example` for the full structure.
 

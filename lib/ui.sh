@@ -232,3 +232,97 @@ mb_to_input() {
     printf '%dM\n' "$mb"
   fi
 }
+
+# ── Disk / library gauge ──────────────────────────────────────────────────────
+#
+# A horizontal bar visualizing, on the scale of the whole disk, how much of it is
+# used, how much the Immich library occupies, and where the MAX (start archiving)
+# and MIN (archive down to) boundaries fall. Unicode block characters are used
+# when the locale supports UTF-8, with a plain-ASCII fallback otherwise.
+
+if [[ "$(locale charmap 2>/dev/null)" == *UTF-8* \
+   || "${LC_ALL:-}${LC_CTYPE:-}${LANG:-}" == *[Uu][Tt][Ff]* ]]; then
+  GAUGE_UTF=1
+else
+  GAUGE_UTF=0
+fi
+
+# Overwrite, in-place, <len(text)> characters of the named variable starting at
+# column <col>, clamping so the text never overflows the string width.
+_gauge_place() {
+  local -n _v="$1"; local c="$2" t="$3" len=${#3} w=${#_v}
+  (( c + len > w )) && c=$(( w - len ))
+  (( c < 0 )) && c=0
+  _v="${_v:0:c}${t}${_v:c+len}"
+}
+
+# render_library_gauge <disk_total> <disk_used> <lib_bytes> <max_mb> <min_mb>
+# Echoes a multi-line visualization. max_mb / min_mb may be 0 to omit a marker.
+render_library_gauge() {
+  local disk_total="${1:-0}" disk_used="${2:-0}" lib_bytes="${3:-0}"
+  local max_mb="${4:-0}" min_mb="${5:-0}"
+  local W=50
+  local max_bytes=$(( max_mb * 1048576 )) min_bytes=$(( min_mb * 1048576 ))
+
+  # Scale to the real disk; fall back to a padded span around the values when the
+  # disk size is unknown (e.g. upload path not local), so the bar still makes sense.
+  local scale="$disk_total"
+  if (( scale <= 0 )); then
+    scale=$max_bytes
+    (( lib_bytes  > scale )) && scale=$lib_bytes
+    (( min_bytes  > scale )) && scale=$min_bytes
+    (( scale <= 0 )) && scale=$(( 1024 * 1048576 ))
+    scale=$(( scale * 5 / 4 ))
+  fi
+
+  local _c
+  _gcol() { _c=$(( $1 * W / scale )); (( _c < 0 )) && _c=0; (( _c > W )) && _c=W; return 0; }
+  local lib_c used_c min_c max_c
+  _gcol "$lib_bytes";  lib_c=$_c
+  _gcol "$disk_used";  used_c=$_c; (( used_c < lib_c )) && used_c=$lib_c
+  _gcol "$min_bytes";  min_c=$_c
+  _gcol "$max_bytes";  max_c=$_c
+
+  local g_full g_other g_empty g_mk g_lb g_rb
+  if (( GAUGE_UTF )); then
+    g_full='█'; g_other='▒'; g_empty='░'; g_mk='▼'; g_lb='├'; g_rb='┤'
+  else
+    g_full='#'; g_other='+'; g_empty='-'; g_mk='v'; g_lb='['; g_rb=']'
+  fi
+
+  local bar="" i
+  for (( i = 0; i < W; i++ )); do
+    if   (( i < lib_c  )); then bar+="$g_full"
+    elif (( i < used_c )); then bar+="$g_other"
+    else                        bar+="$g_empty"; fi
+  done
+
+  # Marker row above the bar (one leading space aligns with the left border g_lb).
+  # Single arrows only — MIN is always left of MAX, so they never need text labels
+  # that could collide when the two boundaries are close on the disk scale.
+  local mrow; printf -v mrow '%*s' "$W" ''
+  (( min_mb > 0 )) && _gauge_place mrow "$min_c" "$g_mk"
+  (( max_mb > 0 )) && _gauge_place mrow "$max_c" "$g_mk"
+
+  # Legend.
+  local lib_pct=0 used_pct=0
+  if (( disk_total > 0 )); then
+    lib_pct=$(( lib_bytes * 100 / disk_total ))
+    used_pct=$(( disk_used * 100 / disk_total ))
+  fi
+
+  printf 'Immich library now: %s (%d%%)   ·   disk used: %s (%d%%)   ·   disk total: %s\n' \
+    "$(bytes_to_human "$lib_bytes")" "$lib_pct" \
+    "$(bytes_to_human "$disk_used")" "$used_pct" \
+    "$(bytes_to_human "$disk_total")"
+  printf ' %s\n'   "$mrow"
+  printf '%s%s%s\n' "$g_lb" "$bar" "$g_rb"
+  if (( min_mb > 0 )); then
+    printf '%s MIN = %-9s archive DOWN to this size\n'        "$g_mk" "$(mb_to_human "$min_mb")"
+  fi
+  if (( max_mb > 0 )); then
+    printf '%s MAX = %-9s START archiving when library exceeds this\n' "$g_mk" "$(mb_to_human "$max_mb")"
+  fi
+  printf '%s library (kept on fast disk)   %s other data   %s free\n' \
+    "$g_full" "$g_other" "$g_empty"
+}
