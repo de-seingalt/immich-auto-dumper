@@ -14,10 +14,11 @@
 # All functions set DET_* globals and/or echo results; none are interactive.
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Raw "Type|Source|Destination" line per mount of a container.
+# Raw "Type|Source|Destination|RW" line per mount of a container. RW is "true"
+# for read-write binds and "false" for read-only ones (:ro).
 _inspect_mounts() {
   $DOCKER_CMD inspect \
-    --format '{{range .Mounts}}{{.Type}}|{{.Source}}|{{.Destination}}{{"\n"}}{{end}}' \
+    --format '{{range .Mounts}}{{.Type}}|{{.Source}}|{{.Destination}}|{{.RW}}{{"\n"}}{{end}}' \
     "$1" 2>/dev/null || true
 }
 
@@ -55,14 +56,14 @@ detect_db_credentials() {
 detect_upload_mount() {
   local container="$1" prefix="${2:-}"
   DET_UPLOAD_LOCATION=""; DET_UPLOAD_CONTAINER=""
-  local mounts type src dst
+  local mounts type src dst rw
   mounts=$(_inspect_mounts "$container")
 
   # Best signal: the mount whose container path is the parent of the DB library
-  # prefix (e.g. prefix /usr/src/app/upload/library -> mount dest /usr/src/app/upload).
+  # prefix (e.g. prefix /data/library -> mount dest /data).
   if [[ -n "$prefix" ]]; then
     local want="${prefix%/library}"
-    while IFS='|' read -r type src dst; do
+    while IFS='|' read -r type src dst rw; do
       [[ "$type" == "bind" ]] || continue
       if [[ "$dst" == "$want" ]]; then
         DET_UPLOAD_LOCATION="$src"; DET_UPLOAD_CONTAINER="$dst"; return 0
@@ -70,16 +71,17 @@ detect_upload_mount() {
     done <<< "$mounts"
   fi
 
-  # Canonical Immich upload destination.
-  while IFS='|' read -r type src dst; do
+  # Canonical Immich upload destinations: modern images bind to /data, older ones
+  # to /usr/src/app/upload.
+  while IFS='|' read -r type src dst rw; do
     [[ "$type" == "bind" ]] || continue
-    if [[ "$dst" == "/usr/src/app/upload" ]]; then
+    if [[ "$dst" == "/data" || "$dst" == "/usr/src/app/upload" ]]; then
       DET_UPLOAD_LOCATION="$src"; DET_UPLOAD_CONTAINER="$dst"; return 0
     fi
   done <<< "$mounts"
 
   # Last resort: a bind mount whose host side actually holds a library/ folder.
-  while IFS='|' read -r type src dst; do
+  while IFS='|' read -r type src dst rw; do
     [[ "$type" == "bind" ]] || continue
     if [[ -n "$src" && -d "$src/library" ]]; then
       DET_UPLOAD_LOCATION="$src"; DET_UPLOAD_CONTAINER="$dst"; return 0
@@ -90,13 +92,15 @@ detect_upload_mount() {
 }
 
 # detect_external_libraries <server_container> <upload_container_path>
-# Echoes one "host_path|container_path" line per external-library candidate:
-# bind mounts that are neither the upload mount nor Immich/system internals.
+# Echoes one "host_path|container_path|rw" line per external-library candidate:
+# bind mounts that are neither the upload mount nor Immich/system internals. The
+# rw field ("true"/"false") lets the caller skip or flag read-only (:ro) mounts,
+# which cannot receive archived files.
 detect_external_libraries() {
   local container="$1" upload_dst="$2"
-  local mounts type src dst
+  local mounts type src dst rw
   mounts=$(_inspect_mounts "$container")
-  while IFS='|' read -r type src dst; do
+  while IFS='|' read -r type src dst rw; do
     [[ "$type" == "bind" ]] || continue
     [[ -z "$src" || -z "$dst" ]] && continue
     [[ -n "$upload_dst" && "$dst" == "$upload_dst" ]] && continue
@@ -108,6 +112,6 @@ detect_external_libraries() {
     case "$src" in
       /etc/localtime|/etc/timezone) continue ;;
     esac
-    printf '%s|%s\n' "$src" "$dst"
+    printf '%s|%s|%s\n' "$src" "$dst" "${rw:-true}"
   done <<< "$mounts"
 }
