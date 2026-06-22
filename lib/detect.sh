@@ -14,11 +14,17 @@
 # All functions set DET_* globals and/or echo results; none are interactive.
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Raw "Type|Source|Destination|RW" line per mount of a container. RW is "true"
-# for read-write binds and "false" for read-only ones (:ro).
+# Raw "Type|Source|Destination" line per mount of a container.
+#
+# Note: only host paths (Source) and container paths (Destination) are read. A
+# Docker ":ro" mount mode is deliberately ignored — it restricts the *container*
+# (so the Immich app cannot write to an external library), but immich-auto-dumper
+# moves files through the *host* filesystem, not through Docker. Whether the tool
+# can write there is a host-side question, verified during setup when the storage
+# marker file is written into ARCHIVE_DEST_PATH.
 _inspect_mounts() {
   $DOCKER_CMD inspect \
-    --format '{{range .Mounts}}{{.Type}}|{{.Source}}|{{.Destination}}|{{.RW}}{{"\n"}}{{end}}' \
+    --format '{{range .Mounts}}{{.Type}}|{{.Source}}|{{.Destination}}{{"\n"}}{{end}}' \
     "$1" 2>/dev/null || true
 }
 
@@ -56,14 +62,14 @@ detect_db_credentials() {
 detect_upload_mount() {
   local container="$1" prefix="${2:-}"
   DET_UPLOAD_LOCATION=""; DET_UPLOAD_CONTAINER=""
-  local mounts type src dst rw
+  local mounts type src dst
   mounts=$(_inspect_mounts "$container")
 
   # Best signal: the mount whose container path is the parent of the DB library
   # prefix (e.g. prefix /data/library -> mount dest /data).
   if [[ -n "$prefix" ]]; then
     local want="${prefix%/library}"
-    while IFS='|' read -r type src dst rw; do
+    while IFS='|' read -r type src dst; do
       [[ "$type" == "bind" ]] || continue
       if [[ "$dst" == "$want" ]]; then
         DET_UPLOAD_LOCATION="$src"; DET_UPLOAD_CONTAINER="$dst"; return 0
@@ -73,7 +79,7 @@ detect_upload_mount() {
 
   # Canonical Immich upload destinations: modern images bind to /data, older ones
   # to /usr/src/app/upload.
-  while IFS='|' read -r type src dst rw; do
+  while IFS='|' read -r type src dst; do
     [[ "$type" == "bind" ]] || continue
     if [[ "$dst" == "/data" || "$dst" == "/usr/src/app/upload" ]]; then
       DET_UPLOAD_LOCATION="$src"; DET_UPLOAD_CONTAINER="$dst"; return 0
@@ -81,7 +87,7 @@ detect_upload_mount() {
   done <<< "$mounts"
 
   # Last resort: a bind mount whose host side actually holds a library/ folder.
-  while IFS='|' read -r type src dst rw; do
+  while IFS='|' read -r type src dst; do
     [[ "$type" == "bind" ]] || continue
     if [[ -n "$src" && -d "$src/library" ]]; then
       DET_UPLOAD_LOCATION="$src"; DET_UPLOAD_CONTAINER="$dst"; return 0
@@ -92,15 +98,18 @@ detect_upload_mount() {
 }
 
 # detect_external_libraries <server_container> <upload_container_path>
-# Echoes one "host_path|container_path|rw" line per external-library candidate:
-# bind mounts that are neither the upload mount nor Immich/system internals. The
-# rw field ("true"/"false") lets the caller skip or flag read-only (:ro) mounts,
-# which cannot receive archived files.
+# Echoes one "host_path|container_path" line per external-library candidate:
+# bind mounts that are neither the upload mount nor Immich/system internals.
+#
+# The Docker mount mode (:ro / :rw) is intentionally NOT used to filter: ":ro"
+# only stops the Immich container from writing (often set on purpose). This tool
+# writes through the host filesystem, so host-side write access is what matters,
+# and that is verified when the storage marker is written during setup.
 detect_external_libraries() {
   local container="$1" upload_dst="$2"
-  local mounts type src dst rw
+  local mounts type src dst
   mounts=$(_inspect_mounts "$container")
-  while IFS='|' read -r type src dst rw; do
+  while IFS='|' read -r type src dst; do
     [[ "$type" == "bind" ]] || continue
     [[ -z "$src" || -z "$dst" ]] && continue
     [[ -n "$upload_dst" && "$dst" == "$upload_dst" ]] && continue
@@ -112,6 +121,6 @@ detect_external_libraries() {
     case "$src" in
       /etc/localtime|/etc/timezone) continue ;;
     esac
-    printf '%s|%s|%s\n' "$src" "$dst" "${rw:-true}"
+    printf '%s|%s\n' "$src" "$dst"
   done <<< "$mounts"
 }

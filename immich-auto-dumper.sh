@@ -217,24 +217,16 @@ _setup() {
   # ── 3. External library — REQUIRED ──────────────────────────────────────────
   # immich-auto-dumper moves photos into an Immich external library that Immich
   # keeps reading. With no external library it has nothing to do and cannot work.
-  local -a ext_raw=()
+  # The Docker mount mode (:ro) is not a filter here — see detect_external_libraries.
+  # Host-side write access is verified later when the storage marker is written.
+  local -a ext_raw=() ext_list=()
   mapfile -t ext_raw < <(detect_external_libraries "$server_container" "$DET_UPLOAD_CONTAINER")
-  # Keep only writable candidates (archiving must write into them); remember
-  # whether read-only ones were skipped so we can explain it if nothing remains.
-  local -a ext_list=()
-  local e ehost econt erw ro_skipped=0
-  for e in "${ext_raw[@]}"; do
-    [[ -n "$e" ]] || continue
-    IFS='|' read -r ehost econt erw <<< "$e"
-    if [[ "$erw" == "false" ]]; then ro_skipped=1; continue; fi
-    ext_list+=("$ehost|$econt")
-  done
+  local e
+  for e in "${ext_raw[@]}"; do [[ -n "$e" ]] && ext_list+=("$e"); done
 
   if (( ${#ext_list[@]} == 0 )); then
-    local ro_note=""
-    (( ro_skipped )) && ro_note="\n\nA read-only (:ro) external library was found but cannot receive archived files — remove the ':ro' flag on its bind-mount to use it."
-    ui_info "No usable external library" \
-      "No writable Immich *external library* is mounted in '$server_container'.\n\nThis tool moves photos OUT of Immich's internal library and INTO an external library that Immich still reads. Without one, it has nothing to archive to and cannot run.${ro_note}\n\nAdd an external library to your Immich docker-compose (a host bind-mount, then register it in Immich's admin UI), and run setup again.\n\nNothing was changed and no jobs were scheduled."
+    ui_info "No external library found" \
+      "No Immich *external library* is mounted in '$server_container'.\n\nThis tool moves photos OUT of Immich's internal library and INTO an external library that Immich still reads. Without one, it has nothing to archive to and cannot run.\n\nAdd an external library to your Immich docker-compose (a host bind-mount, then register it in Immich's admin UI), and run setup again.\n\nNothing was changed and no jobs were scheduled."
     return 0
   fi
 
