@@ -179,11 +179,6 @@ _setup() {
   # Detect docker command first; everything below depends on it.
   detect_docker_cmd
 
-  # The whole questionnaire can be restarted from the final confirmation screen
-  # ("RE-RUN CONFIGURATION STEPS"), so wrap it in a loop. `break` proceeds to
-  # writing the config, `continue` restarts, and any cancel/abort returns.
-  while true; do
-
   # ── 1. Containers (auto-detected) ───────────────────────────────────────────
   detect_immich_containers
   local db_container="$DET_DB_CONTAINER" server_container="$DET_SERVER_CONTAINER"
@@ -342,12 +337,22 @@ _setup() {
 
   # ── 7. User → folder mapping (auto-suggested) ───────────────────────────────
   declare -A new_user_map=()
+  local -a user_paths=()
   local users_raw=""
   if _db_reachable; then
     users_raw=$(db_get_users 2>/dev/null || true)
   fi
   if [[ -n "$users_raw" ]]; then
-    while IFS='|' read -r uid name storage_label; do
+    # Read the rows into an array first. A `while read ... done <<< "$users_raw"`
+    # loop would redirect the whole body's stdin to the here-string, so the
+    # ui_input prompt below (text backend) would read EOF instead of the user's
+    # answer. Iterating an array keeps stdin pointing at the terminal.
+    local -a _users=()
+    mapfile -t _users <<< "$users_raw"
+    local row uid name storage_label
+    for row in "${_users[@]}"; do
+      [[ -z "$row" ]] && continue
+      IFS='|' read -r uid name storage_label <<< "$row"
       [[ -z "$uid" ]] && continue
       local key="${storage_label:-$uid}"
       local current_mapped="${USER_MAP["$key"]:-}"
@@ -358,7 +363,10 @@ _setup() {
         "Sub-folder name on the external library for this user's archived photos.\n\nUser        : $name\nstorageLabel: ${storage_label:-<empty>}" \
         "$default_folder" || { ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."; return 0; }
       new_user_map["$key"]="$UI_VALUE"
-    done <<< "$users_raw"
+      # Remember the real archive path for this user (name + destination folder),
+      # shown in the summary instead of the opaque storageLabel key.
+      user_paths+=("  $name : ${archive_dest%/}/$UI_VALUE")
+    done
   fi
 
   # Advanced knobs keep sensible defaults (or existing config); no extra prompts.
@@ -380,43 +388,31 @@ _setup() {
   fi
 
   # ── 8. Summary & confirmation ───────────────────────────────────────────────
-  # Two groups: values auto-detected from Immich, and values the user typed.
-  # The latter are emphasized (bold in text mode) because a wrong manual value
-  # is what can actually break the script, so they deserve a careful re-read.
   local summary
   printf -v summary '%s\n' \
-    "THE SCRIPT WILL BE SET UP WITH THESE PARAMETERS." \
+    "The script will be set up with these parameters." \
     "" \
-    "Auto-detected from your Immich install:" \
-    "  Immich server      : $server_container" \
-    "  PostgreSQL         : $db_container ($db_name / $db_user)" \
-    "  Upload location    : $upload_location" \
-    "  Internal library   : $db_library_prefix" \
-    "  External library   : $archive_dest" \
-    "    (container path)    $archive_container_path" \
-    "" \
-    "You entered these — please double-check (a wrong value can break archiving):"
-  summary+="  Start archiving at : $(ui_em "$(mb_to_human "$max_mb")")"$'\n'
-  summary+="  Archive down to    : $(ui_em "$(mb_to_human "$target_mb")")"$'\n'
-  if (( ${#new_user_map[@]} > 0 )); then
-    summary+="  Folder per user:"$'\n'
-    for k in "${!new_user_map[@]}"; do
-      summary+="    $k -> $(ui_em "${new_user_map[$k]}")"$'\n'
+    "Immich server      : $server_container" \
+    "PostgreSQL         : $db_container ($db_name / $db_user)" \
+    "Upload location    : $upload_location" \
+    "Internal library   : $db_library_prefix" \
+    "External library   : $archive_dest" \
+    "  (container path)   $archive_container_path" \
+    "Start archiving at : $(mb_to_human "$max_mb")" \
+    "Archive down to    : $(mb_to_human "$target_mb")"
+  if (( ${#user_paths[@]} > 0 )); then
+    summary+=$'\n'
+    summary+="Where each user's photos are archived on the external library:"$'\n'
+    local p
+    for p in "${user_paths[@]}"; do
+      summary+="$p"$'\n'
     done
   fi
 
-  ui_menu "Confirm configuration" "$summary" \
-    validate "VALIDATE SETUP" \
-    rerun    "RE-RUN CONFIGURATION STEPS" \
-    abort    "ABORT SETUP" \
-    || { ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."; return 0; }
-  case "$UI_VALUE" in
-    validate) break ;;
-    rerun)    continue ;;
-    abort)    ui_info "Setup" "Aborted — nothing was written and no jobs were scheduled."; return 0 ;;
-  esac
-
-  done   # end of the restartable questionnaire loop
+  if ! ui_yesno "Confirm configuration" "$summary" yes "Validate config" "Cancel and quit"; then
+    ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."
+    return 0
+  fi
 
   local user_map_block="declare -A USER_MAP"$'\n'
   for k in "${!new_user_map[@]}"; do

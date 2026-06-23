@@ -332,7 +332,11 @@ render_library_gauge() {
   local other_bytes=$(( disk_used - lib_bytes )); (( other_bytes < 0 )) && other_bytes=0
   local min_c max_c
   if (( lib_blocks <= 1 )); then
-    max_c=$lib_end; min_c=$lib_start
+    # Bracket the block by its own cells: MIN on the first cell, MAX on the last
+    # cell. For a single-cell block both land on the same column, so the ▲ and ▼
+    # line up exactly above/below the block instead of straddling it.
+    min_c=$lib_start; max_c=$(( lib_end - 1 ))
+    (( max_c < min_c )) && max_c=$min_c
   else
     _gcol $(( other_bytes + max_bytes )); max_c=$_c
     _gcol $(( other_bytes + min_bytes )); min_c=$_c
