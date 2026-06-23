@@ -24,6 +24,32 @@ curl -fsSL https://raw.githubusercontent.com/de-seingalt/immich-auto-dumper/main
 
 Installs to `~/.local/share/immich-auto-dumper` and creates the `~/.local/bin/immich-auto-dumper` symlink, then launches the configuration wizard. No `sudo` is required — the tool runs strictly as your user. If `~/.local/bin` is not already on your `PATH`, the installer prints the line to add to `~/.bashrc` / `~/.profile`.
 
+### Updating
+
+Re-running the installer on a machine that already has it detects the existing
+copy and asks whether to update. On yes, it force-syncs the install to the
+chosen branch (`git reset --hard`), discarding any local edits to tracked files
+— your `config.conf` and logs are git-ignored and kept. Add `-y`/`--yes` for an
+unattended update, and `-b <branch>` / `BRANCH=<branch>` to track a specific
+branch:
+
+```bash
+# update the existing install without prompts
+~/.local/share/immich-auto-dumper/install.sh --yes
+
+# install or update from a specific branch
+BRANCH=my-branch curl -fsSL .../install.sh | bash
+```
+
+> Stuck on `error: Your local changes to ... would be overwritten by merge`
+> from an older installer? Unblock it once with:
+> ```bash
+> D=~/.local/share/immich-auto-dumper
+> git -C "$D" fetch origin && git -C "$D" reset --hard origin/main
+> ```
+> (use your branch name instead of `main` if you track one). Newer installers
+> set `core.fileMode false`, so the executable-bit change no longer causes this.
+
 To choose a different installation directory:
 
 ```bash
