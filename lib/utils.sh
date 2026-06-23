@@ -232,14 +232,17 @@ disk_free_bytes() {
 
 bytes_to_human() {
   local bytes="$1"
+  # bc does the rounding and prints the decimal string itself (always with a '.'),
+  # which is then emitted with %s. Passing bc's dotted output to printf %f would
+  # fail under locales whose decimal separator is ',' (e.g. fr_FR): "invalid number".
   if (( bytes < 1024 )); then
     printf '%d B\n' "$bytes"
   elif (( bytes < 1048576 )); then
-    printf '%.1f KB\n' "$(echo "scale=1; $bytes / 1024" | bc)"
+    printf '%s KB\n' "$(echo "scale=1; $bytes / 1024" | bc)"
   elif (( bytes < 1073741824 )); then
-    printf '%.1f MB\n' "$(echo "scale=1; $bytes / 1048576" | bc)"
+    printf '%s MB\n' "$(echo "scale=1; $bytes / 1048576" | bc)"
   else
-    printf '%.2f GB\n' "$(echo "scale=2; $bytes / 1073741824" | bc)"
+    printf '%s GB\n' "$(echo "scale=2; $bytes / 1073741824" | bc)"
   fi
 }
 

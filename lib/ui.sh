@@ -220,11 +220,13 @@ ui_menu() {
 parse_size_to_mb() {
   local input="${1// /}" total_bytes="${2:-0}"
   input="${input//,/.}"
+  # bc both computes and rounds to a whole number of MiB, printed with %s. Passing
+  # bc's float output to printf %f would break under a ',' decimal locale (fr_FR).
   local num
   if [[ "$input" =~ ^([0-9]+(\.[0-9]+)?)%$ ]]; then
     num="${BASH_REMATCH[1]}"
     (( total_bytes > 0 )) || return 0
-    printf '%.0f\n' "$(echo "scale=6; $total_bytes * $num / 100 / 1048576" | bc)"
+    printf '%s\n' "$(echo "scale=6; v=$total_bytes * $num / 100 / 1048576; scale=0; (v+0.5)/1" | bc)"
   elif [[ "$input" =~ ^([0-9]+(\.[0-9]+)?)([KkMmGgTt])[Bb]?$ ]]; then
     num="${BASH_REMATCH[1]}"
     local mult
@@ -234,11 +236,11 @@ parse_size_to_mb() {
       [Gg]) mult="1024" ;;
       [Tt]) mult="1048576" ;;
     esac
-    printf '%.0f\n' "$(echo "scale=6; $num * $mult" | bc)"
+    printf '%s\n' "$(echo "scale=6; v=$num * $mult; scale=0; (v+0.5)/1" | bc)"
   elif [[ "$input" =~ ^([0-9]+(\.[0-9]+)?)$ ]]; then
     # Bare number = GiB, for backward compatibility with the old prompts.
     num="${BASH_REMATCH[1]}"
-    printf '%.0f\n' "$(echo "scale=6; $num * 1024" | bc)"
+    printf '%s\n' "$(echo "scale=6; v=$num * 1024; scale=0; (v+0.5)/1" | bc)"
   fi
 }
 
@@ -246,7 +248,7 @@ parse_size_to_mb() {
 mb_to_human() {
   local mb="${1:-0}"
   if (( mb >= 1024 )); then
-    printf '%.2f GB\n' "$(echo "scale=2; $mb / 1024" | bc)"
+    printf '%s GB\n' "$(echo "scale=2; $mb / 1024" | bc)"
   else
     printf '%d MB\n' "$mb"
   fi
