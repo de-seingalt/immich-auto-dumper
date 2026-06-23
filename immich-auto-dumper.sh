@@ -179,6 +179,11 @@ _setup() {
   # Detect docker command first; everything below depends on it.
   detect_docker_cmd
 
+  # The whole questionnaire can be restarted from the final confirmation screen
+  # ("RE-RUN CONFIGURATION STEPS"), so wrap it in a loop. `break` proceeds to
+  # writing the config, `continue` restarts, and any cancel/abort returns.
+  while true; do
+
   # ── 1. Containers (auto-detected) ───────────────────────────────────────────
   detect_immich_containers
   local db_container="$DET_DB_CONTAINER" server_container="$DET_SERVER_CONTAINER"
@@ -328,7 +333,9 @@ _setup() {
     target_mb="$v"
 
     gauge=$(render_library_gauge "$disk_total" "$disk_used" "$cur_lib_bytes" "$max_mb" "$target_mb")
-    if ui_yesno "Confirm boundaries" "$gauge\n\nKeep these two boundaries?"; then
+    if ui_yesno "Confirm boundaries" \
+         "$gauge\n\nMAX = $(ui_em "$(mb_to_human "$max_mb")")    MIN = $(ui_em "$(mb_to_human "$target_mb")")\n\nKeep these boundaries, or reset and enter them again?" \
+         yes "Keep these" "Reset the values"; then
       break
     fi
   done
@@ -344,7 +351,9 @@ _setup() {
       [[ -z "$uid" ]] && continue
       local key="${storage_label:-$uid}"
       local current_mapped="${USER_MAP["$key"]:-}"
-      local default_folder="${current_mapped:-${storage_label:-$name}}"
+      # Default to the human-readable user name, not the storageLabel (which is
+      # often an opaque value for users other than the first admin).
+      local default_folder="${current_mapped:-$name}"
       ui_input "$(_wiz_title "Folder for $name")" \
         "Sub-folder name on the external library for this user's archived photos.\n\nUser        : $name\nstorageLabel: ${storage_label:-<empty>}" \
         "$default_folder" || { ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."; return 0; }
@@ -371,30 +380,43 @@ _setup() {
   fi
 
   # ── 8. Summary & confirmation ───────────────────────────────────────────────
+  # Two groups: values auto-detected from Immich, and values the user typed.
+  # The latter are emphasized (bold in text mode) because a wrong manual value
+  # is what can actually break the script, so they deserve a careful re-read.
   local summary
   printf -v summary '%s\n' \
-    "Review your configuration:" \
+    "THE SCRIPT WILL BE SET UP WITH THESE PARAMETERS." \
     "" \
-    "Immich server      : $server_container" \
-    "PostgreSQL         : $db_container ($db_name / $db_user)" \
-    "Upload location    : $upload_location" \
-    "Internal library   : $db_library_prefix" \
-    "External library   : $archive_dest" \
-    "  (container path)   $archive_container_path" \
-    "Start archiving at : $(mb_to_human "$max_mb")" \
-    "Archive down to    : $(mb_to_human "$target_mb")"
+    "Auto-detected from your Immich install:" \
+    "  Immich server      : $server_container" \
+    "  PostgreSQL         : $db_container ($db_name / $db_user)" \
+    "  Upload location    : $upload_location" \
+    "  Internal library   : $db_library_prefix" \
+    "  External library   : $archive_dest" \
+    "    (container path)    $archive_container_path" \
+    "" \
+    "You entered these — please double-check (a wrong value can break archiving):"
+  summary+="  Start archiving at : $(ui_em "$(mb_to_human "$max_mb")")"$'\n'
+  summary+="  Archive down to    : $(ui_em "$(mb_to_human "$target_mb")")"$'\n'
   if (( ${#new_user_map[@]} > 0 )); then
-    summary+=$'\nUser → folder:\n'
+    summary+="  Folder per user:"$'\n'
     for k in "${!new_user_map[@]}"; do
-      summary+="  $k -> ${new_user_map[$k]}"$'\n'
+      summary+="    $k -> $(ui_em "${new_user_map[$k]}")"$'\n'
     done
   fi
-  summary+=$'\nWrite this to config.conf?'
 
-  if ! ui_yesno "Confirm configuration" "$summary" no; then
-    ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."
-    return 0
-  fi
+  ui_menu "Confirm configuration" "$summary" \
+    validate "VALIDATE SETUP" \
+    rerun    "RE-RUN CONFIGURATION STEPS" \
+    abort    "ABORT SETUP" \
+    || { ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."; return 0; }
+  case "$UI_VALUE" in
+    validate) break ;;
+    rerun)    continue ;;
+    abort)    ui_info "Setup" "Aborted — nothing was written and no jobs were scheduled."; return 0 ;;
+  esac
+
+  done   # end of the restartable questionnaire loop
 
   local user_map_block="declare -A USER_MAP"$'\n'
   for k in "${!new_user_map[@]}"; do

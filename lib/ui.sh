@@ -92,6 +92,17 @@ ui_info() {
   fi
 }
 
+# ui_em <text>  — emphasize a value the user must double-check (manually entered
+# ones, which can break the script). Real bold in the text backend; whiptail
+# cannot style body text, so it is wrapped in guillemets to still stand out.
+ui_em() {
+  if [[ "$UI_BACKEND" == "text" ]]; then
+    printf '%s%s%s' "$C_BOLD" "$1" "$C_RESET"
+  else
+    printf '«%s»' "$1"
+  fi
+}
+
 # ui_note <text>  — light inline note (text backend prints dim; whiptail no-op,
 # since the same info is embedded into the relevant dialog's body text).
 ui_note() {
@@ -99,13 +110,30 @@ ui_note() {
   return 0
 }
 
+# Estimate a whiptail box height that fits <body> without a scrollbar. Counts both
+# real newlines and literal "\n" sequences (whiptail renders both as breaks), adds
+# <extra> rows for borders/buttons/input field, and caps to the terminal height.
+_wt_height() {
+  local body="$1" extra="${2:-7}"
+  local real lit lines h maxh
+  real=$(awk 'END{print NR}' <<< "$body")
+  lit=$(grep -o '\\n' <<< "$body" | wc -l)
+  lines=$(( real + lit ))
+  h=$(( lines + extra ))
+  maxh=$(( ${LINES:-24} - 1 ))
+  (( maxh < 10 )) && maxh=23
+  (( h > maxh )) && h=$maxh
+  (( h < 8 )) && h=8
+  printf '%s' "$h"
+}
+
 # ui_input <title> <body> <default>  — free-text entry with a pre-filled default.
 # Sets UI_VALUE; returns 1 if the user cancelled.
 ui_input() {
   local title="$1" body="$2" default="${3:-}"
   if [[ "$UI_BACKEND" == "whiptail" ]]; then
-    local out rc=0
-    out=$(whiptail --title "$title" --inputbox "$body" 16 "$_UI_W" "$default" 3>&1 1>&2 2>&3) || rc=$?
+    local out rc=0 h; h=$(_wt_height "$body" 8)
+    out=$(whiptail --title "$title" --inputbox "$body" "$h" "$_UI_W" "$default" 3>&1 1>&2 2>&3) || rc=$?
     (( rc == 0 )) || return 1
     UI_VALUE="$out"
   else
@@ -121,18 +149,26 @@ ui_input() {
   return 0
 }
 
-# ui_yesno <title> <body> [default]  — default is "yes" unless "no" is passed.
+# ui_yesno <title> <body> [default] [yes_label] [no_label]
+# default is "yes" unless "no" is passed. Optional button labels rename Yes/No.
 # Returns 0 for yes, 1 for no/cancel.
 ui_yesno() {
-  local title="$1" body="$2" default="${3:-yes}"
+  local title="$1" body="$2" default="${3:-yes}" yes_label="${4:-}" no_label="${5:-}"
   if [[ "$UI_BACKEND" == "whiptail" ]]; then
-    local defflag=()
-    [[ "$default" == "no" ]] && defflag=(--defaultno)
-    whiptail --title "$title" "${defflag[@]}" --yesno "$body" --scrolltext 20 "$_UI_W"
+    local flags=() h; h=$(_wt_height "$body" 6)
+    [[ "$default" == "no" ]] && flags+=(--defaultno)
+    [[ -n "$yes_label" ]] && flags+=(--yes-button "$yes_label")
+    [[ -n "$no_label"  ]] && flags+=(--no-button "$no_label")
+    whiptail --title "$title" "${flags[@]}" --yesno "$body" "$h" "$_UI_W"
     return $?
   else
     printf '%b\n' "${C_CYAN}${body}${C_RESET}"
-    local hint="[Y/n]"; [[ "$default" == "no" ]] && hint="[y/N]"
+    local hint
+    if [[ -n "$yes_label$no_label" ]]; then
+      hint="[y=${yes_label:-yes} / n=${no_label:-no}]"
+    else
+      hint="[Y/n]"; [[ "$default" == "no" ]] && hint="[y/N]"
+    fi
     local ans
     read -r -p "  ${C_BOLD}>${C_RESET} ${hint}: " ans || return 1
     ans="${ans:-$default}"
@@ -145,8 +181,9 @@ ui_yesno() {
 ui_menu() {
   local title="$1" body="$2"; shift 2
   if [[ "$UI_BACKEND" == "whiptail" ]]; then
-    local n=$(( $# / 2 )) out rc=0
-    out=$(whiptail --title "$title" --menu "$body" 18 "$_UI_W" "$n" "$@" 3>&1 1>&2 2>&3) || rc=$?
+    local n=$(( $# / 2 )) out rc=0 h
+    h=$(_wt_height "$body" $(( n + 7 )))
+    out=$(whiptail --title "$title" --menu "$body" "$h" "$_UI_W" "$n" "$@" 3>&1 1>&2 2>&3) || rc=$?
     (( rc == 0 )) || return 1
     UI_VALUE="$out"
   else
@@ -277,34 +314,52 @@ render_library_gauge() {
 
   local _c
   _gcol() { _c=$(( $1 * W / scale )); (( _c < 0 )) && _c=0; (( _c > W )) && _c=W; return 0; }
-  local lib_c used_c min_c max_c
-  _gcol "$lib_bytes";  lib_c=$_c
-  _gcol "$disk_used";  used_c=$_c; (( used_c < lib_c )) && used_c=$lib_c
-  _gcol "$min_bytes";  min_c=$_c
-  _gcol "$max_bytes";  max_c=$_c
 
-  local g_full g_other g_empty g_mk g_lb g_rb
-  if (( GAUGE_UTF )); then
-    g_full='█'; g_other='▒'; g_empty='░'; g_mk='▼'; g_lb='├'; g_rb='┤'
+  # Library is proportional but always >=1 block, drawn at the right edge of the
+  # used region (just before free); other-data fills the rest of the used region.
+  local lib_blocks used_c
+  _gcol "$lib_bytes"; lib_blocks=$_c; (( lib_blocks < 1 )) && lib_blocks=1
+  _gcol "$disk_used"; used_c=$_c; (( used_c < lib_blocks )) && used_c=$lib_blocks
+  (( used_c > W )) && used_c=$W
+  local lib_start=$(( used_c - lib_blocks )) lib_end=$used_c
+
+  # Thresholds are library sizes, so they are measured from the START of the
+  # library block (i.e. offset by the other-data already on disk). For a single
+  # block we simply bracket it — MAX at its end, MIN at its start; with several
+  # blocks the markers fall proportionally around the block.
+  local other_bytes=$(( disk_used - lib_bytes )); (( other_bytes < 0 )) && other_bytes=0
+  local min_c max_c
+  if (( lib_blocks <= 1 )); then
+    max_c=$lib_end; min_c=$lib_start
   else
-    g_full='#'; g_other='+'; g_empty='-'; g_mk='v'; g_lb='['; g_rb=']'
+    _gcol $(( other_bytes + max_bytes )); max_c=$_c
+    _gcol $(( other_bytes + min_bytes )); min_c=$_c
+    (( min_c >= max_c )) && min_c=$(( max_c > 0 ? max_c - 1 : 0 ))
+  fi
+
+  local g_full g_other g_empty g_dn g_up g_lb g_rb
+  if (( GAUGE_UTF )); then
+    g_full='█'; g_other='▒'; g_empty='░'; g_dn='▼'; g_up='▲'; g_lb='├'; g_rb='┤'
+  else
+    g_full='#'; g_other='+'; g_empty='-'; g_dn='v'; g_up='^'; g_lb='['; g_rb=']'
   fi
 
   local bar="" i
   for (( i = 0; i < W; i++ )); do
-    if   (( i < lib_c  )); then bar+="$g_full"
-    elif (( i < used_c )); then bar+="$g_other"
-    else                        bar+="$g_empty"; fi
+    if   (( i < lib_start )); then bar+="$g_other"
+    elif (( i < lib_end   )); then bar+="$g_full"
+    else                           bar+="$g_empty"; fi
   done
 
-  # Marker row above the bar (one leading space aligns with the left border g_lb).
-  # Single arrows only — MIN is always left of MAX, so they never need text labels
-  # that could collide when the two boundaries are close on the disk scale.
-  local mrow; printf -v mrow '%*s' "$W" ''
-  (( min_mb > 0 )) && _gauge_place mrow "$min_c" "$g_mk"
-  (( max_mb > 0 )) && _gauge_place mrow "$max_c" "$g_mk"
+  # MAX marker above the bar (▼), MIN marker below it (▲): distinct symbols on
+  # distinct rows, so they never look alike or overlap. One leading space aligns
+  # each row with the left border g_lb.
+  local toprow botrow
+  printf -v toprow '%*s' "$W" ''
+  printf -v botrow '%*s' "$W" ''
+  (( max_mb > 0 )) && _gauge_place toprow "$max_c" "$g_dn"
+  (( min_mb > 0 )) && _gauge_place botrow "$min_c" "$g_up"
 
-  # Legend.
   local lib_pct=0 used_pct=0
   if (( disk_total > 0 )); then
     lib_pct=$(( lib_bytes * 100 / disk_total ))
@@ -315,14 +370,10 @@ render_library_gauge() {
     "$(bytes_to_human "$lib_bytes")" "$lib_pct" \
     "$(bytes_to_human "$disk_used")" "$used_pct" \
     "$(bytes_to_human "$disk_total")"
-  printf ' %s\n'   "$mrow"
+  printf ' %s\n'    "$toprow"
   printf '%s%s%s\n' "$g_lb" "$bar" "$g_rb"
-  if (( min_mb > 0 )); then
-    printf '%s MIN = %-9s archive DOWN to this size\n'        "$g_mk" "$(mb_to_human "$min_mb")"
-  fi
-  if (( max_mb > 0 )); then
-    printf '%s MAX = %-9s START archiving when library exceeds this\n' "$g_mk" "$(mb_to_human "$max_mb")"
-  fi
-  printf '%s library (kept on fast disk)   %s other data   %s free\n' \
-    "$g_full" "$g_other" "$g_empty"
+  printf ' %s\n'    "$botrow"
+  (( max_mb > 0 )) && printf '%s MAX = %-9s archiving STARTS when the library grows past this\n' "$g_dn" "$(mb_to_human "$max_mb")"
+  (( min_mb > 0 )) && printf '%s MIN = %-9s each run brings the library back DOWN to this\n'     "$g_up" "$(mb_to_human "$min_mb")"
+  printf '%s library   %s other data   %s free\n' "$g_full" "$g_other" "$g_empty"
 }
