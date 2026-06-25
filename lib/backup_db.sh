@@ -21,10 +21,11 @@ backup_db_run() {
     return 0
   fi
 
+  # Skip hidden marker files (e.g. Immich's `.immich`) — only mirror real dumps.
   local files=()
   while IFS= read -r -d '' f; do
     files+=("$f")
-  done < <(find "$src_dir" -maxdepth 1 -type f -print0)
+  done < <(find "$src_dir" -maxdepth 1 -type f ! -name '.*' -print0)
 
   if (( ${#files[@]} == 0 )); then
     log_warn "No backup files found in $src_dir."
@@ -38,7 +39,7 @@ backup_db_run() {
     for src in "${files[@]}"; do
       log_info "DRY-RUN: would copy $(basename "$src") → $dest_dir/"
     done
-    log_info "DRY-RUN: would apply retention policy (keep $BACKUP_RETENTION files)"
+    log_info "DRY-RUN: would apply retention policy (keep $BACKUP_RETENTION database archive files)"
     return 0
   fi
 

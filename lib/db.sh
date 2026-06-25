@@ -3,9 +3,13 @@ set -euo pipefail
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
+# `psql -c` never reads stdin, but `docker exec -i` keeps stdin open and drains it.
+# When called inside a `while read … done < <(…)` loop, that stdin IS the loop's
+# input pipe — docker would swallow the remaining rows and the loop would stop after
+# the first iteration. Redirect from /dev/null so the loop's input is left intact.
 _db_exec() {
   $DOCKER_CMD exec -i "$IMMICH_DB_CONTAINER" psql \
-    -U "$IMMICH_DB_USER" -d "$IMMICH_DB_NAME" -t -A -c "$1"
+    -U "$IMMICH_DB_USER" -d "$IMMICH_DB_NAME" -t -A -c "$1" </dev/null
 }
 
 # Escapes single quotes for SQL string literals.
@@ -91,6 +95,19 @@ db_detect_library_prefix() {
 # Returns id|name|storageLabel for all users, ordered by creation date.
 db_get_users() {
   _db_exec "SELECT \"id\", \"name\", \"storageLabel\" FROM \"user\" ORDER BY \"createdAt\";"
+}
+
+# Returns ownerId|storageLabel|importPath for every Immich external library, one
+# row per import path. `importPaths` is a text[]; the LEFT JOIN LATERAL unnest keeps
+# libraries with an empty array (path field is then empty). Used by setup to
+# pre-fill each user's destination folder from an already-configured import path.
+db_get_external_libraries() {
+  _db_exec "SELECT l.\"ownerId\", u.\"storageLabel\", p
+            FROM \"library\" l
+            JOIN \"user\" u ON u.\"id\" = l.\"ownerId\"
+            LEFT JOIN LATERAL unnest(l.\"importPaths\") AS p ON true
+            WHERE l.\"deletedAt\" IS NULL
+            ORDER BY u.\"name\";"
 }
 
 # Returns id|originalPath|fileSizeInByte for all active assets in a given parent directory.

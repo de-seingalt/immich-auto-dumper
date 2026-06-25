@@ -28,21 +28,24 @@ declare -A USER_MAP 2>/dev/null || true
 
 _usage() {
   cat <<'EOF'
-Usage: immich-auto-dumper <command> [--dry-run]
+Usage: immich-auto-dumper <command> [--dry-run] [--force]
 
 Commands:
   setup      Interactive configuration wizard (creates or updates config.conf)
   status     Show service status, disk usage, and last operations
   start      Enable cron jobs
   stop       Disable cron jobs and wait for any running operation to finish
-  dump_now   Force an immediate archive run until the target size is reached
+  dump_now   Archive when the library exceeds MAX, down to TARGET (used by cron).
+             Add --force to dump now regardless of MAX (still stops at TARGET).
   sync_now   Force an immediate copy of DB backups to external storage
-  test_run   Simulate dump_now + sync_now without making any changes (implies --dry-run)
+  test_run   Verbose simulation of a forced dump + sync_now (implies --dry-run --force)
   uninstall  Remove the tool's local footprint (keeps Immich and external storage intact)
 
 Flags:
   --dry-run  Suppress all destructive operations (cp, rm, DB UPDATE).
              Compatible with dump_now and sync_now.
+  --force    Manual override for dump_now: ignore the MAX threshold and archive
+             down to TARGET even if the library is below MAX.
 EOF
 }
 
@@ -70,6 +73,17 @@ _resolve_self_bin() {
 
 # Wizard dialog title prefix, so every step is clearly part of the same flow.
 _wiz_title() { printf 'immich-auto-dumper Setup — %s' "$1"; }
+
+# Shallow (2-level) directory tree of the external library, shown in setup so the
+# user can see existing folders while choosing a name. Excludes our hidden marker
+# and backup dirs. Prints nothing if the path is empty or unreadable.
+_ext_library_tree() {
+  local dest="$1"
+  [[ -d "$dest" ]] || return 0
+  (cd "$dest" && find . -mindepth 1 -maxdepth 2 -type d \
+     ! -path './.immich-backup*' ! -name '.*' 2>/dev/null \
+     | LC_ALL=C sort | sed -e 's|^\./||' -e 's|[^/]*/|  |g')
+}
 
 # True if the configured Immich Postgres container answers a trivial query. Requires
 # IMMICH_DB_CONTAINER / IMMICH_DB_USER / IMMICH_DB_NAME to be set first.
@@ -233,8 +247,8 @@ _setup() {
   local archive_dest="" archive_container_path=""
   if (( ${#ext_list[@]} == 1 )); then
     IFS='|' read -r archive_dest archive_container_path <<< "${ext_list[0]}"
-    if ! ui_yesno "External library" \
-      "Detected one Immich external library — archived photos will be moved here:\n\n  host path      : $archive_dest\n  container path : $archive_container_path\n\nUse this external library?"; then
+    if ! ui_yesno "External folder (from Docker)" \
+      "Detected one external folder mounted into '$server_container' in Docker config — archived photos will be moved here:\n\n  host path      : $archive_dest\n  container path : $archive_container_path\n\nUse this folder as the archive destination?"; then
       ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."
       return 0
     fi
@@ -286,6 +300,12 @@ _setup() {
     disk_used=$(( disk_total - disk_free )); (( disk_used < 0 )) && disk_used=0
   fi
 
+  # The library can never exceed the space available to it (free disk + its current
+  # size); past that the disk fills before MAX is reached and archiving never fires.
+  # This is the hard ceiling for MAX (0 = unknown disk → no ceiling check).
+  local lib_cap_mb=0
+  (( disk_total > 0 )) && lib_cap_mb=$(( (disk_free + cur_lib_bytes) / 1048576 ))
+
   # Seed sensible defaults: from an existing config, else from the disk size.
   local def_max_mb="${ARCHIVE_LIBRARY_MAX_MB:-}" def_target_mb="${ARCHIVE_LIBRARY_TARGET_MB:-}"
   [[ -z "$def_max_mb"    && -n "${ARCHIVE_LIBRARY_MAX_GB:-}"    ]] && def_max_mb=$(( ARCHIVE_LIBRARY_MAX_GB * 1024 ))
@@ -298,38 +318,55 @@ _setup() {
     fi
   fi
   (( def_max_mb > 0 )) || def_max_mb=$(( 200 * 1024 ))
+  # Keep the suggested default within the ceiling, so it is never pre-rejected.
+  (( lib_cap_mb > 0 && def_max_mb > lib_cap_mb )) && def_max_mb=$lib_cap_mb
   if [[ -z "$def_target_mb" ]] || (( def_target_mb <= 0 || def_target_mb >= def_max_mb )); then
     def_target_mb=$(( def_max_mb * 3 / 4 ))
   fi
 
   local max_mb="$def_max_mb" target_mb="$def_target_mb" gauge v
+  # Treat boundaries seeded from disk size (no existing config) as "not yet defined",
+  # so their first gauge shows a placeholder marker + a "set a … value" hint.
+  local max_user_set=false min_user_set=false
+  [[ -n "${ARCHIVE_LIBRARY_MAX_MB:-}${ARCHIVE_LIBRARY_MAX_GB:-}" ]] && max_user_set=true
+  [[ -n "${ARCHIVE_LIBRARY_TARGET_MB:-}${ARCHIVE_LIBRARY_TARGET_GB:-}" ]] && min_user_set=true
   while true; do
-    gauge=$(render_library_gauge "$disk_total" "$disk_used" "$cur_lib_bytes" "$max_mb" "$target_mb")
-    ui_input "$(_wiz_title "MAX — start archiving above")" \
-      "$gauge\n\nMAX: when the library grows ABOVE this, archiving begins.\nEnter a size — 200, 1.5G, 500M, or 80% of the disk." \
+    local gmax gmin
+    "$max_user_set" && gmax="$max_mb" || gmax=0
+    "$min_user_set" && gmin="$target_mb" || gmin=0
+    # MAX ▼ — a % is taken on the whole disk.
+    gauge=$(render_library_gauge "$disk_total" "$disk_used" "$cur_lib_bytes" "$gmax" "$gmin" max)
+    ui_input "$(_wiz_title "MAX ▼ — start archiving above")" \
+      "$gauge\n\nMAX ▼: when the library grows ABOVE this, archiving begins.\nEnter a size (200, 1.5G, 500M) or a % of the disk (e.g. 80%)." \
       "$(mb_to_input "$max_mb")" || { ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."; return 0; }
     v=$(parse_size_to_mb "$UI_VALUE" "$disk_total")
     if [[ -z "$v" ]] || (( v <= 0 )); then
       ui_info "Invalid value" "Enter a positive size, e.g. 200, 1.5G, 500M, 80% (the % needs a detectable disk)."
       continue
     fi
-    max_mb="$v"
-    (( target_mb >= max_mb )) && target_mb=$(( max_mb * 3 / 4 ))
-
-    gauge=$(render_library_gauge "$disk_total" "$disk_used" "$cur_lib_bytes" "$max_mb" "$target_mb")
-    ui_input "$(_wiz_title "MIN — archive down to")" \
-      "$gauge\n\nMIN: after archiving, the library is reduced back DOWN to this size.\nMust be below MAX ($(mb_to_human "$max_mb"))." \
-      "$(mb_to_input "$target_mb")" || { ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."; return 0; }
-    v=$(parse_size_to_mb "$UI_VALUE" "$disk_total")
-    if [[ -z "$v" ]] || (( v <= 0 || v >= max_mb )); then
-      ui_info "Invalid value" "MIN must be a positive size BELOW MAX ($(mb_to_human "$max_mb"))."
+    if (( lib_cap_mb > 0 && v > lib_cap_mb )); then
+      ui_info "MAX ▼ too large" "MAX ▼ ($(mb_to_human "$v")) exceeds the space the library can use ($(mb_to_human "$lib_cap_mb") = free disk + current library).\n\nBeyond that the disk fills before MAX is reached and archiving never triggers. Enter a smaller value."
       continue
     fi
-    target_mb="$v"
+    max_mb="$v"; max_user_set=true
+    (( target_mb >= max_mb )) && target_mb=$(( max_mb * 3 / 4 ))
+
+    "$min_user_set" && gmin="$target_mb" || gmin=0
+    # MIN ▲ — a % is taken on MAX (the library's max potential size).
+    gauge=$(render_library_gauge "$disk_total" "$disk_used" "$cur_lib_bytes" "$max_mb" "$gmin" min)
+    ui_input "$(_wiz_title "MIN ▲ — archive down to")" \
+      "$gauge\n\nMIN ▲: after archiving, the library is brought back DOWN to this size.\nEnter a size, or a % of MAX ▼ ($(mb_to_human "$max_mb")). Must be below MAX." \
+      "$(mb_to_input "$target_mb")" || { ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."; return 0; }
+    v=$(parse_size_to_mb "$UI_VALUE" "$(( max_mb * 1048576 ))")
+    if [[ -z "$v" ]] || (( v <= 0 || v >= max_mb )); then
+      ui_info "Invalid value" "MIN ▲ must be a positive size BELOW MAX ▼ ($(mb_to_human "$max_mb")). A % is taken on MAX."
+      continue
+    fi
+    target_mb="$v"; min_user_set=true
 
     gauge=$(render_library_gauge "$disk_total" "$disk_used" "$cur_lib_bytes" "$max_mb" "$target_mb")
     if ui_yesno "Confirm boundaries" \
-         "$gauge\n\nMAX = $(ui_em "$(mb_to_human "$max_mb")")    MIN = $(ui_em "$(mb_to_human "$target_mb")")\n\nKeep these boundaries, or reset and enter them again?" \
+         "$gauge\n\nMAX ▼ = $(ui_em "$(mb_to_human "$max_mb")")    MIN ▲ = $(ui_em "$(mb_to_human "$target_mb")")\n\nKeep these boundaries, or reset and enter them again?" \
          yes "Keep these" "Reset the values"; then
       break
     fi
@@ -337,10 +374,35 @@ _setup() {
 
   # ── 7. User → folder mapping (auto-suggested) ───────────────────────────────
   declare -A new_user_map=()
+  declare -A user_name_by_key=()
   local -a user_paths=()
   local users_raw=""
   if _db_reachable; then
     users_raw=$(db_get_users 2>/dev/null || true)
+  fi
+
+  # Pre-fill each user's folder from an external library already pointing under
+  # ARCHIVE_CONTAINER_PATH in Immich: import path "/kdrive/Test" → folder "Test".
+  # Keyed like USER_MAP (storageLabel, else ownerId). First matching path wins;
+  # libraries with no/empty import path are ignored (fall back to the user name).
+  declare -A prefill_folder=()
+  if _db_reachable; then
+    local libs_raw lrow l_owner l_label l_path l_key l_rel
+    libs_raw=$(db_get_external_libraries 2>/dev/null || true)
+    if [[ -n "$libs_raw" ]]; then
+      local -a _libs=()
+      mapfile -t _libs <<< "$libs_raw"
+      for lrow in "${_libs[@]}"; do
+        [[ -z "$lrow" ]] && continue
+        IFS='|' read -r l_owner l_label l_path <<< "$lrow"
+        [[ -z "$l_path" ]] && continue
+        [[ "$l_path" != "${archive_container_path%/}"/* ]] && continue
+        l_key="${l_label:-$l_owner}"
+        [[ -n "${prefill_folder["$l_key"]:-}" ]] && continue
+        l_rel="${l_path#"${archive_container_path%/}"/}"
+        [[ -n "$l_rel" ]] && prefill_folder["$l_key"]="$l_rel"
+      done
+    fi
   fi
   if [[ -n "$users_raw" ]]; then
     # Read the rows into an array first. A `while read ... done <<< "$users_raw"`
@@ -349,18 +411,29 @@ _setup() {
     # answer. Iterating an array keeps stdin pointing at the terminal.
     local -a _users=()
     mapfile -t _users <<< "$users_raw"
+    # Existing external-library folders, shown in each prompt so the user can reuse a
+    # consistent name (and see what they'll point Immich at afterwards).
+    local lib_tree tree_note=""
+    lib_tree=$(_ext_library_tree "$archive_dest")
+    [[ -n "$lib_tree" ]] && tree_note="\n\nFolders currently on the external library:\n${lib_tree}"
     local row uid name storage_label
     for row in "${_users[@]}"; do
       [[ -z "$row" ]] && continue
       IFS='|' read -r uid name storage_label <<< "$row"
       [[ -z "$uid" ]] && continue
       local key="${storage_label:-$uid}"
+      user_name_by_key["$key"]="$name"
       local current_mapped="${USER_MAP["$key"]:-}"
-      # Default to the human-readable user name, not the storageLabel (which is
-      # often an opaque value for users other than the first admin).
-      local default_folder="${current_mapped:-$name}"
+      local detected="${prefill_folder["$key"]:-}"
+      # Default priority: an existing config choice, else a folder detected from this
+      # user's Immich external library, else the human-readable user name (not the
+      # storageLabel, which is often opaque for users other than the first admin).
+      local default_folder="${current_mapped:-${detected:-$name}}"
+      local detected_note=""
+      [[ -z "$current_mapped" && -n "$detected" ]] \
+        && detected_note="\n\nDetected from this user's Immich external library: ${archive_container_path%/}/$detected"
       ui_input "$(_wiz_title "Folder for $name")" \
-        "Sub-folder name on the external library for this user's archived photos.\n\nUser        : $name\nstorageLabel: ${storage_label:-<empty>}" \
+        "Sub-folder name on the external library for this user's archived photos.\n\nUser        : $name\nstorageLabel: ${storage_label:-<empty>}${detected_note}${tree_note}" \
         "$default_folder" || { ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."; return 0; }
       new_user_map["$key"]="$UI_VALUE"
       # Remember the real archive path for this user (name + destination folder),
@@ -398,8 +471,8 @@ _setup() {
     "Internal library   : $db_library_prefix" \
     "External library   : $archive_dest" \
     "  (container path)   $archive_container_path" \
-    "Start archiving at : $(mb_to_human "$max_mb")" \
-    "Archive down to    : $(mb_to_human "$target_mb")"
+    "Start archiving at : ▼ $(mb_to_human "$max_mb")" \
+    "Archive down to    : ▲ $(mb_to_human "$target_mb")"
   if (( ${#user_paths[@]} > 0 )); then
     summary+=$'\n'
     summary+="Where each user's photos are archived on the external library:"$'\n'
@@ -451,11 +524,57 @@ LOG_DIR="${log_dir}"
 LOG_MAX_LINES=${log_max_lines}
 CONF
 
-  ui_info "Done" "config.conf written successfully."
+  # An external library can only point at a path that already exists, so create each
+  # user's destination folder now if missing. We never touch Immich's own config; any
+  # user without a library already pointed under our path gets copy-paste instructions
+  # in the final report below.
+  local -a fld_created=() fld_existed=() fld_failed=() immich_todo=()
+  local k folder host_dir uname cpath
+  for k in "${!new_user_map[@]}"; do
+    folder="${new_user_map[$k]}"
+    [[ -z "$folder" ]] && continue
+    uname="${user_name_by_key[$k]:-$k}"
+    cpath="${archive_container_path%/}/$folder"
+    host_dir="${archive_dest%/}/$folder"
+    if [[ ! -d "$archive_dest" ]]; then
+      fld_failed+=("$host_dir")
+    elif [[ -d "$host_dir" ]]; then
+      fld_existed+=("$folder")
+    elif mkdir -p "$host_dir" 2>/dev/null; then
+      fld_created+=("$folder")
+    else
+      fld_failed+=("$host_dir")
+    fi
+    # No external library detected pointing here → the admin must set it up in Immich.
+    [[ -z "${prefill_folder[$k]:-}" ]] && immich_todo+=("$uname  →  $cpath")
+  done
 
   if ui_yesno "Cron jobs" "Install the scheduled cron jobs now so archiving and DB backups run automatically?" no; then
     _start
   fi
+
+  # Persistent terminal trace (plain stdout, survives the whiptail screen) so the
+  # user keeps a record of the outcome and any remaining manual Immich steps.
+  printf '\n========================================\n'
+  printf 'immich-auto-dumper setup: SUCCESS\n'
+  printf '========================================\n'
+  printf 'Config written : %s\n' "$CONFIG_FILE"
+  (( ${#fld_created[@]} > 0 )) && printf 'Folders created : %s\n' "${fld_created[*]}"
+  (( ${#fld_existed[@]} > 0 )) && printf 'Folders present : %s\n' "${fld_existed[*]}"
+  if (( ${#fld_failed[@]} > 0 )); then
+    printf 'WARNING — could not create (make them manually, then re-run setup):\n'
+    local f; for f in "${fld_failed[@]}"; do printf '  - %s\n' "$f"; done
+  fi
+  if (( ${#immich_todo[@]} > 0 )); then
+    printf '\nACTION REQUIRED in Immich (Administration → Libraries):\n'
+    printf 'These users have no external library pointed under %s yet.\n' "${archive_container_path%/}"
+    printf 'For each, add an External Library with the import path below and assign the owner\n'
+    printf '(until then, Immich will not display the archived photos):\n'
+    local t; for t in "${immich_todo[@]}"; do printf '  - %s\n' "$t"; done
+  else
+    printf '\nAll users already have an external library pointed under %s.\n' "${archive_container_path%/}"
+  fi
+  printf '========================================\n\n'
 }
 
 # ── status ────────────────────────────────────────────────────────────────────
@@ -473,7 +592,7 @@ _status() {
     local s_max_mb="${ARCHIVE_LIBRARY_MAX_MB:-}" s_target_mb="${ARCHIVE_LIBRARY_TARGET_MB:-}"
     [[ -z "$s_max_mb"    && -n "${ARCHIVE_LIBRARY_MAX_GB:-}"    ]] && s_max_mb=$(( ARCHIVE_LIBRARY_MAX_GB * 1024 ))
     [[ -z "$s_target_mb" && -n "${ARCHIVE_LIBRARY_TARGET_GB:-}" ]] && s_target_mb=$(( ARCHIVE_LIBRARY_TARGET_GB * 1024 ))
-    printf 'Library size         : %s  [max: %s — target: %s]\n' \
+    printf 'Library size         : %s  [max ▼: %s — target ▲: %s]\n' \
       "$(bytes_to_human "$lib_bytes")" \
       "${s_max_mb:+$(mb_to_human "$s_max_mb")}" "${s_target_mb:+$(mb_to_human "$s_target_mb")}"
     printf 'Disk (library FS)    : %s total, %s free\n' \
@@ -631,12 +750,14 @@ _stop() {
 
 main() {
   local dry_run=false
+  local force=false
   local cmd=""
   local args=()
 
   for arg in "$@"; do
     case "$arg" in
       --dry-run) dry_run=true ;;
+      --force)   force=true ;;
       *)         args+=("$arg") ;;
     esac
   done
@@ -650,6 +771,8 @@ main() {
 
   local dry_flag=()
   "$dry_run" && dry_flag=(--dry-run)
+  local force_flag=()
+  "$force" && force_flag=(--force)
 
   case "$cmd" in
     setup)
@@ -665,14 +788,19 @@ main() {
       _stop
       ;;
     dump_now)
-      archive_run "${dry_flag[@]}"
+      # Without --force: automatic, threshold-based run (used by cron).
+      # With --force: manual dump that ignores MAX and archives down to TARGET.
+      archive_run "${dry_flag[@]}" "${force_flag[@]}"
       ;;
     sync_now)
       backup_db_run "${dry_flag[@]}"
       ;;
     test_run)
-      archive_run --dry-run
-      backup_db_run --dry-run
+      # Verbose simulation of a forced dump + DB-backup sync. Forced so candidates
+      # are listed even when the library is below MAX. Run both halves regardless of
+      # either's outcome so a non-zero return under `set -e` never hides a preview.
+      archive_run --force --dry-run || true
+      backup_db_run --dry-run || true
       ;;
     uninstall)
       # Hand off to the standalone uninstaller (self-relocates before deleting the

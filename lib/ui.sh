@@ -295,11 +295,13 @@ _gauge_place() {
   _v="${_v:0:c}${t}${_v:c+len}"
 }
 
-# render_library_gauge <disk_total> <disk_used> <lib_bytes> <max_mb> <min_mb>
-# Echoes a multi-line visualization. max_mb / min_mb may be 0 to omit a marker.
+# render_library_gauge <disk_total> <disk_used> <lib_bytes> <max_mb> <min_mb> [focus]
+# focus ∈ {max,min,""}: when set, the matching marker gets a "set a … value" hint;
+# a 0/undefined value also gets a placeholder position (MAX at far right −1 block,
+# MIN on the leftmost current-library cell). Echoes a multi-line visualization.
 render_library_gauge() {
   local disk_total="${1:-0}" disk_used="${2:-0}" lib_bytes="${3:-0}"
-  local max_mb="${4:-0}" min_mb="${5:-0}"
+  local max_mb="${4:-0}" min_mb="${5:-0}" focus="${6:-}"
   local W=50
   local max_bytes=$(( max_mb * 1048576 )) min_bytes=$(( min_mb * 1048576 ))
 
@@ -325,46 +327,64 @@ render_library_gauge() {
   (( used_c > W )) && used_c=$W
   local lib_start=$(( used_c - lib_blocks )) lib_end=$used_c
 
-  # Thresholds are library sizes, so they are measured from the START of the
-  # library block (i.e. offset by the other-data already on disk). For a single
-  # block we simply bracket it — MAX at its end, MIN at its start; with several
-  # blocks the markers fall proportionally around the block.
+  # Thresholds are library sizes, measured from the START of the library block
+  # (offset by the other-data already on disk), so each marker tracks its real
+  # value on the disk scale — independent of how few cells the current size spans.
   local other_bytes=$(( disk_used - lib_bytes )); (( other_bytes < 0 )) && other_bytes=0
   local min_c max_c
-  if (( lib_blocks <= 1 )); then
-    # Bracket the block by its own cells: MIN on the first cell, MAX on the last
-    # cell. For a single-cell block both land on the same column, so the ▲ and ▼
-    # line up exactly above/below the block instead of straddling it.
-    min_c=$lib_start; max_c=$(( lib_end - 1 ))
-    (( max_c < min_c )) && max_c=$min_c
-  else
-    _gcol $(( other_bytes + max_bytes )); max_c=$_c
-    _gcol $(( other_bytes + min_bytes )); min_c=$_c
-    (( min_c >= max_c )) && min_c=$(( max_c > 0 ? max_c - 1 : 0 ))
-  fi
+  _gcol $(( other_bytes + max_bytes )); max_c=$_c
+  _gcol $(( other_bytes + min_bytes )); min_c=$_c
+  (( max_c < lib_end )) && max_c=$lib_end   # MAX can never sit left of the current size
+  (( min_c > max_c   )) && min_c=$max_c
 
-  local g_full g_other g_empty g_dn g_up g_lb g_rb
+  local g_full g_other g_grow g_free g_dn g_up g_lb g_rb
   if (( GAUGE_UTF )); then
-    g_full='█'; g_other='▒'; g_empty='░'; g_dn='▼'; g_up='▲'; g_lb='├'; g_rb='┤'
+    g_full='█'; g_other='▒'; g_grow='░'; g_free='┄'; g_dn='▼'; g_up='▲'; g_lb='├'; g_rb='┤'
   else
-    g_full='#'; g_other='+'; g_empty='-'; g_dn='v'; g_up='^'; g_lb='['; g_rb=']'
+    g_full='#'; g_other='+'; g_grow='.'; g_free='-'; g_dn='v'; g_up='^'; g_lb='['; g_rb=']'
   fi
 
+  # Bands: other data ▒ | current library █ | headroom up to MAX ░ | free (blank).
+  # The ░ band makes the current size (█) visibly distinct from the archiving
+  # ceiling, and the MAX marker lands at the right edge of that band.
+  local grow_end=$max_c
+  (( max_mb <= 0 )) && grow_end=$lib_end   # no MAX configured: no headroom band
+  (( grow_end < lib_end )) && grow_end=$lib_end
   local bar="" i
   for (( i = 0; i < W; i++ )); do
     if   (( i < lib_start )); then bar+="$g_other"
     elif (( i < lib_end   )); then bar+="$g_full"
-    else                           bar+="$g_empty"; fi
+    elif (( i < grow_end  )); then bar+="$g_grow"
+    else                           bar+="$g_free"; fi
   done
 
-  # MAX marker above the bar (▼), MIN marker below it (▲): distinct symbols on
-  # distinct rows, so they never look alike or overlap. One leading space aligns
-  # each row with the left border g_lb.
+  # Marker columns. A defined value sits one cell back, over the last filled cell of
+  # its band (the boundary it marks) — cleaner. An undefined value (0) gets a
+  # placeholder: MAX at the far right minus one block, MIN on the leftmost cell of
+  # the current-library block. MAX (▼) rides above the bar, MIN (▲) below it.
+  local max_mk min_mk
+  if (( max_mb > 0 )); then max_mk=$(( max_c > 0 ? max_c - 1 : 0 )); else max_mk=$(( W - 2 )); fi
+  if (( min_mb > 0 )); then min_mk=$(( min_c > 0 ? min_c - 1 : 0 )); else min_mk=$lib_start; fi
+  (( max_mk < 0 )) && max_mk=0
+  (( min_mk < 0 )) && min_mk=0
+
   local toprow botrow
   printf -v toprow '%*s' "$W" ''
   printf -v botrow '%*s' "$W" ''
-  (( max_mb > 0 )) && _gauge_place toprow "$max_c" "$g_dn"
-  (( min_mb > 0 )) && _gauge_place botrow "$min_c" "$g_up"
+  _gauge_place toprow "$max_mk" "$g_dn"
+  _gauge_place botrow "$min_mk" "$g_up"
+
+  # Label the marker being set so it's obvious which arrow the user is moving. Skip
+  # the label when it wouldn't fit, to avoid garbled overlap with the bar edges.
+  if [[ "$focus" == "max" ]]; then
+    local lbl='set a MAX value ->'
+    (( max_mk >= ${#lbl} )) && _gauge_place toprow $(( max_mk - ${#lbl} )) "$lbl"
+    _gauge_place toprow "$max_mk" "$g_dn"
+  elif [[ "$focus" == "min" ]]; then
+    local lbl='<- set a MIN value'
+    (( min_mk + 1 + ${#lbl} <= W )) && _gauge_place botrow $(( min_mk + 1 )) "$lbl"
+    _gauge_place botrow "$min_mk" "$g_up"
+  fi
 
   local lib_pct=0 used_pct=0
   if (( disk_total > 0 )); then
@@ -372,14 +392,16 @@ render_library_gauge() {
     used_pct=$(( disk_used * 100 / disk_total ))
   fi
 
-  printf 'Immich library now: %s (%d%%)   ·   disk used: %s (%d%%)   ·   disk total: %s\n' \
+  local disk_free=$(( disk_total - disk_used )); (( disk_free < 0 )) && disk_free=0
+  printf 'Immich library now: %s (%d%%)   ·   disk used: %s (%d%%)   ·   disk total: %s   ·   free space: %s\n' \
     "$(bytes_to_human "$lib_bytes")" "$lib_pct" \
     "$(bytes_to_human "$disk_used")" "$used_pct" \
-    "$(bytes_to_human "$disk_total")"
+    "$(bytes_to_human "$disk_total")" \
+    "$(bytes_to_human "$disk_free")"
   printf ' %s\n'    "$toprow"
   printf '%s%s%s\n' "$g_lb" "$bar" "$g_rb"
   printf ' %s\n'    "$botrow"
   (( max_mb > 0 )) && printf '%s MAX = %-9s archiving STARTS when the library grows past this\n' "$g_dn" "$(mb_to_human "$max_mb")"
   (( min_mb > 0 )) && printf '%s MIN = %-9s each run brings the library back DOWN to this\n'     "$g_up" "$(mb_to_human "$min_mb")"
-  printf '%s library   %s other data   %s free\n' "$g_full" "$g_other" "$g_empty"
+  printf '%s current library   %s other data   %s headroom up to MAX   %s free\n' "$g_full" "$g_other" "$g_grow" "$g_free"
 }
