@@ -71,6 +71,32 @@ _resolve_self_bin() {
   fi
 }
 
+# Create (or repair) the stable ~/.local/bin/immich-auto-dumper symlink that PATH
+# invocations and cron lines rely on. Owned by setup — not the installer — so the
+# link is (re)established every time the user configures, even when the tool was
+# copied into place manually rather than installed via install.sh. Only prints when
+# it actually (re)creates the link, to stay quiet on routine re-runs.
+_ensure_symlink() {
+  local target link current
+  target="$(readlink -f "$SCRIPT_DIR/immich-auto-dumper.sh")"
+  link="$HOME/.local/bin/immich-auto-dumper"
+  mkdir -p "$HOME/.local/bin"
+
+  current=""
+  [[ -e "$link" || -L "$link" ]] && current="$(readlink -f "$link" 2>/dev/null || true)"
+  if [[ "$current" != "$target" ]]; then
+    rm -f "$link"
+    ln -s "$target" "$link"
+    printf 'Symlink created: %s -> %s\n' "$link" "$target"
+  fi
+
+  if [[ ":${PATH}:" != *":${HOME}/.local/bin:"* ]]; then
+    printf '\nWARNING: ~/.local/bin is not in your PATH.\n'
+    printf 'Add this line to ~/.bashrc or ~/.profile, then restart your shell:\n'
+    printf '  export PATH="${HOME}/.local/bin:${PATH}"\n\n'
+  fi
+}
+
 # Wizard dialog title prefix, so every step is clearly part of the same flow.
 _wiz_title() { printf 'immich-auto-dumper Setup — %s' "$1"; }
 
@@ -187,6 +213,10 @@ _resolve_storage_marker() {
 # ── setup ─────────────────────────────────────────────────────────────────────
 
 _setup() {
+  # Establish the ~/.local/bin symlink first: the cron lines generated later resolve
+  # through it (see _resolve_self_bin), and it lets the user call the tool by name.
+  _ensure_symlink
+
   ui_detect
   ui_banner "immich-auto-dumper — guided setup"
 

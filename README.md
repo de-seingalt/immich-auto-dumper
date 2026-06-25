@@ -60,14 +60,17 @@ Immich's side, the photo simply lives somewhere else now.
 curl -fsSL https://raw.githubusercontent.com/de-seingalt/immich-auto-dumper/main/install.sh | bash
 ```
 
-Installs to `~/.local/share/immich-auto-dumper`, symlinks `~/.local/bin/immich-auto-dumper`,
-and launches the setup wizard. If `~/.local/bin` isn't on your `PATH`, the installer prints
-the line to add. Pick another directory with `INSTALL_DIR=…`.
+Installs to `~/.local/share/immich-auto-dumper` from the latest `main`, then launches the
+setup wizard. The wizard creates the `~/.local/bin/immich-auto-dumper` symlink (and prints
+the `PATH` line to add if `~/.local/bin` isn't on your `PATH`). Pick another directory with
+`INSTALL_DIR=…`.
 
-**Updating** — re-run the installer; it detects the existing copy and offers to update
-(force-syncs to the branch, `git reset --hard`; your gitignored `config.conf` and logs are
-kept). Non-interactive: `~/.local/share/immich-auto-dumper/install.sh --yes`. Track a
-branch with `BRANCH=<name>`.
+**Updating** — re-run the installer; it detects the existing copy and asks what to do with
+your config: update keeping `config.conf`, update and reset it (your old one is saved to
+`config.conf.bak`), or cancel. Either way it force-syncs to the latest `main`
+(`git reset --hard`); gitignored logs are kept. A directory whose files were copied in by
+hand (not a git checkout) is adopted into git first. Non-interactive (updates, keeps
+config): `~/.local/share/immich-auto-dumper/install.sh --yes`.
 
 ## Configure
 
