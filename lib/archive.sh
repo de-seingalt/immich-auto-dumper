@@ -90,14 +90,22 @@ _archive_move_file() {
     return 1
   fi
 
-  if ! $DOCKER_CMD exec "$IMMICH_SERVER_CONTAINER" test -f "$dst_db"; then
+  if ! $DOCKER_CMD exec "$IMMICH_SERVER_CONTAINER" test -f "$dst_db" </dev/null; then
     log_error "File not accessible from container: $dst_db"
     "$update_fn" "$asset_id" "$(host_path_to_db_path "$src_host_path")" || true
     if ! "$already_archived"; then rm -f "$dst_host"; fi
     return 1
   fi
 
-  rm -f "$src_host_path"
+  # Library files are owned by the container's UID (often root), so the unprivileged
+  # host user can't remove them. Delete through the container that owns them — no
+  # sudo. The copy + DB update already succeeded, so a failed cleanup is non-fatal:
+  # the asset now points to the destination; the source just lingers as an orphan.
+  local src_db
+  src_db=$(host_path_to_db_path "$src_host_path")
+  if ! $DOCKER_CMD exec "$IMMICH_SERVER_CONTAINER" rm -f "$src_db" </dev/null; then
+    log_warn "Archived OK but could not remove source in container: $src_db"
+  fi
   return 0
 }
 
@@ -128,7 +136,9 @@ _archive_move_sidecar() {
 
     mkdir -p "$(dirname "$dst_sidecar")"
     if cp "$sidecar" "$dst_sidecar" && stat "$dst_sidecar" &>/dev/null; then
-      rm -f "$sidecar"
+      # Same ownership constraint as the asset: remove the source via the container.
+      $DOCKER_CMD exec "$IMMICH_SERVER_CONTAINER" rm -f "$(host_path_to_db_path "$sidecar")" </dev/null \
+        || log_warn "Sidecar copied but could not remove source: $sidecar"
     else
       log_warn "Failed to move sidecar: $sidecar"
     fi
@@ -159,8 +169,13 @@ guard_path_consistency() {
 }
 
 archive_run() {
-  local dry_run=false
-  [[ "${1:-}" == "--dry-run" ]] && dry_run=true
+  local dry_run=false force=false
+  for arg in "$@"; do
+    case "$arg" in
+      --dry-run) dry_run=true ;;
+      --force)   force=true ;;
+    esac
+  done
 
   check_prereqs
 
@@ -179,30 +194,55 @@ archive_run() {
   fi
 
   # Drive archiving by the library's actual size (du of library/), compared against
-  # absolute boundaries in GB. This is independent of any unrelated data sharing the
-  # same filesystem. 1 GB = 1024^3 bytes (matches bytes_to_human / du -B G).
+  # absolute boundaries. This is independent of any unrelated data sharing the same
+  # filesystem. Boundaries are stored in MiB (1 MiB = 1024^2 bytes) so fractional-GB
+  # limits are expressible; the deprecated *_GB keys are still honored for configs
+  # written before the switch (1 GiB = 1024 MiB).
   local lib_bytes
   lib_bytes=$(dir_size_bytes "$IMMICH_UPLOAD_LOCATION/library")
-  local max_bytes=$(( ${ARCHIVE_LIBRARY_MAX_GB:-0} * 1073741824 ))
-  local target_bytes=$(( ${ARCHIVE_LIBRARY_TARGET_GB:-0} * 1073741824 ))
+  local max_mb="${ARCHIVE_LIBRARY_MAX_MB:-}" target_mb="${ARCHIVE_LIBRARY_TARGET_MB:-}"
+  [[ -z "$max_mb"    && -n "${ARCHIVE_LIBRARY_MAX_GB:-}"    ]] && max_mb=$(( ARCHIVE_LIBRARY_MAX_GB * 1024 ))
+  [[ -z "$target_mb" && -n "${ARCHIVE_LIBRARY_TARGET_GB:-}" ]] && target_mb=$(( ARCHIVE_LIBRARY_TARGET_GB * 1024 ))
+  local max_bytes=$(( ${max_mb:-0} * 1048576 ))
+  local target_bytes=$(( ${target_mb:-0} * 1048576 ))
 
-  if (( max_bytes <= 0 )); then
-    log_error "ARCHIVE_LIBRARY_MAX_GB is not configured — run: immich-auto-dumper setup"
+  "$dry_run" && log_info "DRY-RUN: nothing will be copied, removed, or written to the DB."
+  log_info "Library size: $(bytes_to_human "$lib_bytes")  [max: $(bytes_to_human "$max_bytes") — target: $(bytes_to_human "$target_bytes")]"
+
+  # The target is the floor: archiving always stops once the library reaches it,
+  # never below it — both for automatic and forced runs.
+  if (( target_bytes <= 0 )); then
+    log_error "Archive target size is not configured — run: immich-auto-dumper setup"
     release_lock
     return 1
   fi
 
-  if (( lib_bytes <= max_bytes )); then
-    log_info "Library $(bytes_to_human "$lib_bytes") within limit (max $(bytes_to_human "$max_bytes")) — nothing to archive."
-    release_lock
-    return 0
+  if "$force"; then
+    # Manual forced dump: bypass the MAX trigger but still respect the target floor.
+    log_info "Forced archive: ignoring MAX threshold, archiving down to target $(bytes_to_human "$target_bytes")."
+    if (( lib_bytes <= target_bytes )); then
+      log_info "Library already at or below target — nothing to archive."
+      release_lock
+      return 0
+    fi
+  else
+    if (( max_bytes <= 0 )); then
+      log_error "Archive size limit is not configured — run: immich-auto-dumper setup"
+      release_lock
+      return 1
+    fi
+    if (( lib_bytes <= max_bytes )); then
+      log_info "Library within limit (max $(bytes_to_human "$max_bytes")) — nothing to archive."
+      release_lock
+      return 0
+    fi
+    log_info "Archive triggered: library exceeds max $(bytes_to_human "$max_bytes")."
   fi
-
-  log_info "Archive triggered: library $(bytes_to_human "$lib_bytes") exceeds max $(bytes_to_human "$max_bytes") (target $(bytes_to_human "$target_bytes"))."
 
   # Safety: never modify the database unless a recent (<7 days) Immich DB backup
   # exists. Archiving rewrites "originalPath" rows, so a fresh dump is the safety net.
-  if ! find "$IMMICH_UPLOAD_LOCATION/backups" -type f -mtime -7 2>/dev/null | grep -q .; then
+  # Skipped in dry-run: it writes nothing, and test_run must still preview candidates.
+  if ! "$dry_run" && ! find "$IMMICH_UPLOAD_LOCATION/backups" -type f -mtime -7 2>/dev/null | grep -q .; then
     log_error "No recent DB backup (<7 days) in $IMMICH_UPLOAD_LOCATION/backups — archive aborted."
     release_lock
     return 1
@@ -210,10 +250,14 @@ archive_run() {
 
   local bytes_to_free=$(( lib_bytes - target_bytes ))
 
+  log_info "Need to free $(bytes_to_human "$bytes_to_free") — selecting oldest directories first:"
+
   local freed_bytes=0
 
   while IFS='|' read -r user_folder parent_dir folder_size; do
     [[ -z "$user_folder" ]] && continue
+
+    log_info "Candidate directory: $parent_dir (user: $user_folder, $(bytes_to_human "${folder_size:-0}"))"
 
     while IFS='|' read -r asset_id original_path_db file_size; do
       [[ -z "$asset_id" ]] && continue
