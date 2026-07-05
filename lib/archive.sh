@@ -76,9 +76,20 @@ _archive_move_file() {
 
   if ! "$already_archived"; then
     mkdir -p "$(dirname "$dst_host")"
-    cp "$src_host_path" "$dst_host"
-    if ! stat "$dst_host" &>/dev/null; then
-      log_error "Verification failed after cp: $dst_host"
+    # A failed or interrupted cp (full disk, dead mount) can leave a PARTIAL file
+    # that a mere existence check would accept — and the source would then be
+    # deleted. Verify the exit code AND that the copied size matches the source
+    # before anything irreversible happens.
+    if ! cp "$src_host_path" "$dst_host"; then
+      log_error "Copy failed: $src_host_path → $dst_host"
+      rm -f "$dst_host"
+      return 1
+    fi
+    local copied_src_size copied_dst_size
+    copied_src_size=$(stat --format='%s' "$src_host_path" 2>/dev/null || echo -1)
+    copied_dst_size=$(stat --format='%s' "$dst_host" 2>/dev/null || echo -2)
+    if [[ "$copied_src_size" != "$copied_dst_size" ]]; then
+      log_error "Size mismatch after copy (src=${copied_src_size}B dst=${copied_dst_size}B): $dst_host"
       rm -f "$dst_host"
       return 1
     fi
