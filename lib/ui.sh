@@ -68,6 +68,24 @@ readonly _UI_W=78
 
 # ── Primitives ────────────────────────────────────────────────────────────────
 
+# ui_logo  — ASCII splash shown at the start of an interactive entry point
+# (setup wizard, usage screen). Printed to the raw terminal, so it runs
+# regardless of the whiptail/text backend choice.
+ui_logo() {
+  printf '%s' "$C_CYAN"
+  cat <<'EOF'
+                             ___
+ +====================+     /::/|
+ | immich-auto-dumper |   /::/  / .__
+ +====================+ /::/   /__|[_I___,
+                       /::/.-./___I__.-~;|
+ auto-free library    |__|`(_)--------(_)"
+to external storage.::::::..
+       .........:::::::::::::..
+EOF
+  printf '%s' "$C_RESET"
+}
+
 # ui_banner <title>  — wizard header (text backend only; whiptail uses titles).
 ui_banner() {
   if [[ "$UI_BACKEND" == "text" ]]; then

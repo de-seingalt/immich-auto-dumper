@@ -37,6 +37,17 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
+cat <<'EOF'
+                             ___
+ +====================+     /::/|
+ | immich-auto-dumper |   /::/  / .__
+ +====================+ /::/   /__|[_I___,
+                       /::/.-./___I__.-~;|
+ auto-free library    |__|`(_)--------(_)"
+to external storage.::::::..
+       .........:::::::::::::..
+EOF
+
 _check_cmd() {
   if ! command -v "$1" &>/dev/null; then
     printf 'Error: "%s" is required but not found. Install it and try again.\n' "$1" >&2

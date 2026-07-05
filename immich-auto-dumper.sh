@@ -27,6 +27,7 @@ declare -A USER_MAP 2>/dev/null || true
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 _usage() {
+  ui_logo
   cat <<'EOF'
 Usage: immich-auto-dumper <command> [--dry-run] [--force]
 
@@ -218,6 +219,7 @@ _setup() {
   _ensure_symlink
 
   ui_detect
+  ui_logo
   ui_banner "immich-auto-dumper — guided setup"
 
   # Detect docker command first; everything below depends on it.
