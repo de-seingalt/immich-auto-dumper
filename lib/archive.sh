@@ -71,6 +71,9 @@ _archive_move_file() {
       log_info "DRY-RUN: would copy $src_host_path → $dst_host"
       log_info "DRY-RUN: would UPDATE asset $asset_id originalPath → $dst_db"
     fi
+    if [[ "$(db_asset_would_be_external "$asset_id" "$dst_db" || true)" == "f" ]]; then
+      log_warn "DRY-RUN: no external library in Immich covers $dst_db for this asset's owner — the real run would SKIP this asset (Immich's library scan would otherwise re-import it as a duplicate). Create the external library first (see setup)."
+    fi
     return 0
   fi
 
@@ -97,6 +100,18 @@ _archive_move_file() {
 
   if ! "$update_fn" "$asset_id" "$dst_db"; then
     log_error "DB update failed (asset $asset_id): $dst_db"
+    if ! "$already_archived"; then rm -f "$dst_host"; fi
+    return 1
+  fi
+
+  # The asset must end up ADOPTED by an external library: an archived asset left as
+  # an upload asset gets re-imported as a duplicate by Immich's periodic library
+  # scan, and stays exposed to the storage-template migration job. Roll back and
+  # skip rather than create that state.
+  if [[ "${DB_UPDATE_IS_EXTERNAL:-}" == "f" ]]; then
+    log_error "No external library in Immich covers $dst_db for this asset's owner — skipping (a library scan would re-import it as a duplicate)."
+    log_error "Create the external library in Immich (Administration → Libraries), then re-run."
+    "$update_fn" "$asset_id" "$(host_path_to_db_path "$src_host_path")" || true
     if ! "$already_archived"; then rm -f "$dst_host"; fi
     return 1
   fi

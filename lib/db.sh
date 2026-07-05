@@ -156,22 +156,58 @@ db_get_archive_candidates() {
     ORDER BY MIN(a.\"fileCreatedAt\") ASC;"
 }
 
-# Updates originalPath for an asset in a transaction. Returns 0 on success, 1 on failure.
+# Updates originalPath for an asset AND its library membership. When the new path
+# falls under an import path of an external library owned by the asset's owner, the
+# asset is adopted into that library (libraryId set, isExternal=true) so Immich's
+# periodic library scan matches the existing row instead of re-importing the file
+# as a duplicate asset. When no library covers the path (including the rollback to
+# the internal library), the asset reverts to a plain upload asset (libraryId NULL,
+# isExternal=false). Sets DB_UPDATE_IS_EXTERNAL to the resulting state ('t'/'f').
+# Returns 0 on success, 1 on failure.
 db_update_asset_path() {
   local asset_id="$1"
   local new_path="$2"
+  DB_UPDATE_IS_EXTERNAL=""
 
   local escaped_id escaped_path
   escaped_id=$(_db_escape "$asset_id")
   escaped_path=$(_db_escape "$new_path")
 
-  if _db_exec "BEGIN;
-               UPDATE \"asset\" SET \"originalPath\"='${escaped_path}' WHERE \"id\"='${escaped_id}';
-               COMMIT;" &>/dev/null; then
-    return 0
-  else
-    return 1
-  fi
+  # rtrim + '/%' matches import paths with or without a trailing slash, without
+  # letting '/kdrive/Test' claim '/kdrive/Test2/...'.
+  local lib_match="SELECT l.\"id\" FROM \"library\" l
+                   WHERE l.\"deletedAt\" IS NULL
+                     AND l.\"ownerId\" = a.\"ownerId\"
+                     AND EXISTS (SELECT 1 FROM unnest(l.\"importPaths\") ip
+                                 WHERE '${escaped_path}' LIKE rtrim(ip, '/') || '/%')"
+
+  local out
+  out=$(_db_exec "UPDATE \"asset\" AS a SET
+                    \"originalPath\" = '${escaped_path}',
+                    \"libraryId\"    = (${lib_match} LIMIT 1),
+                    \"isExternal\"   = EXISTS (${lib_match}),
+                    \"isOffline\"    = false
+                  WHERE a.\"id\" = '${escaped_id}'
+                  RETURNING a.\"isExternal\";" 2>/dev/null) || return 1
+  DB_UPDATE_IS_EXTERNAL=$(printf '%s' "$out" | head -1)
+  [[ -n "$DB_UPDATE_IS_EXTERNAL" ]]
+}
+
+# Echoes 't' when an external library of the asset's owner covers <path>, 'f'
+# otherwise. Read-only preview of the adoption decision above — used by dry runs
+# to surface a missing external library before any real archiving is attempted.
+db_asset_would_be_external() {
+  local asset_id="$1"
+  local path="$2"
+  local escaped_id escaped_path
+  escaped_id=$(_db_escape "$asset_id")
+  escaped_path=$(_db_escape "$path")
+  _db_exec "SELECT EXISTS (SELECT 1 FROM \"library\" l JOIN \"asset\" a
+              ON l.\"ownerId\" = a.\"ownerId\"
+            WHERE a.\"id\" = '${escaped_id}'
+              AND l.\"deletedAt\" IS NULL
+              AND EXISTS (SELECT 1 FROM unnest(l.\"importPaths\") ip
+                          WHERE '${escaped_path}' LIKE rtrim(ip, '/') || '/%'));" 2>/dev/null | head -1
 }
 
 # ── Path consistency (case B detection — read-only) ───────────────────────────
