@@ -39,6 +39,10 @@ db_check_schema() {
     "deletedAt" "ownerId" "visibility" "fileCreatedAt"
   )
   local expected_exif_columns=("assetId" "fileSizeInByte")
+  # Used by the external-library adoption in db_update_asset_path and by
+  # db_get_external_libraries — a rework of the library table must abort here,
+  # at pre-flight, not mid-archive.
+  local expected_library_columns=("id" "ownerId" "importPaths" "deletedAt")
 
   local missing=()
 
@@ -55,6 +59,14 @@ db_check_schema() {
   for col in "${expected_exif_columns[@]}"; do
     if ! printf '%s\n' "$exif_cols" | grep -qx "$col"; then
       missing+=("asset_exif.$col")
+    fi
+  done
+
+  local library_cols
+  library_cols=$(_db_exec "SELECT column_name FROM information_schema.columns WHERE table_name='library';" 2>/dev/null || true)
+  for col in "${expected_library_columns[@]}"; do
+    if ! printf '%s\n' "$library_cols" | grep -qx "$col"; then
+      missing+=("library.$col")
     fi
   done
 

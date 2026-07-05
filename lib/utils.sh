@@ -107,6 +107,16 @@ check_prereqs() {
     exit 1
   fi
 
+  # Log the running Immich version so schema failures in the log can be tied to
+  # the exact Immich upgrade that introduced them. Purely informational.
+  # IMMICH_SOURCE_REF is baked into the image at build time (exact release, e.g.
+  # v2.7.5); IMMICH_VERSION is only the compose-file tag the user pinned (can be
+  # a bare major or "release") and serves as fallback.
+  local immich_version
+  immich_version=$($DOCKER_CMD exec "$IMMICH_SERVER_CONTAINER" sh -c \
+    'printenv IMMICH_SOURCE_REF || printenv IMMICH_VERSION' 2>/dev/null </dev/null || true)
+  log_info "Immich version: ${immich_version:-unknown}"
+
   # Validate the Immich DB schema before any operation touches the database.
   if ! db_check_schema; then
     exit 1
