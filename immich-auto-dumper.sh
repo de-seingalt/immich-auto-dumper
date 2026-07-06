@@ -92,9 +92,9 @@ _ensure_symlink() {
   fi
 
   if [[ ":${PATH}:" != *":${HOME}/.local/bin:"* ]]; then
-    printf '\nWARNING: ~/.local/bin is not in your PATH.\n'
-    printf 'Add this line to ~/.bashrc or ~/.profile, then restart your shell:\n'
-    printf '  export PATH="${HOME}/.local/bin:${PATH}"\n\n'
+    printf '\033[31mWARNING: ~/.local/bin is not in your PATH.\033[0m\n'
+    printf '\033[31mTo use the command immich-auto-dumper, run:\033[0m\n'
+    printf '\033[31m%s\033[0m\n' 'echo '"'"'export PATH="${HOME}/.local/bin:${PATH}"'"'"' >> ~/.bashrc && source ~/.bashrc'
   fi
 }
 
