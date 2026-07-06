@@ -1,12 +1,11 @@
-<p align="center">
-  <img src="docs/icon.svg" width="180" alt="immich-auto-dumper icon">
-</p>
+<img src="docs/icon.svg" width="180" alt="immich-auto-dumper icon" align="left">
+<br><br><br><br>
 
 # immich-auto-dumper
 
-**Your [Immich](https://immich.app/) disk is filling up. Your photos don't have to leave Immich.**
+**Your [Immich](https://immich.app/) server disk is filling up ? Your photos don't have to leave Immich.**
 
-Every self-hosted Immich server has the same quiet problem: the photo library only ever
+Your self-hosted Immich server has probably a limited disk space: the photo library only ever
 grows, and one day the disk is full. The usual fixes are painful — buy a bigger disk,
 delete memories, or move files around by hand and break your timeline.
 
