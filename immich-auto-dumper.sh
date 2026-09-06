@@ -435,9 +435,9 @@ _setup() {
     fi
     if (( v < def_min_free_mb )); then
       if ui_yesno "Below recommended floor" \
-           "$(mb_to_human "$v") is below the recommended safety floor of $(mb_to_human "$def_min_free_mb") for this disk.\n\nA smaller non-zero value would not reliably protect against the disk filling up. Disable the safety net entirely, or keep the recommended value?" \
-           yes "Disable (0)" "Keep recommended ($(mb_to_human "$def_min_free_mb"))"; then
-        min_free_mb=0
+           "$(mb_to_human "$v") is below the recommended safety floor of $(mb_to_human "$def_min_free_mb") for this disk (computed as 10% of total disk size, between a 2 GB floor and a 20 GB cap).\n\nA smaller value protects less reliably against the disk filling up from unrelated data. Keep $(mb_to_human "$v") anyway, or use the recommended value instead?" \
+           yes "Keep $(mb_to_human "$v")" "Use recommended ($(mb_to_human "$def_min_free_mb"))"; then
+        min_free_mb="$v"
       else
         min_free_mb="$def_min_free_mb"
       fi
