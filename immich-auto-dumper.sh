@@ -404,6 +404,49 @@ _setup() {
     fi
   done
 
+  # ── 6b. Free-disk safety net ─────────────────────────────────────────────────
+  # Independent of the library-size MAX above: also archive when TOTAL free disk
+  # space drops below this floor, so archiving still fires even if unrelated data
+  # (Postgres, Docker, logs...) — not the library — is what actually fills the disk.
+  # On by default (computed from disk size) unless the user disables it outright.
+  local def_min_free_mb=0
+  if (( disk_total > 0 )); then
+    def_min_free_mb=$(( disk_total * 10 / 100 / 1048576 ))
+    (( def_min_free_mb < 2048 ))  && def_min_free_mb=2048
+    (( def_min_free_mb > 20480 )) && def_min_free_mb=20480
+  fi
+  local min_free_mb="${ARCHIVE_MIN_FREE_MB:-$def_min_free_mb}"
+  while true; do
+    ui_input "$(_wiz_title "FREE ▽ — also archive if disk free drops below")" \
+      "Independent safety net: even if the library stays under MAX ▼, archiving\nalso triggers when TOTAL free disk space on this filesystem drops below this\nvalue (other processes — DB, Docker, logs — can fill the disk too).\n\nRecommended for this disk: $(mb_to_human "$def_min_free_mb")\nEnter a size, a % of the disk, or 0 to disable this safety net entirely." \
+      "$(mb_to_input "$min_free_mb")" || { ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."; return 0; }
+    if [[ -z "$UI_VALUE" ]]; then
+      min_free_mb=0
+      break
+    fi
+    v=$(parse_size_to_mb "$UI_VALUE" "$disk_total")
+    if [[ -z "$v" ]]; then
+      ui_info "Invalid value" "Enter a positive size, e.g. 2G, 500M, 10% (the % needs a detectable disk), or 0 to disable."
+      continue
+    fi
+    if (( v <= 0 )); then
+      min_free_mb=0
+      break
+    fi
+    if (( v < def_min_free_mb )); then
+      if ui_yesno "Below recommended floor" \
+           "$(mb_to_human "$v") is below the recommended safety floor of $(mb_to_human "$def_min_free_mb") for this disk.\n\nA smaller non-zero value would not reliably protect against the disk filling up. Disable the safety net entirely, or keep the recommended value?" \
+           yes "Disable (0)" "Keep recommended ($(mb_to_human "$def_min_free_mb"))"; then
+        min_free_mb=0
+      else
+        min_free_mb="$def_min_free_mb"
+      fi
+      break
+    fi
+    min_free_mb="$v"
+    break
+  done
+
   # ── 7. User → folder mapping (auto-suggested) ───────────────────────────────
   declare -A new_user_map=()
   declare -A user_name_by_key=()
@@ -504,7 +547,8 @@ _setup() {
     "External library   : $archive_dest" \
     "  (container path)   $archive_container_path" \
     "Start archiving at : ▼ $(mb_to_human "$max_mb")" \
-    "Archive down to    : ▲ $(mb_to_human "$target_mb")"
+    "Archive down to    : ▲ $(mb_to_human "$target_mb")" \
+    "Free-disk safety   : $(if (( min_free_mb > 0 )); then printf 'also archive if free disk < %s' "$(mb_to_human "$min_free_mb")"; else printf 'disabled'; fi)"
   if (( ${#user_paths[@]} > 0 )); then
     summary+=$'\n'
     summary+="Where each user's photos are archived on the external library:"$'\n'
@@ -545,6 +589,11 @@ ARCHIVE_STORAGE_ID="${storage_id}"
 # Archiving starts when library/ exceeds MAX and runs until it drops to TARGET.
 ARCHIVE_LIBRARY_MAX_MB=${max_mb}
 ARCHIVE_LIBRARY_TARGET_MB=${target_mb}
+
+# Also archive (down to TARGET) if total free disk space drops below this,
+# regardless of library size — a safety net against other processes filling
+# the disk. 0 = disabled.
+ARCHIVE_MIN_FREE_MB=${min_free_mb}
 
 # --- DB backup ---
 BACKUP_RETENTION=${backup_retention}
@@ -624,11 +673,30 @@ _status() {
     local s_max_mb="${ARCHIVE_LIBRARY_MAX_MB:-}" s_target_mb="${ARCHIVE_LIBRARY_TARGET_MB:-}"
     [[ -z "$s_max_mb"    && -n "${ARCHIVE_LIBRARY_MAX_GB:-}"    ]] && s_max_mb=$(( ARCHIVE_LIBRARY_MAX_GB * 1024 ))
     [[ -z "$s_target_mb" && -n "${ARCHIVE_LIBRARY_TARGET_GB:-}" ]] && s_target_mb=$(( ARCHIVE_LIBRARY_TARGET_GB * 1024 ))
-    printf 'Library size         : %s  [max ▼: %s — target ▲: %s]\n' \
+    printf 'Library size         : %s  (archives above %s, down to %s)\n' \
       "$(bytes_to_human "$lib_bytes")" \
       "${s_max_mb:+$(mb_to_human "$s_max_mb")}" "${s_target_mb:+$(mb_to_human "$s_target_mb")}"
-    printf 'Disk (library FS)    : %s total, %s free\n' \
-      "$(bytes_to_human "${disk_total:-0}")" "$(bytes_to_human "${disk_free:-0}")"
+    printf 'Total free disk space: %s free of %s total\n' \
+      "$(bytes_to_human "${disk_free:-0}")" "$(bytes_to_human "${disk_total:-0}")"
+
+    local s_min_free_mb="${ARCHIVE_MIN_FREE_MB:-0}"
+    if (( s_min_free_mb > 0 )); then
+      printf 'Free-disk safety net : archives if free disk < %s (currently %s free)\n' \
+        "$(mb_to_human "$s_min_free_mb")" "$(bytes_to_human "${disk_free:-0}")"
+    fi
+
+    # Same ceiling check `setup` makes when validating MAX (free disk + current
+    # library = the most the library can ever reach before the disk itself fills).
+    # Re-checked here because unrelated processes can erode that ceiling over time.
+    if (( disk_total > 0 && s_max_mb > 0 )) && (( disk_free + lib_bytes < s_max_mb * 1048576 )); then
+      if (( s_min_free_mb > 0 )); then
+        printf 'WARNING              : library cannot reach its %s max before the disk fills — relying on the free-disk safety net above.\n' \
+          "$(mb_to_human "$s_max_mb")"
+      else
+        printf 'WARNING              : library cannot reach its %s max before the disk fills, and no free-disk safety net is configured — automatic archiving may never trigger. Run: immich-auto-dumper setup\n' \
+          "$(mb_to_human "$s_max_mb")"
+      fi
+    fi
   else
     printf 'Library size         : unavailable (%s not found)\n' "$library_path"
   fi
@@ -641,7 +709,15 @@ _status() {
     printf 'External storage     : NOT READY  (%s)\n' "${ARCHIVE_DEST_PATH:-?}"
   fi
 
-  # Path consistency vs Immich DB (requires docker; best-effort, never fatal).
+  # Schema + path consistency vs Immich DB (requires docker; best-effort, never fatal).
+  if probe_docker_cmd 2>/dev/null && _db_reachable; then
+    if db_check_schema >/dev/null 2>&1; then
+      printf 'Schema check         : OK\n'
+    else
+      printf 'Schema check         : FAILED — Immich DB schema may have changed, review the script\n'
+    fi
+  fi
+
   if "$storage_ready" && probe_docker_cmd 2>/dev/null; then
     if db_check_path_consistency >/dev/null 2>&1; then
       printf 'Path consistency     : OK\n'

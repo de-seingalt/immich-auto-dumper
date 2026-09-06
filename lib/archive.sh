@@ -232,6 +232,16 @@ archive_run() {
   local max_bytes=$(( ${max_mb:-0} * 1048576 ))
   local target_bytes=$(( ${target_mb:-0} * 1048576 ))
 
+  # Free-disk safety net: also archive when total free disk space is low, even if
+  # the library itself stayed under MAX — other processes on the same disk can be
+  # what's actually filling it up. 0/unset disables this trigger.
+  local min_free_mb="${ARCHIVE_MIN_FREE_MB:-0}"
+  local min_free_bytes=$(( min_free_mb * 1048576 ))
+  local disk_free_bytes_now=0
+  (( min_free_bytes > 0 )) && disk_free_bytes_now=$(disk_free_bytes "$IMMICH_UPLOAD_LOCATION")
+  local low_free_disk=false
+  (( min_free_bytes > 0 && disk_free_bytes_now < min_free_bytes )) && low_free_disk=true
+
   "$dry_run" && log_info "DRY-RUN: nothing will be copied, removed, or written to the DB."
   log_info "Library size: $(bytes_to_human "$lib_bytes")  [max: $(bytes_to_human "$max_bytes") — target: $(bytes_to_human "$target_bytes")]"
 
@@ -257,12 +267,16 @@ archive_run() {
       release_lock
       return 1
     fi
-    if (( lib_bytes <= max_bytes )); then
-      log_info "Library within limit (max $(bytes_to_human "$max_bytes")) — nothing to archive."
+    if (( lib_bytes <= max_bytes )) && ! "$low_free_disk"; then
+      log_info "Library within limit (max $(bytes_to_human "$max_bytes")) and free disk above floor — nothing to archive."
       release_lock
       return 0
     fi
-    log_info "Archive triggered: library exceeds max $(bytes_to_human "$max_bytes")."
+    if (( lib_bytes > max_bytes )); then
+      log_info "Archive triggered: library exceeds max $(bytes_to_human "$max_bytes")."
+    else
+      log_info "Archive triggered: free disk ($(bytes_to_human "$disk_free_bytes_now")) below safety floor ($(bytes_to_human "$min_free_bytes")), even though the library is within its max."
+    fi
   fi
 
   # Safety: never modify the database unless a recent (<7 days) Immich DB backup

@@ -33,6 +33,12 @@ ARCHIVE_STORAGE_ID=""
 ARCHIVE_LIBRARY_MAX_MB=204800      # archiving starts when library/ exceeds this (=200 GiB)
 ARCHIVE_LIBRARY_TARGET_MB=153600   # archiving runs until library/ drops to this (=150 GiB)
 
+# Also archive (down to TARGET) if total free disk space on this filesystem drops
+# below this, regardless of library size — a safety net against other processes
+# (Postgres, Docker, logs...) filling the disk before the library ever hits MAX.
+# `setup` computes a recommended default from the disk size; 0 disables it.
+ARCHIVE_MIN_FREE_MB=10240           # e.g. 10 GiB
+
 # --- DB backup ---
 BACKUP_RETENTION=14                # Number of backup files to keep
 

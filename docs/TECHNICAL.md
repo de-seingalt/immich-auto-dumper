@@ -95,10 +95,14 @@ After each Immich upgrade, run `immich-auto-dumper test_run` before re-enabling 
 
 ### Trigger and candidate selection
 
-The trigger compares the **measured size of `UPLOAD_LOCATION/library`** (`du -sb`,
-apparent size) with the configured boundaries — unrelated data on the same filesystem
-never influences it. Normal runs archive only when the size exceeds `MAX`; `--force`
-runs archive regardless. Both bring the library down to `TARGET`, never below.
+Normal (unforced) runs trigger on **either** of two independent conditions:
+the **measured size of `UPLOAD_LOCATION/library`** (`du -sb`, apparent size) exceeds
+`ARCHIVE_LIBRARY_MAX_MB`, or the **total free disk space** on that filesystem drops
+below `ARCHIVE_MIN_FREE_MB` (0 = disabled). The second condition exists because the
+first assumes the library is the only thing that can fill the disk — on a shared
+filesystem, unrelated data (Postgres, Docker, logs...) can fill it instead, in which
+case the library-size trigger would never fire on its own. `--force` runs bypass both
+conditions. All paths bring the library down to `TARGET`, never below.
 
 `db_get_archive_candidates` groups active assets (`deletedAt IS NULL`, not offline, not
 already external) by their **immediate parent directory** and orders groups by the

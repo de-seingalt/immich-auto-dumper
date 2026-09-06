@@ -64,6 +64,11 @@ The wizard detects your running Immich (containers, database, folders) and asks 
 2. **A folder name per user** on that storage (suggested automatically).
 3. **Two sizes on a visual gauge**: the limit that triggers archiving (`MAX`) and the
    size the library shrinks back to (`TARGET`).
+4. **A free-disk safety net** (`FREE`): archiving also triggers if total free disk
+   space drops below this, even while the library is still under `MAX` — protection
+   against other things on the same disk (the database, Docker, logs...) filling it
+   up before the library ever gets the chance. On by default, sized from your disk;
+   enter `0` to disable it.
 
 ```
 Immich library now: 142.3 GB (31%)  ·  disk used: 256 GB (56%)  ·  disk total: 460 GB  ·  free space: 204 GB
@@ -118,7 +123,7 @@ immich-auto-dumper <command> [--dry-run] [--force]
 | `setup` | Configuration wizard (safe to re-run any time). |
 | `status` | Library size, storage readiness, backups, cron state, last runs. |
 | `start` / `stop` | Enable / disable the scheduled runs. |
-| `dump_now` | Archive now **if** the library exceeds `MAX`. |
+| `dump_now` | Archive now **if** the library exceeds `MAX` or free disk drops below `FREE`. |
 | `dump_now --force` | Archive now regardless of `MAX`, down to `TARGET`. |
 | `sync_now` | Mirror the DB backups to external storage now. |
 | `test_run` | Full simulation — shows what would happen, changes nothing. |
