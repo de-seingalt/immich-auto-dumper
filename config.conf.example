@@ -4,8 +4,11 @@
 
 # --- Immich ---
 IMMICH_UPLOAD_LOCATION="/path/to/immich/upload"  # Host path to UPLOAD_LOCATION
-IMMICH_DB_LIBRARY_PREFIX="/data/library"         # Absolute prefix of "originalPath" in the DB
-                                                 # (auto-detected by setup; default: /data/library)
+IMMICH_DB_LIBRARY_PREFIX="/data/library"         # Absolute prefix of "originalPath" in the DB.
+                                                 # Auto-detected by setup: /data/library on current
+                                                 # Immich images, /usr/src/app/upload/library on
+                                                 # older ones — which is also the last-resort value
+                                                 # when nothing can be detected.
 IMMICH_DB_CONTAINER="immich_postgres"
 IMMICH_SERVER_CONTAINER="immich_server"
 IMMICH_DB_NAME="immich"
@@ -40,7 +43,13 @@ ARCHIVE_LIBRARY_TARGET_MB=153600   # archiving runs until library/ drops to this
 ARCHIVE_MIN_FREE_MB=10240           # e.g. 10 GiB
 
 # --- DB backup ---
-BACKUP_RETENTION=14                # Number of backup files to keep
+# How many Immich database dumps to keep in $ARCHIVE_DEST_PATH/.immich-backup/.
+# Independent of Immich's own backup.database.keepLastAmount, which only governs the
+# dumps Immich keeps locally in $IMMICH_UPLOAD_LOCATION/backups (the matching 14
+# defaults are a coincidence). `setup` reads Immich's value and suggests it, so the
+# mirror never drops a dump Immich still holds; keeping fewer than Immich does means
+# the oldest exist in one place only.
+BACKUP_RETENTION=14                # Number of dumps kept on the external storage
 
 # --- User → external folder mapping ---
 # Generated automatically by "setup"; can be edited manually.

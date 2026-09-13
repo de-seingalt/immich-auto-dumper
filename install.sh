@@ -5,7 +5,9 @@ set -euo pipefail
 # immich-auto-dumper installer / updater.
 #
 # Always brings the install up to the latest origin/main, then hands off to the
-# setup wizard (which owns the ~/.local/bin symlink).
+# setup wizard (which owns the ~/.local/bin symlink). On an install that already has
+# a config.conf, setup opens on a review of that config — checks, summary and cron
+# status — not on the step-by-step, so handing off is always the right move here.
 #
 #   Nothing installed yet  : clones origin/main (the `curl ... | bash` path).
 #   Installation present    : asks whether to update keeping the local config,
@@ -56,6 +58,13 @@ _check_cmd() {
 }
 _check_cmd git
 
+# True only when /dev/tty can actually be opened. `[[ -r /dev/tty ]]` is not enough:
+# the device node exists and tests readable even in a process with no controlling
+# terminal (`ssh host 'cmd'`, a cron job, a pipeline), where every open() then fails
+# with "No such device or address" — which used to abort the installer right where it
+# hands off to the wizard. Trying the open is the only reliable test.
+_have_tty() { { : </dev/tty; } 2>/dev/null; }
+
 _git() { git -C "$INSTALL_DIR" "$@"; }
 
 # True when INSTALL_DIR holds no installation yet (absent or empty). Such a dir is
@@ -97,7 +106,7 @@ _adopt_into_git() {
 # Three-way prompt for an existing installation. Echoes one of: update / reset /
 # cancel. With --yes (or no terminal) it defaults to a config-preserving update.
 _ask_update_choice() {
-  if [[ "$ASSUME_YES" == "1" || ! -r /dev/tty ]]; then
+  if [[ "$ASSUME_YES" == "1" ]] || ! _have_tty; then
     printf 'update\n'; return 0
   fi
   local ans=""
@@ -144,22 +153,18 @@ fi
 chmod +x "$INSTALL_DIR/immich-auto-dumper.sh"
 
 # Configuration. The wizard creates config.conf and owns the ~/.local/bin symlink.
-# It is safe to re-run (re-detects everything and can be aborted), so only skip it
-# when a config already exists and the user declines.
-run_setup=1
-if [[ -f "$INSTALL_DIR/config.conf" ]]; then
-  if [[ "$ASSUME_YES" == "1" ]]; then
-    run_setup=0
-  elif [[ -r /dev/tty ]]; then
-    read -r -p "Re-run the configuration wizard now? [y/N] " ans </dev/tty || ans=""
-    [[ "$ans" =~ ^([Yy]|[Yy][Ee][Ss])$ ]] || run_setup=0
+# When a config already exists, setup opens on a review screen instead of the
+# step-by-step: it validates the saved config against this version of the tool and
+# the live Immich, shows it back, reports the cron status, and only then offers to
+# reconfigure. So it is always worth launching interactively — there is no blind
+# "re-run the wizard?" question here any more. --yes and a missing terminal still
+# skip it, since neither can answer the review.
+if [[ "$ASSUME_YES" != "1" ]] && _have_tty; then
+  if [[ -f "$INSTALL_DIR/config.conf" ]]; then
+    printf '\nChecking your configuration...\n\n'
   else
-    run_setup=0
+    printf '\nLaunching configuration wizard...\n\n'
   fi
-fi
-
-if [[ "$run_setup" == "1" && -r /dev/tty ]]; then
-  printf '\nLaunching configuration wizard...\n\n'
   "$INSTALL_DIR/immich-auto-dumper.sh" setup </dev/tty
 else
   printf '\nInstalled. Run "immich-auto-dumper setup" to configure.\n'

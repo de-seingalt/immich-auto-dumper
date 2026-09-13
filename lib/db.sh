@@ -122,6 +122,21 @@ db_get_external_libraries() {
             ORDER BY u.\"name\";"
 }
 
+# Echoes how many database dumps Immich itself keeps in UPLOAD_LOCATION/backups
+# (its backup.database.keepLastAmount setting), or nothing when that number is not
+# readable from the DB. Immich only stores the keys an admin actually changed in
+# system_metadata, so an empty answer means "still on Immich's own default" (14 at
+# the time of writing) — or that the setting comes from an IMMICH_CONFIG_FILE, which
+# lives outside the DB. Best-effort and never fatal: used by setup to suggest a
+# BACKUP_RETENTION that does not silently drop dumps Immich still has locally.
+db_immich_backup_keep_last() {
+  local v
+  v=$(_db_exec "SELECT \"value\" #>> '{backup,database,keepLastAmount}'
+                FROM \"system_metadata\" WHERE \"key\" = 'system-config';" 2>/dev/null | head -1 || true)
+  [[ "$v" =~ ^[0-9]+$ ]] && printf '%s\n' "$v"
+  return 0
+}
+
 # Returns id|originalPath|fileSizeInByte for all active assets in a given parent directory.
 # parent_dir_db_path is the exact DB path of the folder (no trailing slash).
 db_get_folder_assets() {

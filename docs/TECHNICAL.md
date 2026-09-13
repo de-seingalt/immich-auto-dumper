@@ -80,6 +80,40 @@ upgrade that introduced it. Limits to be aware of: the check verifies column *pr
 so purely additive migrations or semantic changes with unchanged names are not detected.
 After each Immich upgrade, run `immich-auto-dumper test_run` before re-enabling the cron.
 
+## Setup on an existing config (the review path)
+
+`setup` is the only writer of `config.conf`, and it is expected to be re-run — after an
+update, or just to check where things stand. Walking the full questionnaire every time
+pushes the user to re-answer questions they cannot remember, on a tool that rewrites
+paths in Immich's database; so with a config already present, `_setup` opens on
+`_setup_review` instead: saved settings (`_config_summary`), verdict
+(`_config_check`), then a three-way choice between keeping the config, reconfiguring
+step by step, and quitting. The step-by-step is only *recommended* — first in the menu —
+when a check actually failed.
+
+The review runs **before** `detect_docker_cmd`, which exits when the daemon is
+unreachable: showing a saved config and managing the schedule must keep working while
+Immich or Docker is down. Every live check in `_config_check` is therefore guarded by
+`probe_docker_cmd` / `_db_reachable` and degrades to a note. Findings land in three
+buckets, and the distinction is the whole point of the screen:
+
+| Bucket | Meaning | Effect |
+|---|---|---|
+| `CFG_PROBLEMS` | a setting no longer holds (missing key, `TARGET ≥ MAX`, container gone, Immich user with no folder, path drift) | reconfiguration recommended |
+| `CFG_OUTDATED` | keys in `_CFG_BACKFILL_KEYS` absent from the file — a config written by an older version | offered for append-only backfill |
+| `CFG_NOTES` | live state, not a config error (storage currently unmounted, Docker unreachable, Immich keeping more dumps than we mirror) | informational |
+
+`_config_has_key` greps `config.conf` rather than testing the variable: a variable can be
+set from the environment or defaulted elsewhere in the script, which would hide a key
+that is genuinely absent from the file. `_config_backfill` only ever *appends* lines, so
+a value the user edited by hand is never rewritten — that is what makes "keep my config"
+safe to offer at all.
+
+`ARCHIVE_STORAGE_ID` and the container names are in `_CFG_ESSENTIAL_KEYS`: they identify
+this particular Immich install and have no safe default, so their absence is a problem
+rather than something to backfill. `USER_MAP` is checked on its contents instead — empty
+always, and per Immich user whenever the database answers.
+
 ## The archiving engine (`archive_run`)
 
 ### Pre-flight
@@ -199,6 +233,22 @@ the external storage as unreliable; compare names and sizes instead.
 weekly on Sunday at 03:00, both appending to `cron.log`. `stop` comments the entries out
 and waits for a running operation to release the lock. The guard above may also disable
 the entries autonomously.
+
+`cron_state` reports three distinct states, and every caller (setup, `status`) branches
+on them rather than on a boolean: `active` (a live schedule line), `disabled` (schedule
+lines present but commented out — what `stop` leaves behind, and what `start` re-enables
+before appending anything), `absent` (nothing scheduled at all). The middle state is the
+reason `start` un-comments first: a commented line still matches the substring check that
+decides whether an entry is missing, so without that step `start` after `stop` would
+no-op.
+
+A **schedule line** means one whose payload begins with a digit, `*` or `@`, and all four
+cron-touching functions agree on that definition: `cron_state`, `cron_entries`, `start`'s
+un-comment step, and `disable_cron`. A line that merely mentions the tool — a `MAILTO=`
+or a `PATH=` naming its path, a user's own comment — is therefore never read as a job,
+turned into one, or commented out. `disable_cron` used to match the substring alone,
+which made `stop` comment out such a line while `start` could not restore it (its
+un-comment pattern requires the schedule payload), leaving it disabled for good.
 
 ## Logging
 

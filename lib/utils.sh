@@ -189,14 +189,44 @@ write_archive_marker() {
 
 # ── Cron control ──────────────────────────────────────────────────────────────
 
-# Comments out immich-auto-dumper entries in the current user's crontab.
-# Returns 0 if entries were found and disabled, 1 if none were present.
+# Echoes what our crontab entries are currently doing:
+#   active   — at least one live (uncommented) immich-auto-dumper schedule
+#   disabled — schedules present but commented out (what `stop` leaves behind)
+#   absent   — no immich-auto-dumper schedule at all
+# Only lines whose payload starts like a cron schedule (digit, '*' or '@') count, so
+# a plain user comment mentioning the tool is never reported as a job. The commented
+# form matched here is exactly the one disable_cron writes and `start` reverses.
+cron_state() {
+  local current
+  current=$(crontab -l 2>/dev/null || true)
+  if printf '%s\n' "$current" | grep -qE '^[0-9*@].*immich-auto-dumper'; then
+    printf 'active\n'
+  elif printf '%s\n' "$current" | grep -qE '^#[0-9*@].*immich-auto-dumper'; then
+    printf 'disabled\n'
+  else
+    printf 'absent\n'
+  fi
+}
+
+# Echoes our crontab schedules (live and commented out), for display to the user.
+cron_entries() {
+  crontab -l 2>/dev/null | grep -E '^#?[0-9*@].*immich-auto-dumper' || true
+}
+
+# Comments out our schedule lines in the current user's crontab.
+# Returns 0 if live schedules were found and disabled, 1 if there were none.
+#
+# Only schedule lines are touched — the same set cron_state reports on and `start`
+# re-enables. The pattern used to comment out ANY uncommented line merely containing
+# "immich-auto-dumper", so a MAILTO= or PATH= line mentioning the tool's path was
+# commented out too; `start`'s un-comment step only restores lines whose payload
+# starts with a digit, '*' or '@', so such a line stayed disabled for good.
 disable_cron() {
   local current
   current=$(crontab -l 2>/dev/null || true)
-  if printf '%s\n' "$current" | grep -q 'immich-auto-dumper' 2>/dev/null; then
+  if printf '%s\n' "$current" | grep -qE '^[0-9*@].*immich-auto-dumper'; then
     printf '%s\n' "$current" \
-      | sed 's|^\([^#].*immich-auto-dumper.*\)|#\1|' \
+      | sed 's|^\([0-9*@].*immich-auto-dumper.*\)|#\1|' \
       | crontab -
     return 0
   fi

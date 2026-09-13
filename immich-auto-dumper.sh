@@ -101,6 +101,22 @@ _ensure_symlink() {
 # Wizard dialog title prefix, so every step is clearly part of the same flow.
 _wiz_title() { printf 'immich-auto-dumper Setup — %s' "$1"; }
 
+# Normalizes a USER_MAP sub-folder: trims surrounding slashes and collapses repeats.
+# Inner slashes are kept, since an Immich import path may legitimately be nested
+# ("/external_library/family/alice" -> "family/alice").
+#
+# This matters because the value is pasted into paths as "${ARCHIVE_DEST_PATH%/}/$folder/...".
+# Immich stores its import paths with a trailing slash ("/external_library/Alice/"), so
+# the folder detected from one and accepted as-is used to yield "Alice/" — writing
+# "/external_library/Alice//2020/…" into asset.originalPath, where Immich's own library
+# scan records the single-slash form and would re-import the file as a duplicate.
+_sanitize_folder() {
+  local f="$1"
+  while [[ "$f" == *//* ]]; do f="${f//\/\///}"; done
+  f="${f#/}"; f="${f%/}"
+  printf '%s' "$f"
+}
+
 # Shallow (2-level) directory tree of the external library, shown in setup so the
 # user can see existing folders while choosing a name. Excludes our hidden marker
 # and backup dirs. Prints nothing if the path is empty or unreadable.
@@ -211,6 +227,394 @@ _resolve_storage_marker() {
   return 0
 }
 
+# Recommended free-disk floor for the filesystem holding <path>: 10% of the disk,
+# clamped between 2 GB and 20 GB. Echoes 0 when the disk size cannot be read.
+#
+# Rounded down to a whole GiB: mb_to_input renders the suggestion with two decimals
+# ("10.84G"), and parsing that back loses a few MiB — enough for simply accepting the
+# pre-filled default to be flagged as "below the recommended floor". A whole-GiB
+# value round-trips exactly, and reads better in the prompt.
+_recommended_min_free_mb() {
+  local path="$1" total=0 mb=0
+  [[ -n "$path" && -d "$path" ]] && total=$(disk_total_bytes "$path")
+  if (( total > 0 )); then
+    mb=$(( total * 10 / 100 / 1048576 ))
+    mb=$(( mb / 1024 * 1024 ))
+    (( mb < 2048 ))  && mb=2048
+    (( mb > 20480 )) && mb=20480
+  fi
+  printf '%s' "$mb"
+}
+
+# Archive boundaries as stored in the config, in MiB. The deprecated *_GB keys are
+# still honored so an old config is read, not reported as incomplete.
+_cfg_max_mb() {
+  local v="${ARCHIVE_LIBRARY_MAX_MB:-}"
+  [[ -z "$v" && "${ARCHIVE_LIBRARY_MAX_GB:-}" =~ ^[0-9]+$ ]] && v=$(( ARCHIVE_LIBRARY_MAX_GB * 1024 ))
+  [[ "$v" =~ ^[0-9]+$ ]] || v=0
+  printf '%s' "$v"
+}
+_cfg_target_mb() {
+  local v="${ARCHIVE_LIBRARY_TARGET_MB:-}"
+  [[ -z "$v" && "${ARCHIVE_LIBRARY_TARGET_GB:-}" =~ ^[0-9]+$ ]] && v=$(( ARCHIVE_LIBRARY_TARGET_GB * 1024 ))
+  [[ "$v" =~ ^[0-9]+$ ]] || v=0
+  printf '%s' "$v"
+}
+
+# ── Config review (existing installation) ─────────────────────────────────────
+#
+# Re-running setup on an installation that already has a config.conf should not
+# force the whole step-by-step again. The wizard first checks the saved config
+# against what this version of the tool expects and against the live Immich, shows
+# it back, and only then offers to reconfigure — so the user can see where they
+# stand instead of redoing everything "just in case".
+
+# Settings only the wizard can answer: they identify this specific Immich install.
+# A config missing one of these is broken, not merely old.
+_CFG_ESSENTIAL_KEYS=(
+  IMMICH_UPLOAD_LOCATION IMMICH_DB_LIBRARY_PREFIX IMMICH_DB_CONTAINER
+  IMMICH_SERVER_CONTAINER IMMICH_DB_NAME IMMICH_DB_USER
+  ARCHIVE_DEST_PATH ARCHIVE_CONTAINER_PATH ARCHIVE_STORAGE_ID
+)
+# Settings with a safe default, so a config written by an older version — which
+# simply did not know about them — can be topped up in place instead of redone.
+_CFG_BACKFILL_KEYS=(ARCHIVE_MIN_FREE_MB BACKUP_RETENTION LOG_DIR LOG_MAX_LINES)
+
+# Filled by _config_check: blocking findings, settings absent since an older
+# version, and remarks that need no action. CFG_USER_NAME caches the Immich user
+# names so the summary can label the USER_MAP keys (often opaque UUIDs).
+CFG_PROBLEMS=(); CFG_OUTDATED=(); CFG_NOTES=()
+declare -A CFG_USER_NAME=()
+
+# True when config.conf actually assigns <key> (as opposed to the variable merely
+# being set in the environment, or defaulted elsewhere in the script).
+_config_has_key() { grep -qE "^[[:space:]]*${1}=" "$CONFIG_FILE" 2>/dev/null; }
+
+# Number of entries in USER_MAP. A config carrying `declare -A USER_MAP` with no
+# assignment leaves the array declared but UNSET, and `${#USER_MAP[@]}` on an unset
+# array aborts under `set -u` — which is exactly the config we need to report on.
+_user_map_count() {
+  local n=0
+  [[ -n "${USER_MAP[*]+x}" ]] && n=${#USER_MAP[@]}
+  printf '%s' "$n"
+}
+
+# Validates the saved config against this version of the tool and the live Immich.
+# Every live check is best-effort: docker or the DB being unreachable downgrades the
+# verdict to a note, it never invents a problem. Always returns 0.
+_config_check() {
+  CFG_PROBLEMS=(); CFG_OUTDATED=(); CFG_NOTES=(); CFG_USER_NAME=()
+
+  local k
+  for k in "${_CFG_ESSENTIAL_KEYS[@]}"; do
+    if ! _config_has_key "$k"; then
+      CFG_PROBLEMS+=("$k is missing from config.conf.")
+    elif [[ -z "${!k:-}" ]]; then
+      CFG_PROBLEMS+=("$k is empty.")
+    fi
+  done
+
+  for k in "${_CFG_BACKFILL_KEYS[@]}"; do
+    _config_has_key "$k" || CFG_OUTDATED+=("$k")
+  done
+
+  local max_mb target_mb
+  max_mb=$(_cfg_max_mb); target_mb=$(_cfg_target_mb)
+  if (( max_mb <= 0 )); then
+    CFG_PROBLEMS+=("No archiving threshold set (ARCHIVE_LIBRARY_MAX_MB).")
+  elif (( target_mb <= 0 || target_mb >= max_mb )); then
+    CFG_PROBLEMS+=("Archive-down-to size must be a positive size BELOW the $(mb_to_human "$max_mb") threshold.")
+  fi
+
+  local retention="${BACKUP_RETENTION:-}"
+  if _config_has_key BACKUP_RETENTION && ! [[ "$retention" =~ ^[1-9][0-9]*$ ]]; then
+    CFG_PROBLEMS+=("BACKUP_RETENTION must be a positive whole number (found '${retention}').")
+  fi
+
+  # Archiving has nowhere to put a user's photos without a mapping. The per-user check
+  # further down needs the DB; this one catches an empty map even when it is unreachable.
+  if (( $(_user_map_count) == 0 )); then
+    CFG_PROBLEMS+=("No user → folder mapping (USER_MAP is empty): archiving has no destination folder to use.")
+  else
+    # A folder with a stray leading/trailing/double slash builds paths like
+    # "/external_library/Alice//2020/…" into asset.originalPath, which Immich's own
+    # library scan does not recognize as the file it sees. Earlier versions could
+    # write one when the folder was detected from an Immich import path.
+    local mk clean
+    for mk in "${!USER_MAP[@]}"; do
+      clean=$(_sanitize_folder "${USER_MAP[$mk]}")
+      if [[ "$clean" != "${USER_MAP[$mk]}" ]]; then
+        CFG_PROBLEMS+=("USER_MAP[\"$mk\"]=\"${USER_MAP[$mk]}\" has a stray slash: archived paths would contain a double slash Immich cannot match. It should be \"${clean}\".")
+      fi
+    done
+  fi
+
+  if [[ -n "${IMMICH_UPLOAD_LOCATION:-}" && ! -d "${IMMICH_UPLOAD_LOCATION}/library" ]]; then
+    CFG_PROBLEMS+=("Upload location '${IMMICH_UPLOAD_LOCATION}' has no library/ folder any more.")
+  fi
+
+  # External storage: being unreachable right now is a state, not a config error — a
+  # removable or remote mount is allowed to be down — so it is only a note. A
+  # destination path that does not even exist on this host is a real problem.
+  if [[ -n "${ARCHIVE_DEST_PATH:-}" ]]; then
+    if archive_dest_ready 2>/dev/null; then
+      CFG_NOTES+=("External storage is reachable and its marker matches this config.")
+    elif [[ ! -d "$ARCHIVE_DEST_PATH" ]]; then
+      CFG_PROBLEMS+=("External library path '${ARCHIVE_DEST_PATH}' does not exist on this host.")
+    else
+      CFG_NOTES+=("External storage not reachable right now (marker missing, or another volume is mounted) — archiving stays paused until it is back.")
+    fi
+  fi
+
+  if ! probe_docker_cmd 2>/dev/null; then
+    CFG_NOTES+=("Docker is not reachable, so the configured containers could not be verified.")
+    return 0
+  fi
+
+  local running name
+  running=$($DOCKER_CMD ps --format '{{.Names}}' 2>/dev/null || true)
+  for k in IMMICH_SERVER_CONTAINER IMMICH_DB_CONTAINER; do
+    name="${!k:-}"
+    [[ -z "$name" ]] && continue
+    printf '%s\n' "$running" | grep -qx -- "$name" \
+      || CFG_PROBLEMS+=("Container '${name}' (${k}) is not running — stopped, or renamed in your compose file?")
+  done
+
+  if ! _db_reachable; then
+    CFG_NOTES+=("The Immich database did not answer, so the user mapping and library paths could not be verified.")
+    return 0
+  fi
+
+  db_check_schema >/dev/null 2>&1 \
+    || CFG_PROBLEMS+=("Immich's database schema no longer matches what this tool expects — review it before archiving again.")
+
+  # Every Immich user needs a destination folder: one added since the last setup
+  # would otherwise have no place for its archived photos.
+  local users_raw row uid uname label key
+  local -a unmapped=()
+  users_raw=$(db_get_users 2>/dev/null || true)
+  if [[ -n "$users_raw" ]]; then
+    local -a _u=()
+    mapfile -t _u <<< "$users_raw"
+    for row in "${_u[@]}"; do
+      [[ -z "$row" ]] && continue
+      IFS='|' read -r uid uname label <<< "$row"
+      [[ -z "$uid" ]] && continue
+      key="${label:-$uid}"
+      CFG_USER_NAME["$key"]="$uname"
+      [[ -n "${USER_MAP["$key"]:-}" ]] || unmapped+=("$uname")
+    done
+    # Naming the users only helps when some of them ARE mapped; an entirely empty map
+    # is already reported above, and listing every user there would just repeat it.
+    (( ${#unmapped[@]} > 0 && $(_user_map_count) > 0 )) \
+      && CFG_PROBLEMS+=("No destination folder configured for: ${unmapped[*]} — user(s) added in Immich since the last setup.")
+  fi
+
+  # Only trustworthy while the storage is actually there (see db_check_path_consistency).
+  if archive_dest_ready 2>/dev/null; then
+    local report
+    if ! report=$(db_check_path_consistency 2>/dev/null); then
+      CFG_PROBLEMS+=("Immich's paths no longer match this config: $(printf '%s' "$report" | tr '\n' ' ')")
+    fi
+  fi
+
+  # Mirroring fewer dumps than Immich keeps locally silently drops dumps from the
+  # external storage while Immich still has them — worth saying, not a config error.
+  local keep
+  keep=$(db_immich_backup_keep_last)
+  if [[ -n "$keep" && "$retention" =~ ^[0-9]+$ ]] && (( retention < keep )); then
+    CFG_NOTES+=("Immich keeps ${keep} database dumps locally but only ${retention} are mirrored to the external storage.")
+  fi
+  return 0
+}
+
+# One-line, human-readable rendering of cron_state.
+_cron_state_label() {
+  case "$(cron_state)" in
+    active)   printf 'ACTIVE — archiving and DB backups run automatically' ;;
+    disabled) printf 'DISABLED — entries present in the crontab but commented out' ;;
+    *)        printf 'NOT INSTALLED — nothing runs automatically' ;;
+  esac
+}
+
+# Human-readable rendering of the saved config, including the live schedule state.
+_config_summary() {
+  local max_mb target_mb min_free
+  max_mb=$(_cfg_max_mb); target_mb=$(_cfg_target_mb)
+  min_free="${ARCHIVE_MIN_FREE_MB:-0}"
+  [[ "$min_free" =~ ^[0-9]+$ ]] || min_free=0
+
+  printf '%s\n' \
+    "Immich server      : ${IMMICH_SERVER_CONTAINER:-<not set>}" \
+    "PostgreSQL         : ${IMMICH_DB_CONTAINER:-<not set>} (${IMMICH_DB_NAME:-?} / ${IMMICH_DB_USER:-?})" \
+    "Upload location    : ${IMMICH_UPLOAD_LOCATION:-<not set>}" \
+    "Internal library   : ${IMMICH_DB_LIBRARY_PREFIX:-<not set>}" \
+    "External library   : ${ARCHIVE_DEST_PATH:-<not set>}" \
+    "  (container path)   ${ARCHIVE_CONTAINER_PATH:-<not set>}" \
+    "Start archiving at : ▼ $( (( max_mb > 0 )) && mb_to_human "$max_mb" || printf '<not set>' )" \
+    "Archive down to    : ▲ $( (( target_mb > 0 )) && mb_to_human "$target_mb" || printf '<not set>' )" \
+    "Free-disk safety   : $( (( min_free > 0 )) && printf 'also archive if free disk < %s' "$(mb_to_human "$min_free")" || printf 'disabled' )" \
+    "DB dumps mirrored  : ${BACKUP_RETENTION:-<not set>} kept on the external storage" \
+    "Scheduled jobs     : $(_cron_state_label)"
+
+  if (( $(_user_map_count) > 0 )); then
+    printf '\nWhere each user'"'"'s photos are archived:\n'
+    local k
+    for k in "${!USER_MAP[@]}"; do
+      printf '  %s : %s\n' "${CFG_USER_NAME[$k]:-$k}" "${ARCHIVE_DEST_PATH%/}/${USER_MAP[$k]}"
+    done
+  fi
+}
+
+# Default value this version would use for a setting absent from an older config.
+_config_default_for() {
+  case "$1" in
+    ARCHIVE_MIN_FREE_MB) _recommended_min_free_mb "${IMMICH_UPLOAD_LOCATION:-}" ;;
+    BACKUP_RETENTION)
+      local keep=""
+      probe_docker_cmd 2>/dev/null && _db_reachable && keep=$(db_immich_backup_keep_last)
+      printf '%s' "${keep:-14}"
+      ;;
+    LOG_DIR)       printf '%s' "${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper" ;;
+    LOG_MAX_LINES) printf '1000' ;;
+  esac
+}
+
+# Appends the settings this version added to an existing config.conf, with their
+# default values. Only ever adds lines: the user's own values are never rewritten.
+_config_backfill() {
+  local k v
+  {
+    printf '\n# --- Added by setup on %s (settings new in this version) ---\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    for k in "${CFG_OUTDATED[@]}"; do
+      v=$(_config_default_for "$k")
+      case "$k" in
+        LOG_DIR) printf '%s="%s"\n' "$k" "$v" ;;
+        *)       printf '%s=%s\n'   "$k" "$v" ;;
+      esac
+    done
+  } >> "$CONFIG_FILE"
+}
+
+# Renders cron/crontab.example with the real binary path and log dir, keeping only
+# the schedule lines. Cron has a minimal PATH, hence the absolute binary path.
+_render_cron_lines() {
+  local tpl="$SCRIPT_DIR/cron/crontab.example"
+  [[ -f "$tpl" ]] || return 1
+  local bin logdir
+  bin=$(_resolve_self_bin)
+  logdir="${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper}"
+  sed -e "s|__BIN__|${bin}|g" -e "s|__LOGDIR__|${logdir}|g" "$tpl" \
+    | grep -vE '^[[:space:]]*(#|$)' || true
+}
+
+# Schedule review. Shows what is actually scheduled right now, then offers the
+# action that fits that state — so the user is never asked to "install the cron
+# jobs" while those jobs are already running.
+_cron_review() {
+  local state entries listing
+  state=$(cron_state)
+  entries=$(cron_entries)
+  listing=""
+  [[ -n "$entries" ]] && listing=$'\n\nIn your crontab right now:\n'"$(printf '%s\n' "$entries" | sed 's/^/  /')"
+
+  case "$state" in
+    active)
+      ui_menu "Scheduled jobs — ACTIVE" \
+        "Archiving and DB backups are ALREADY scheduled: they run automatically, nothing to do.${listing}" \
+        keep    "Leave them exactly as they are (recommended)" \
+        refresh "Re-install the entries (after a move or a log-dir change)" \
+        stop    "Disable them (comment them out in the crontab)" || return 0
+      case "$UI_VALUE" in
+        refresh) _start ;;
+        stop)    _stop ;;
+      esac
+      ;;
+    disabled)
+      if ui_yesno "Scheduled jobs — DISABLED" \
+        "Nothing runs automatically: the entries are in your crontab but commented out, which is what \"immich-auto-dumper stop\" leaves behind.${listing}\n\nRe-enable them now?"; then
+        _start
+      fi
+      ;;
+    *)
+      local would
+      would=$(_render_cron_lines || true)
+      [[ -n "$would" ]] && would=$'\n\nEntries that would be added:\n'"$(printf '%s\n' "$would" | sed 's/^/  /')"
+      if ui_yesno "Scheduled jobs — NOT INSTALLED" \
+        "Nothing is scheduled: archiving and DB backups only run when you launch them by hand.${would}\n\nInstall them now so they run automatically?" no; then
+        _start
+      fi
+      ;;
+  esac
+}
+
+# Opening screen when a config already exists: show it, show the verdict of the
+# checks, and let the user choose. Sets SETUP_REVIEW_CHOICE to keep / full / cancel.
+SETUP_REVIEW_CHOICE=""
+_setup_review() {
+  _config_check
+
+  ui_info "Your configuration" \
+    "Saved in ${CONFIG_FILE}:"$'\n\n'"$(_config_summary)"
+
+  local verdict
+  if (( ${#CFG_PROBLEMS[@]} > 0 )); then
+    verdict="Checked against this version of the tool and your live Immich."$'\n\n'
+    verdict+="These no longer hold up:"$'\n'
+    verdict+="$(printf '%s\n' "${CFG_PROBLEMS[@]}" | sed 's/^/  ! /')"
+  else
+    verdict="Checked against this version of the tool and your live Immich: every setting is still valid."
+  fi
+  if (( ${#CFG_OUTDATED[@]} > 0 )); then
+    verdict+=$'\n\n'"Settings this version added, still absent from your config (they can be appended with their defaults, without touching the rest):"$'\n  '"${CFG_OUTDATED[*]}"
+  fi
+  if (( ${#CFG_NOTES[@]} > 0 )); then
+    verdict+=$'\n\n'"For information:"$'\n'
+    verdict+="$(printf '%s\n' "${CFG_NOTES[@]}" | sed 's/^/  - /')"
+  fi
+  ui_info "Configuration check" "$verdict"
+
+  local -a menu=()
+  if (( ${#CFG_PROBLEMS[@]} > 0 )); then
+    menu=(full   "Reconfigure step by step (recommended)"
+          keep   "Keep this config as it is anyway"
+          cancel "Quit without changing anything")
+  else
+    menu=(keep   "Keep this config (recommended)"
+          full   "Reconfigure step by step anyway"
+          cancel "Quit without changing anything")
+  fi
+  ui_menu "Existing configuration" "What should setup do?" "${menu[@]}" || UI_VALUE="cancel"
+  SETUP_REVIEW_CHOICE="$UI_VALUE"
+}
+
+# The "keep my config" path: never rewrites an answer the user already gave. It only
+# tops up settings this version added, then reviews the schedule.
+_setup_keep() {
+  if (( ${#CFG_OUTDATED[@]} > 0 )); then
+    local -a lines=()
+    local k
+    for k in "${CFG_OUTDATED[@]}"; do
+      lines+=("  ${k} = $(_config_default_for "$k")")
+    done
+    if ui_yesno "Add the new settings" \
+      "This version has settings your config.conf does not mention yet. They can be appended with their default values, leaving every other line untouched:"$'\n\n'"$(printf '%s\n' "${lines[@]}")"$'\n\n'"Add them now?"; then
+      _config_backfill
+      ui_info "config.conf updated" "The settings above were appended to ${CONFIG_FILE}. Re-run setup and choose \"Reconfigure step by step\" if you want to pick different values."
+    fi
+  fi
+
+  _cron_review
+
+  printf '\n========================================\n'
+  printf 'immich-auto-dumper: config kept as it is\n'
+  printf '========================================\n'
+  printf 'Config file    : %s\n' "$CONFIG_FILE"
+  printf 'Scheduled jobs : %s\n' "$(_cron_state_label)"
+  printf 'Run "immich-auto-dumper status" for the current library size and last operations.\n'
+  printf '========================================\n\n'
+}
+
 # ── setup ─────────────────────────────────────────────────────────────────────
 
 _setup() {
@@ -221,6 +625,19 @@ _setup() {
   ui_detect
   ui_logo
   ui_banner "immich-auto-dumper — guided setup"
+
+  # An existing config is reviewed before anything else: the step-by-step below is
+  # only worth walking through when something is actually wrong, or when the user
+  # asks for it. The review deliberately runs before detect_docker_cmd (which exits
+  # when the daemon is unreachable) so the saved config can still be shown and the
+  # schedule still managed while Immich or Docker is down.
+  if [[ -f "$CONFIG_FILE" ]]; then
+    _setup_review
+    case "$SETUP_REVIEW_CHOICE" in
+      keep)   _setup_keep; return 0 ;;
+      cancel) ui_info "Setup" "Left unchanged — nothing was written and no jobs were scheduled."; return 0 ;;
+    esac
+  fi
 
   # Detect docker command first; everything below depends on it.
   detect_docker_cmd
@@ -409,12 +826,8 @@ _setup() {
   # space drops below this floor, so archiving still fires even if unrelated data
   # (Postgres, Docker, logs...) — not the library — is what actually fills the disk.
   # On by default (computed from disk size) unless the user disables it outright.
-  local def_min_free_mb=0
-  if (( disk_total > 0 )); then
-    def_min_free_mb=$(( disk_total * 10 / 100 / 1048576 ))
-    (( def_min_free_mb < 2048 ))  && def_min_free_mb=2048
-    (( def_min_free_mb > 20480 )) && def_min_free_mb=20480
-  fi
+  local def_min_free_mb
+  def_min_free_mb=$(_recommended_min_free_mb "$upload_location")
   local min_free_mb="${ARCHIVE_MIN_FREE_MB:-$def_min_free_mb}"
   while true; do
     ui_input "$(_wiz_title "FREE ▽ — also archive if disk free drops below")" \
@@ -447,6 +860,43 @@ _setup() {
     break
   done
 
+  # ── 6c. How many DB dumps to mirror ─────────────────────────────────────────
+  # Immich dumps its database into UPLOAD_LOCATION/backups and rotates those dumps
+  # itself (its backup.database.keepLastAmount setting); this tool copies them to the
+  # external storage and rotates its own copies. The two counts are independent — the
+  # matching 14 defaults are a coincidence — so Immich's value is offered as the
+  # suggested default (read from its DB when possible) rather than hard-coded: mirror
+  # at least as many as Immich keeps and no dump is dropped while Immich still has it.
+  local immich_keep=""
+  _db_reachable && immich_keep=$(db_immich_backup_keep_last)
+  local def_retention="${BACKUP_RETENTION:-}"
+  [[ "$def_retention" =~ ^[1-9][0-9]*$ ]] || def_retention="${immich_keep:-14}"
+  local backup_retention="$def_retention" keep_note
+  if [[ -n "$immich_keep" ]]; then
+    keep_note="Immich currently keeps $immich_keep dump(s) of its own in $upload_location/backups."
+  else
+    keep_note="Immich's own retention could not be read (never changed from its default, or set through a config file), so 14 is suggested."
+  fi
+  while true; do
+    ui_input "$(_wiz_title "DB dumps — how many to keep")" \
+      "Immich dumps its database regularly; this tool copies those dumps to the external storage and keeps the newest ones there.\n\n${keep_note}\n\nKeeping at least as many as Immich does means a dump is never dropped from the external storage while Immich still has it locally.\n\nHow many dumps should be kept on the external storage?" \
+      "$backup_retention" || { ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."; return 0; }
+    if [[ ! "$UI_VALUE" =~ ^[1-9][0-9]*$ ]]; then
+      ui_info "Invalid value" "Enter a whole number of dumps to keep, 1 or more."
+      continue
+    fi
+    backup_retention="$UI_VALUE"
+    if [[ -n "$immich_keep" ]] && (( backup_retention < immich_keep )); then
+      if ui_yesno "Fewer than Immich keeps" \
+           "Keeping $backup_retention dump(s) while Immich keeps $immich_keep means the oldest are deleted from the external storage even though Immich still holds them locally — so those dumps exist in one place only.\n\nKeep $backup_retention anyway, or match Immich?" \
+           no "Keep $backup_retention" "Match Immich ($immich_keep)"; then
+        break
+      fi
+      backup_retention="$immich_keep"
+    fi
+    break
+  done
+
   # ── 7. User → folder mapping (auto-suggested) ───────────────────────────────
   declare -A new_user_map=()
   declare -A user_name_by_key=()
@@ -474,7 +924,7 @@ _setup() {
         [[ "$l_path" != "${archive_container_path%/}"/* ]] && continue
         l_key="${l_label:-$l_owner}"
         [[ -n "${prefill_folder["$l_key"]:-}" ]] && continue
-        l_rel="${l_path#"${archive_container_path%/}"/}"
+        l_rel=$(_sanitize_folder "${l_path#"${archive_container_path%/}"/}")
         [[ -n "$l_rel" ]] && prefill_folder["$l_key"]="$l_rel"
       done
     fi
@@ -507,18 +957,26 @@ _setup() {
       local detected_note=""
       [[ -z "$current_mapped" && -n "$detected" ]] \
         && detected_note="\n\nDetected from this user's Immich external library: ${archive_container_path%/}/$detected"
-      ui_input "$(_wiz_title "Folder for $name")" \
-        "Sub-folder name on the external library for this user's archived photos.\n\nUser        : $name\nstorageLabel: ${storage_label:-<empty>}${detected_note}${tree_note}" \
-        "$default_folder" || { ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."; return 0; }
-      new_user_map["$key"]="$UI_VALUE"
+      local folder_answer=""
+      while true; do
+        ui_input "$(_wiz_title "Folder for $name")" \
+          "Sub-folder name on the external library for this user's archived photos.\n\nUser        : $name\nstorageLabel: ${storage_label:-<empty>}${detected_note}${tree_note}" \
+          "$default_folder" || { ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."; return 0; }
+        folder_answer=$(_sanitize_folder "$UI_VALUE")
+        [[ -n "$folder_answer" ]] && break
+        # An empty folder would archive straight into the root of the external library,
+        # mixing every user's photos together and leaving no per-user path to register
+        # in Immich.
+        ui_info "Folder required" "Enter a sub-folder name for $name's archived photos — it cannot be empty."
+      done
+      new_user_map["$key"]="$folder_answer"
       # Remember the real archive path for this user (name + destination folder),
       # shown in the summary instead of the opaque storageLabel key.
-      user_paths+=("  $name : ${archive_dest%/}/$UI_VALUE")
+      user_paths+=("  $name : ${archive_dest%/}/$folder_answer")
     done
   fi
 
   # Advanced knobs keep sensible defaults (or existing config); no extra prompts.
-  local backup_retention="${BACKUP_RETENTION:-14}"
   local log_dir="${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper}"
   local log_max_lines="${LOG_MAX_LINES:-1000}"
 
@@ -548,7 +1006,8 @@ _setup() {
     "  (container path)   $archive_container_path" \
     "Start archiving at : ▼ $(mb_to_human "$max_mb")" \
     "Archive down to    : ▲ $(mb_to_human "$target_mb")" \
-    "Free-disk safety   : $(if (( min_free_mb > 0 )); then printf 'also archive if free disk < %s' "$(mb_to_human "$min_free_mb")"; else printf 'disabled'; fi)"
+    "Free-disk safety   : $(if (( min_free_mb > 0 )); then printf 'also archive if free disk < %s' "$(mb_to_human "$min_free_mb")"; else printf 'disabled'; fi)" \
+    "DB dumps mirrored  : $backup_retention kept on the external storage"
   if (( ${#user_paths[@]} > 0 )); then
     summary+=$'\n'
     summary+="Where each user's photos are archived on the external library:"$'\n'
@@ -630,9 +1089,7 @@ CONF
     [[ -z "${prefill_folder[$k]:-}" ]] && immich_todo+=("$uname  →  $cpath")
   done
 
-  if ui_yesno "Cron jobs" "Install the scheduled cron jobs now so archiving and DB backups run automatically?" no; then
-    _start
-  fi
+  _cron_review
 
   # Persistent terminal trace (plain stdout, survives the whiptail screen) so the
   # user keeps a record of the outcome and any remaining manual Immich steps.
@@ -640,6 +1097,7 @@ CONF
   printf 'immich-auto-dumper setup: SUCCESS\n'
   printf '========================================\n'
   printf 'Config written : %s\n' "$CONFIG_FILE"
+  printf 'Scheduled jobs : %s\n' "$(_cron_state_label)"
   (( ${#fld_created[@]} > 0 )) && printf 'Folders created : %s\n' "${fld_created[*]}"
   (( ${#fld_existed[@]} > 0 )) && printf 'Folders present : %s\n' "${fld_existed[*]}"
   if (( ${#fld_failed[@]} > 0 )); then
@@ -735,11 +1193,13 @@ _status() {
     printf 'DB backups           : .immich-backup/ directory absent\n'
   fi
 
-  local cron_status="disabled"
-  if crontab -l 2>/dev/null | grep 'immich-auto-dumper' | grep -qv '^#' 2>/dev/null; then
-    cron_status="active"
-  fi
-  printf 'Cron jobs            : %s\n' "$cron_status"
+  # Distinguish "stopped" (entries commented out, `start` re-enables them) from
+  # "never installed" (nothing scheduled at all) — they need different actions.
+  case "$(cron_state)" in
+    active)   printf 'Cron jobs            : active\n' ;;
+    disabled) printf 'Cron jobs            : disabled (entries commented out — run "immich-auto-dumper start" to re-enable)\n' ;;
+    *)        printf 'Cron jobs            : not installed (run "immich-auto-dumper start")\n' ;;
+  esac
 
   local log_file="${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper}/immich-auto-dumper.log"
   if [[ -f "$log_file" ]]; then
@@ -749,7 +1209,9 @@ _status() {
 
     if [[ -n "$last_archive" ]]; then
       local ts detail
-      ts=$(printf '%s' "$last_archive" | grep -oP '(?<=\[)[^\]]+' | head -1)
+      # `|| true`: under `set -o pipefail` a grep that matches nothing fails the whole
+      # assignment, which would abort `status` over a cosmetic detail.
+      ts=$(printf '%s' "$last_archive" | grep -oP '(?<=\[)[^\]]+' | head -1 || true)
       detail=$(printf '%s' "$last_archive" | sed 's/.*Archive complete\. //')
       printf 'Last archive         : %s — %s\n' "$ts" "$detail"
     else
@@ -758,7 +1220,7 @@ _status() {
 
     if [[ -n "$last_backup" ]]; then
       local ts2 detail2
-      ts2=$(printf '%s' "$last_backup" | grep -oP '(?<=\[)[^\]]+' | head -1)
+      ts2=$(printf '%s' "$last_backup" | grep -oP '(?<=\[)[^\]]+' | head -1 || true)
       detail2=$(printf '%s' "$last_backup" | sed 's/.*DB backup: //')
       printf 'Last DB backup       : %s — %s\n' "$ts2" "$detail2"
     else
@@ -785,19 +1247,13 @@ _status() {
 # ── start ─────────────────────────────────────────────────────────────────────
 
 _start() {
-  local crontab_example="$SCRIPT_DIR/cron/crontab.example"
-  if [[ ! -f "$crontab_example" ]]; then
-    printf 'crontab.example not found: %s\n' "$crontab_example" >&2
+  local rendered logdir
+  if ! rendered=$(_render_cron_lines) || [[ -z "$rendered" ]]; then
+    printf 'crontab.example not found or empty: %s\n' "$SCRIPT_DIR/cron/crontab.example" >&2
     return 1
   fi
-
-  # Render the template with the real binary path and log directory, so cron does not
-  # depend on PATH or on a fixed /usr/local/bin or /var/log location.
-  local bin logdir rendered
-  bin=$(_resolve_self_bin)
   logdir="${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper}"
   mkdir -p "$logdir" 2>/dev/null || true
-  rendered=$(sed -e "s|__BIN__|${bin}|g" -e "s|__LOGDIR__|${logdir}|g" "$crontab_example")
 
   # Re-enable any entries a previous 'stop' commented out (symmetric to disable_cron),
   # then append any that are still missing. Without the un-comment step, a commented
@@ -829,8 +1285,13 @@ _start() {
 # ── stop ──────────────────────────────────────────────────────────────────────
 
 _stop() {
+  # disable_cron only reports on live schedules, so tell the two "nothing to do" cases
+  # apart instead of claiming the crontab holds no entry when it simply holds no
+  # *enabled* one.
   if disable_cron; then
     echo "Cron jobs disabled."
+  elif [[ "$(cron_state)" == "disabled" ]]; then
+    echo "Cron jobs were already disabled."
   else
     echo "No immich-auto-dumper entries in crontab."
   fi

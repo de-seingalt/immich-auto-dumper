@@ -58,17 +58,22 @@ immich-auto-dumper setup
 ```
 
 The wizard detects your running Immich (containers, database, folders) and asks you to
-**confirm** rather than type. You choose three things:
+**confirm** rather than type. You choose:
 
 1. **Where to archive** — the external folder mounted into the Immich container.
-2. **A folder name per user** on that storage (suggested automatically).
-3. **Two sizes on a visual gauge**: the limit that triggers archiving (`MAX`) and the
+2. **Two sizes on a visual gauge**: the limit that triggers archiving (`MAX`) and the
    size the library shrinks back to (`TARGET`).
-4. **A free-disk safety net** (`FREE`): archiving also triggers if total free disk
+3. **A free-disk safety net** (`FREE`): archiving also triggers if total free disk
    space drops below this, even while the library is still under `MAX` — protection
    against other things on the same disk (the database, Docker, logs...) filling it
    up before the library ever gets the chance. On by default, sized from your disk;
    enter `0` to disable it.
+4. **How many database dumps to keep** on the external storage. Immich rotates the
+   dumps it writes locally; this tool rotates its own copies. The wizard reads
+   Immich's own number and suggests it, so mirroring never drops a dump Immich
+   still has.
+5. **A folder name per user** on that storage (suggested automatically, from the
+   import path Immich already uses for that user when there is one).
 
 ```
 Immich library now: 142.3 GB (31%)  ·  disk used: 256 GB (56%)  ·  disk total: 460 GB  ·  free space: 204 GB
@@ -82,6 +87,14 @@ Immich library now: 142.3 GB (31%)  ·  disk used: 256 GB (56%)  ·  disk total:
 
 Sizes accept GB (`200`, `1.5G`), MB (`500M`) or percentages (`80%`). Everything is
 saved to `config.conf` — re-run `setup` any time to change it.
+
+**Re-running `setup` later never makes you redo everything.** With a config already in
+place it opens on a review instead of the questionnaire: it shows your saved settings,
+checks them against the current version of the tool and your live Immich (containers
+still there, folders still there, every Immich user still mapped, paths still matching),
+tells you whether the scheduled jobs are running right now, and only then offers to
+reconfigure. Settings added by a newer version of the tool can be appended with their
+defaults without touching anything else.
 
 If some of your users don't have their external library registered in Immich yet, the
 wizard prints the exact path to add in **Administration → Libraries**. Do this before
