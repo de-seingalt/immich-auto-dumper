@@ -173,9 +173,24 @@ in Immich and re-runs `setup`. The tool never rewrites the DB to reconcile.
 ## DB-dump mirroring (`backup_db_run`)
 
 Copies every non-hidden file from `UPLOAD_LOCATION/backups/` to
-`<storage>/.immich-backup/`, then applies retention (`BACKUP_RETENTION`, newest kept by
-mtime). It intentionally skips the consistency guard: mirroring dumps stays safe and
-useful even while a path change is being resolved. It never touches the database.
+`<storage>/.immich-backup/`, then applies retention (`BACKUP_RETENTION` newest kept). It
+intentionally skips the consistency guard: mirroring dumps stays safe and useful even
+while a path change is being resolved. It never touches the database.
+
+A dump already present at the destination with the same size is left alone, so each run
+transfers only what is new rather than the whole retention window. A destination of a
+*different* size is a truncated leftover (interrupted run, cancelled upload) and is
+overwritten.
+
+**Retention orders by filename, never by mtime.** Dump names start with a timestamp
+(`immich-db-backup-YYYYMMDDTHHMMSS-...`), so lexicographic order is chronological — and
+unlike mtime, a name cannot be misreported by the storage. This is not a stylistic
+choice: on a write-back mount (rclone `--vfs-write-back`, async NFS...) a file whose
+upload is still pending has no known modification time and the mount answers with a
+placeholder date far in the past. Rotation by mtime then ranks the dumps it has just
+copied as the oldest on the volume and deletes them, cancelling their upload in flight —
+silently, while the log still reports every file as copied. Treat any mtime read from
+the external storage as unreliable; compare names and sizes instead.
 
 ## Scheduling
 
@@ -203,5 +218,6 @@ abort a run.
 | Immich schema changed by an upgrade | Every run aborts at pre-flight with the missing columns listed |
 | External library path changed in Immich | Run aborts, cron disabled until re-setup |
 | No recent DB backup | Archiving refuses to start |
+| Storage reports unreliable mtimes (write-back mount) | No effect: names and sizes decide, never mtime |
 | Concurrent invocation | Second run exits on the PID lock |
 | Crash mid-run | Stale lock auto-cleaned; each asset is either fully archived or intact |

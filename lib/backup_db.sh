@@ -37,7 +37,15 @@ backup_db_run() {
   if "$dry_run"; then
     log_info "DRY-RUN: would create $dest_dir if missing"
     for src in "${files[@]}"; do
-      log_info "DRY-RUN: would copy $(basename "$src") → $dest_dir/"
+      local dr_name dr_src_size dr_dst_size
+      dr_name=$(basename "$src")
+      dr_src_size=$(stat --format='%s' "$src")
+      dr_dst_size=$(stat --format='%s' "$dest_dir/$dr_name" 2>/dev/null || echo -1)
+      if [[ "$dr_dst_size" == "$dr_src_size" ]]; then
+        log_info "DRY-RUN: would skip $dr_name (already mirrored)"
+      else
+        log_info "DRY-RUN: would copy $dr_name → $dest_dir/"
+      fi
     done
     log_info "DRY-RUN: would apply retention policy (keep $BACKUP_RETENTION database archive files)"
     return 0
@@ -45,23 +53,57 @@ backup_db_run() {
 
   mkdir -p "$dest_dir"
 
+  # Dumps are immutable and their name carries their timestamp, so a destination file
+  # of the same size IS the same dump, already mirrored. Skipping it keeps each run
+  # proportional to what is actually new instead of re-uploading the whole retention
+  # window every time — which on a metered or write-back mount is the difference
+  # between a few MB and a full GB, and avoids rewriting files the storage may still
+  # be flushing from the previous run.
+  local copied=0 skipped=0
   for src in "${files[@]}"; do
-    local filename
+    local filename src_size dst_size
     filename=$(basename "$src")
+    src_size=$(stat --format='%s' "$src")
+    dst_size=$(stat --format='%s' "$dest_dir/$filename" 2>/dev/null || echo -1)
+
+    if [[ "$dst_size" == "$src_size" ]]; then
+      skipped=$(( skipped + 1 ))
+      continue
+    fi
+    # Present but a different size: a previous copy was truncated (interrupted run,
+    # full storage, cancelled upload). Overwrite it rather than keep a corrupt dump.
+    if (( dst_size >= 0 )); then
+      log_warn "Re-copying $filename: size mismatch (local $src_size B, storage $dst_size B)"
+    fi
+
     cp "$src" "$dest_dir/$filename"
     log_info "Backup copied: $filename"
+    copied=$(( copied + 1 ))
   done
 
-  # Retention: delete oldest files beyond BACKUP_RETENTION.
+  if (( skipped > 0 )); then
+    log_info "Backup: $skipped file(s) already mirrored, $copied copied."
+  fi
+
+  # Retention: keep the newest BACKUP_RETENTION dumps, delete the rest.
+  #
+  # Ordering is by FILENAME, never by mtime. Dump names start with an ISO-like
+  # timestamp (immich-db-backup-YYYYMMDDTHHMMSS-...), so lexicographic order is
+  # chronological order — and unlike mtime, it cannot be misreported by the storage.
+  # On a write-back mount (rclone --vfs-write-back, NFS async...) a file whose upload
+  # is still pending has no known modification time and the mount answers with a
+  # placeholder date. An mtime-based rotation then sees the dumps it has just copied
+  # as the oldest on the volume and deletes them, cancelling their upload in flight.
   local all_backups=()
   while IFS= read -r -d '' f; do
     all_backups+=("$f")
-  done < <(find "$dest_dir" -maxdepth 1 -type f -print0 | xargs -0 ls -t --zero)
+  done < <(find "$dest_dir" -maxdepth 1 -type f ! -name '.*' -print0 | LC_ALL=C sort -z)
 
   local count=${#all_backups[@]}
   if (( count > BACKUP_RETENTION )); then
     local to_delete=$(( count - BACKUP_RETENTION ))
-    for (( i = count - to_delete; i < count; i++ )); do
+    # Oldest first after the sort: delete the head, keep the tail.
+    for (( i = 0; i < to_delete; i++ )); do
       log_info "Rotation: removing $(basename "${all_backups[$i]}")"
       rm -f "${all_backups[$i]}"
     done
@@ -70,7 +112,7 @@ backup_db_run() {
   local kept=()
   while IFS= read -r -d '' f; do
     kept+=("$f")
-  done < <(find "$dest_dir" -maxdepth 1 -type f -print0)
+  done < <(find "$dest_dir" -maxdepth 1 -type f ! -name '.*' -print0)
 
   local total_bytes=0
   for f in "${kept[@]}"; do
