@@ -42,7 +42,7 @@ Three coordinate systems describe the same file:
 |---|---|---|
 | Host, internal library | `/home/x/immich-app/library/library/admin/2024/06/a.jpg` | `cp`, `du`, `stat` |
 | Container / DB, internal | `/data/library/admin/2024/06/a.jpg` (`IMMICH_DB_LIBRARY_PREFIX`) | `asset.originalPath` before archiving |
-| Container / DB, archive | `/kdrive/Alice/2024/06/a.jpg` (`ARCHIVE_CONTAINER_PATH`) | `asset.originalPath` after archiving |
+| Container / DB, archive | `/external_library/Alice/2024/06/a.jpg` (`ARCHIVE_CONTAINER_PATH`) | `asset.originalPath` after archiving |
 
 `lib/archive.sh` converts between them by prefix substitution
 (`db_path_to_host_path`, `host_path_to_db_path`, `archive_build_dest_path`). The

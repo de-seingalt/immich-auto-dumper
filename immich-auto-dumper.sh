@@ -457,7 +457,7 @@ _setup() {
   fi
 
   # Pre-fill each user's folder from an external library already pointing under
-  # ARCHIVE_CONTAINER_PATH in Immich: import path "/kdrive/Test" → folder "Test".
+  # ARCHIVE_CONTAINER_PATH in Immich: import path "/external_library/Test" → folder "Test".
   # Keyed like USER_MAP (storageLabel, else ownerId). First matching path wins;
   # libraries with no/empty import path are ignored (fall back to the user name).
   declare -A prefill_folder=()

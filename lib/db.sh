@@ -186,7 +186,7 @@ db_update_asset_path() {
   escaped_path=$(_db_escape "$new_path")
 
   # rtrim + '/%' matches import paths with or without a trailing slash, without
-  # letting '/kdrive/Test' claim '/kdrive/Test2/...'.
+  # letting '/external_library/Test' claim '/external_library/Test2/...'.
   local lib_match="SELECT l.\"id\" FROM \"library\" l
                    WHERE l.\"deletedAt\" IS NULL
                      AND l.\"ownerId\" = a.\"ownerId\"
