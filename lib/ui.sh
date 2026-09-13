@@ -100,11 +100,17 @@ ui_section() {
   fi
 }
 
-# ui_info <title> <text>  — purely informational message.
+# ui_info <title> <text>  — purely informational message. Sized to its body (some
+# of these carry a config summary or a list of problems, which a fixed height clips).
 ui_info() {
   local title="$1" text="$2"
   if [[ "$UI_BACKEND" == "whiptail" ]]; then
-    whiptail --title "$title" --msgbox "$text" 16 "$_UI_W" || true
+    local flags=()
+    _wt_geometry "$text" 7
+    # A body taller than the terminal (a config summary, a long list of findings) is
+    # made scrollable — clipping it would hide exactly what the user opened it for.
+    (( _UI_CLIPPED )) && flags+=(--scrolltext)
+    whiptail --title "$title" "${flags[@]}" --msgbox "$text" "$_UI_HEIGHT" "$_UI_W" || true
   else
     printf '%b\n' "$text"
   fi
@@ -131,18 +137,48 @@ ui_note() {
 # Estimate a whiptail box height that fits <body> without a scrollbar. Counts both
 # real newlines and literal "\n" sequences (whiptail renders both as breaks), adds
 # <extra> rows for borders/buttons/input field, and caps to the terminal height.
-_wt_height() {
+#
+# _wt_geometry sets _UI_HEIGHT and _UI_CLIPPED (1 when the cap kicked in, i.e. the
+# body does not fit and the caller should make the box scrollable rather than
+# silently lose its last lines). _wt_height is the echoing wrapper used where only
+# the height matters.
+_UI_HEIGHT=8
+_UI_CLIPPED=0
+
+# Terminal height in rows. $LINES is set by INTERACTIVE shells only, so inside a script
+# it is almost always empty and `${LINES:-24}` silently pinned every box to 24 rows —
+# on a shorter terminal the dialog was then taller than the screen. Ask the terminal
+# itself, and fall back to 24 only when it cannot say.
+_ui_term_lines() {
+  local n="${LINES:-}"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=$( { tput lines; } 2>/dev/null || true )
+  [[ "$n" =~ ^[0-9]+$ ]] || n=$( { stty size; } 2>/dev/null | cut -d' ' -f1 || true )
+  [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 10 )) || n=24
+  printf '%s' "$n"
+}
+_wt_geometry() {
   local body="$1" extra="${2:-7}"
   local real lit lines h maxh
-  real=$(awk 'END{print NR}' <<< "$body")
-  lit=$(grep -o '\\n' <<< "$body" | wc -l)
+  _UI_CLIPPED=0
+  # Counted with pure parameter expansion, no subprocess. The previous
+  # `grep -o '\\n' <<< "$body" | wc -l` was a landmine: a body with no literal "\n"
+  # sequence (one built from real newlines) makes grep exit 1, and under
+  # `set -o pipefail` that failed the assignment and killed the whole wizard —
+  # only ever in the whiptail branch, since the text backend never sizes a box.
+  local only_newlines="${body//[^$'\n']/}"
+  real=$(( ${#only_newlines} + 1 ))
+  local without_literals="${body//\\n/}"
+  lit=$(( (${#body} - ${#without_literals}) / 2 ))
   lines=$(( real + lit ))
   h=$(( lines + extra ))
-  maxh=$(( ${LINES:-24} - 1 ))
-  (( maxh < 10 )) && maxh=23
-  (( h > maxh )) && h=$maxh
+  maxh=$(( $(_ui_term_lines) - 1 ))
+  (( h > maxh )) && { h=$maxh; _UI_CLIPPED=1; }
   (( h < 8 )) && h=8
-  printf '%s' "$h"
+  _UI_HEIGHT="$h"
+}
+_wt_height() {
+  _wt_geometry "$1" "${2:-7}"
+  printf '%s' "$_UI_HEIGHT"
 }
 
 # ui_input <title> <body> <default>  — free-text entry with a pre-filled default.
