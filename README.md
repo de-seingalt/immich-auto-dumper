@@ -23,7 +23,21 @@ just live somewhere cheaper.
   external storage, with retention.
 - 🔒 **Careful by design** — every file is copied and verified before the original is
   removed; if the storage is unplugged or anything looks wrong, the run safely skips.
-  No `sudo`, no Immich API key, no modification of your Immich install.
+  No `sudo`, no changes to your Immich installation or its configuration.
+
+> ### ⚠️ This tool writes directly to Immich's database
+>
+> Immich's API cannot relocate a file, so `immich-auto-dumper` talks to Immich's
+> PostgreSQL database directly: it reads your users, libraries and assets, and for each
+> asset it moves it updates that asset's path and the library it belongs to. It changes
+> nothing else in the database, and no Immich API key is involved.
+>
+> This is a deliberate trade-off you should be aware of before installing: **an Immich
+> upgrade that changes the database schema can break the tool.** Two safeguards limit
+> the damage — every run first checks that the columns it relies on still exist and
+> aborts if they don't, and it refuses to archive unless a database dump less than
+> 7 days old is present. After upgrading Immich, run `immich-auto-dumper test_run`
+> (which changes nothing) before letting it run again.
 
 Curious how it works under the hood? Read the [technical documentation](docs/TECHNICAL.md).
 
