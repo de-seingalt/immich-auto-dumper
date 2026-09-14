@@ -315,7 +315,11 @@ archive_run() {
       freed_bytes=$(( freed_bytes + ${file_size:-0} ))
     done < <(db_get_folder_assets "$parent_dir")
 
-    log_info "Directory archived: $parent_dir — $(bytes_to_human "${folder_size:-0}")"
+    if "$dry_run"; then
+      log_info "DRY-RUN: would archive directory: $parent_dir — $(bytes_to_human "${folder_size:-0}")"
+    else
+      log_info "Directory archived: $parent_dir — $(bytes_to_human "${folder_size:-0}")"
+    fi
 
     # Check threshold only after completing the current directory, never mid-directory.
     if (( freed_bytes >= bytes_to_free )); then
@@ -324,5 +328,12 @@ archive_run() {
   done < <(db_get_archive_candidates)
 
   release_lock
-  log_info "Archive complete. Freed: $(bytes_to_human "$freed_bytes")."
+  # A simulation must never log a line that reads as work done: `status` reports the
+  # last "Archive complete" as history, so an unmarked dry run used to show an
+  # archive that never happened, along with space it never freed.
+  if "$dry_run"; then
+    log_info "DRY-RUN: would free $(bytes_to_human "$freed_bytes") in total. Nothing was moved."
+  else
+    log_info "Archive complete. Freed: $(bytes_to_human "$freed_bytes")."
+  fi
 }
