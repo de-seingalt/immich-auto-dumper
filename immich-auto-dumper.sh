@@ -1341,6 +1341,7 @@ _status() {
     printf '\n'
     if (( rl_blocked > 0 || rl_divergent > 0 )); then
       printf '                       Details in %s — blocked and divergent entries need a decision.\n' "$(runlog_dir)"
+      printf '                       Their assets stay untouched until you resolve the cause and delete that run file.\n'
     fi
   fi
 }

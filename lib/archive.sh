@@ -32,6 +32,10 @@ archive_build_dest_path() {
   printf '%s/%s/%s\n' "$ARCHIVE_DEST_PATH" "$mapped_name" "$rest"
 }
 
+# Assets an unfinished run journal still owns, filled by archive_reconcile and
+# read by the candidate loop. Declared here so both see the same array.
+declare -A ARCHIVE_IN_FLIGHT=()
+
 # ── Per-asset pipeline, journalled and resumable ──────────────────────────────
 
 # Where Immich currently says the asset is, answered against what the journal
@@ -336,7 +340,15 @@ _archive_move_file() {
 #
 # Echoes nothing; logs what it does. Each old run file is appended to in place and
 # then renamed, so one run's history stays in one file.
+#
+# Fills ARCHIVE_IN_FLIGHT with the assets an unfinished journal still owns. The
+# selection below must leave those alone: an asset that keeps failing is still an
+# internal asset, so a fresh run would pick it up again and give it a SECOND entry
+# whose attempt counter starts at one — which is how an asset blocked by a foreign
+# file at its destination collected four "first attempts" across four runs and
+# never reached the ceiling meant to park it.
 archive_reconcile() {
+  ARCHIVE_IN_FLIGHT=()
   local -a files=()
   while IFS= read -r f; do [[ -n "$f" ]] && files+=("$f"); done < <(runlog_unfinished_files)
   (( ${#files[@]} > 0 )) || return 0
@@ -378,6 +390,21 @@ archive_reconcile() {
     runlog_close "$file"
   done
   RUNLOG_FILE="$previous"
+
+  # Re-read what is left, after renaming, and claim those assets. An entry that
+  # did not complete keeps its asset until either a later run finishes it or an
+  # operator resolves it and removes the run file.
+  local f2
+  while IFS= read -r f2; do
+    [[ -n "$f2" ]] || continue
+    while IFS="$RUNLOG_SEP" read -r asset etat _; do
+      [[ -n "$asset" ]] || continue
+      case "$etat" in
+        source_supprimee|abandonne) ;;
+        *) ARCHIVE_IN_FLIGHT["$asset"]=1 ;;
+      esac
+    done < <(runlog_read "$f2")
+  done < <(runlog_unfinished_files)
 
   log_info "Resume: $resumed completed, $skipped postponed to the next run, $stuck needing attention."
   return 0
@@ -765,6 +792,13 @@ archive_run() {
     local dir_ok=0 dir_ko=0 dir_freed=0
     while IFS="$DB_FIELD_SEP" read -r asset_id original_path_db file_size; do
       [[ -z "$asset_id" ]] && continue
+
+      # Already spoken for by an unfinished run: reconciliation above owns it.
+      # Taking it again here would open a parallel entry with a fresh attempt
+      # counter, and the ceiling that parks a hopeless asset would never bite.
+      if [[ -n "${ARCHIVE_IN_FLIGHT[$asset_id]:-}" ]]; then
+        continue
+      fi
 
       local src_host
       src_host=$(db_path_to_host_path "$original_path_db")
