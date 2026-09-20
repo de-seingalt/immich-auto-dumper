@@ -104,6 +104,10 @@ _archive_process_asset() {
   local asset_id="$1" src_host="$2" dst_host="$3" src_db="$4" dst_db="$5"
   local sha="$6" size="$7" state="$8" attempts="$9" update_fn="${10}"
 
+  # Bytes this call actually removed from the library, read off the disk. Zero
+  # until a source is really deleted.
+  ARCHIVE_LAST_FREED_BYTES=0
+
   local try=$(( attempts + 1 ))
   # Records the entry as it now stands and gives back the right return code. An
   # entry that has used up its tries is parked rather than retried every night.
@@ -242,12 +246,22 @@ _archive_process_asset() {
 
   # ── base_a_jour → source_supprimee ──────────────────────────────────────────
   if [[ "$state" == "base_a_jour" ]]; then
+    # How much the library actually loses is what the filesystem says about the
+    # file we are about to delete — measured now, while it is still there. The
+    # accounting used to come from Immich's own fileSizeInByte, and when those
+    # rows were missing the tool believed it had freed nothing and kept going
+    # until the whole library was gone.
+    local freed_now=0
+    if [[ -e "$src_host" ]]; then
+      freed_now=$(stat --format='%s' "$src_host" 2>/dev/null || echo 0)
+    fi
     if ! _archive_remove_source "$src_host" "$src_db" "$sha"; then
       # The archive itself succeeded: the asset points at the copy and is readable.
       # Only the cleanup is outstanding, so the entry stays pending rather than
       # being treated as a failure of the move.
       _park base_a_jour; return $?
     fi
+    ARCHIVE_LAST_FREED_BYTES="$freed_now"
     runlog_record "" "$asset_id" source_supprimee "$try" "$size" "$sha" "$src_host" "$src_db" "$dst_host" "$dst_db"
   fi
 
@@ -557,6 +571,30 @@ guard_path_consistency() {
   return 1
 }
 
+# True when Immich's backup folder holds at least one recent dump that could
+# actually be restored.
+#
+# The previous test was "any file here, modified in the last 7 days", and the file
+# that satisfied it was Immich's own 13-byte `.immich` marker. The last real dump
+# was two months old and predated a major-version upgrade, so it was unusable — yet
+# the run went ahead and rewrote database rows on the strength of it.
+#
+# Hidden files are excluded and a plausible size demanded, rather than matching
+# `immich-db-backup-*`: a name filter would tie this tool to a convention of
+# Immich's that is free to change, which is exactly the coupling that breaks at the
+# next upgrade.
+_recent_usable_dump() {
+  local f size
+  while IFS= read -r -d '' f; do
+    size=$(stat --format='%s' "$f" 2>/dev/null || echo 0)
+    if (( size > 1024 )); then
+      return 0
+    fi
+  done < <(find "$IMMICH_UPLOAD_LOCATION/backups" -maxdepth 1 -type f \
+             ! -name '.*' -mtime -7 -print0 2>/dev/null)
+  return 1
+}
+
 archive_run() {
   local dry_run=false force=false
   for arg in "$@"; do
@@ -677,8 +715,9 @@ archive_run() {
   # Safety: never modify the database unless a recent (<7 days) Immich DB backup
   # exists. Archiving rewrites "originalPath" rows, so a fresh dump is the safety net.
   # Skipped in dry-run: it writes nothing, and test_run must still preview candidates.
-  if ! "$dry_run" && ! find "$IMMICH_UPLOAD_LOCATION/backups" -type f -mtime -7 2>/dev/null | grep -q .; then
-    log_error "No recent DB backup (<7 days) in $IMMICH_UPLOAD_LOCATION/backups — archive aborted."
+  if ! "$dry_run" && ! _recent_usable_dump; then
+    log_error "No recent, usable DB backup (<7 days) in $IMMICH_UPLOAD_LOCATION/backups — archive aborted."
+    log_error "Immich writes its dumps there; check its backup job before archiving again."
     release_lock
     return 1
   fi
@@ -698,7 +737,7 @@ archive_run() {
 
     log_info "Candidate directory: $parent_dir (user: $user_folder, $(bytes_to_human "${folder_size:-0}"))"
 
-    local dir_ok=0 dir_ko=0
+    local dir_ok=0 dir_ko=0 dir_freed=0
     while IFS='|' read -r asset_id original_path_db file_size; do
       [[ -z "$asset_id" ]] && continue
 
@@ -714,7 +753,10 @@ archive_run() {
       _archive_move_sidecar "$src_host" "$dry_run" || true
 
       dir_ok=$(( dir_ok + 1 ))
-      freed_bytes=$(( freed_bytes + ${file_size:-0} ))
+      # What the filesystem lost, not what Immich's metadata claims the file
+      # weighs. file_size is only good enough to sort the candidates.
+      dir_freed=$((   dir_freed   + ARCHIVE_LAST_FREED_BYTES ))
+      freed_bytes=$(( freed_bytes + ARCHIVE_LAST_FREED_BYTES ))
     done < <(db_get_folder_assets "$parent_dir")
 
     # "Directory archived" used to be printed whatever happened, so a directory
@@ -725,14 +767,27 @@ archive_run() {
     elif (( dir_ok == 0 )); then
       log_error "Directory NOT archived: $parent_dir — all $dir_ko asset(s) failed."
     elif (( dir_ko > 0 )); then
-      log_warn "Directory partially archived: $parent_dir — $dir_ok done, $dir_ko failed."
+      log_warn "Directory partially archived: $parent_dir — $dir_ok done ($(bytes_to_human "$dir_freed") freed), $dir_ko failed."
     else
-      log_info "Directory archived: $parent_dir — $(bytes_to_human "${folder_size:-0}") ($dir_ok asset(s))"
+      # The size reported is the one the disk gave up, not the one the metadata
+      # advertised: with the exif rows missing the latter reads "0 B" for a
+      # directory that just freed hundreds of kilobytes.
+      log_info "Directory archived: $parent_dir — $(bytes_to_human "$dir_freed") freed ($dir_ok asset(s))"
     fi
 
-    # Check threshold only after completing the current directory, never mid-directory.
-    if (( freed_bytes >= bytes_to_free )); then
-      break
+    # Checked only after completing the current directory, never mid-directory —
+    # and checked by MEASURING the library again rather than by adding up what
+    # Immich says its files weigh. With the exif rows missing, those sizes summed
+    # to zero, the stopping condition was never met, and a run asked to free 178 KB
+    # moved 1.2 MB: every directory there was.
+    if "$dry_run"; then
+      (( freed_bytes >= bytes_to_free )) && break
+    else
+      lib_bytes=$(dir_size_bytes "$IMMICH_UPLOAD_LOCATION/library")
+      if (( lib_bytes <= target_bytes )); then
+        log_info "Library back down to $(bytes_to_human "$lib_bytes") — target reached, stopping."
+        break
+      fi
     fi
   done < <(db_get_archive_candidates)
 

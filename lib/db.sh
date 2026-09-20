@@ -311,18 +311,32 @@ db_current_library_prefix() {
 # Echoes the number of active assets we archived (under ARCHIVE_CONTAINER_PATH)
 # that Immich currently reports offline. Meaningful as a "container path changed"
 # signal ONLY when the external storage is ready (files physically present).
-# Returns 2 rather than an empty string when the count cannot be obtained: an
+# Echoes "<live>|<trashed>": how many of the assets we archived Immich currently
+# reports offline, split by whether it has also put them in the trash.
+#
+# Counting only the live ones made the check blind exactly when it mattered. Immich
+# marks an asset offline and moves it to the trash in the SAME operation — that is
+# what happened to 12 133 assets on 11 September — so the window in which the old
+# query could see anything lasted seconds. The same three assets read as
+# INCONSISTENT and then, moments later, as OK.
+#
+# The feared false positive, someone deleting archived photos on purpose, is ruled
+# out by `isOffline = true`: a deliberately deleted asset is not offline. It is the
+# conjunction that signals the failure, and nothing needs remembering between runs.
+#
+# Returns 2 rather than an empty string when the counts cannot be obtained: an
 # absent number used to read as "nothing offline", i.e. as good news.
 db_count_offline_archived() {
   local escaped out rc=0
   escaped=$(_db_escape "$(_db_escape_like "${ARCHIVE_CONTAINER_PATH%/}")")
-  out=$(_db_exec "SELECT count(*) FROM \"asset\"
-            WHERE \"deletedAt\" IS NULL
-              AND \"isOffline\" = true
-              AND \"originalPath\" LIKE '${escaped}/%' ESCAPE '\\';" 2>/dev/null) || rc=$?
+  out=$(_db_exec "SELECT count(*) FILTER (WHERE \"deletedAt\" IS NULL) || '|' ||
+                         count(*) FILTER (WHERE \"deletedAt\" IS NOT NULL)
+                  FROM \"asset\"
+                  WHERE \"isOffline\" = true
+                    AND \"originalPath\" LIKE '${escaped}/%' ESCAPE '\\';" 2>/dev/null) || rc=$?
   (( rc == 0 )) || return 2
   out=$(printf '%s\n' "$out" | head -1)
-  [[ "$out" =~ ^[0-9]+$ ]] || return 2
+  [[ "$out" =~ ^[0-9]+\|[0-9]+$ ]] || return 2
   printf '%s' "$out"
 }
 
@@ -348,15 +362,19 @@ db_check_path_consistency() {
     issues+=("Internal library prefix changed in DB: config='${IMMICH_DB_LIBRARY_PREFIX}' but DB shows '${current_prefix}'.")
   fi
 
-  local offline
+  local counts
   rc=0
-  offline=$(db_count_offline_archived) || rc=$?
+  counts=$(db_count_offline_archived) || rc=$?
   if (( rc != 0 )); then
     printf 'The count of offline archived assets could not be read; nothing could be verified.\n'
     return 2
   fi
-  if (( offline > 0 )); then
-    issues+=("${offline} archived asset(s) under '${ARCHIVE_CONTAINER_PATH}' are offline while the storage is reachable — the external library path likely changed in Immich.")
+  local offline_live="${counts%%|*}" offline_trashed="${counts##*|}"
+  if (( offline_live + offline_trashed > 0 )); then
+    local detail="${offline_live} still visible"
+    (( offline_trashed > 0 )) && detail+=", ${offline_trashed} already moved to the trash by Immich"
+    issues+=("$(( offline_live + offline_trashed )) archived asset(s) under '${ARCHIVE_CONTAINER_PATH}' are offline while the storage is reachable (${detail}) — the external library path likely changed in Immich.")
+    (( offline_trashed > 0 )) && issues+=("Assets Immich has both marked offline and trashed are how a mass loss starts: do NOT empty the trash before the path is fixed.")
   fi
 
   if (( ${#issues[@]} > 0 )); then

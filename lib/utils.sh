@@ -150,9 +150,10 @@ readonly ARCHIVE_MARKER_NAME=".immich-auto-dumper.id"
 
 # Reads the marker and says what it found, following the diagnostic convention:
 #
-#   0  the storage is there and is the expected volume
+#   0  the storage is there, is the expected volume, and Immich can see it too
 #   1  a clear negative — no marker (storage absent), or another volume's marker
-#   2  no conclusion — the read timed out, or the marker is there but unreadable
+#   2  no conclusion — the read timed out, the marker is there but unreadable, or
+#      the host can read it and the Immich container cannot
 #
 # 1 and 2 are not the same situation and must not lead to the same decision: a
 # removable disk that is simply unplugged is normal and a run should end quietly,
@@ -181,6 +182,23 @@ _archive_dest_state() {
     if [[ -n "${ARCHIVE_STORAGE_ID:-}" && "$id" != "$ARCHIVE_STORAGE_ID" ]]; then
       _ARCHIVE_DEST_REASON="marker id does not match ARCHIVE_STORAGE_ID — wrong volume mounted?"
       return 1
+    fi
+    # The host seeing the storage is not the same thing as Immich seeing it. In the
+    # state that caused the 11 September incident the host read the marker fine
+    # while the container answered "Transport endpoint is not connected" — and the
+    # tool reported itself green, archived nothing and alerted nobody.
+    #
+    # Only asked when Docker answers at all: "Docker is down" is a different fault,
+    # reported in its own right, and must not masquerade as a storage problem.
+    if [[ -n "${IMMICH_SERVER_CONTAINER:-}" && -n "${ARCHIVE_CONTAINER_PATH:-}" ]] \
+       && probe_docker_cmd 2>/dev/null; then
+      local seen_by_container
+      seen_by_container=$(timeout 15 $DOCKER_CMD exec "$IMMICH_SERVER_CONTAINER" \
+        cat "${ARCHIVE_CONTAINER_PATH%/}/$ARCHIVE_MARKER_NAME" 2>/dev/null </dev/null || true)
+      if [[ "$seen_by_container" != "$id" ]]; then
+        _ARCHIVE_DEST_REASON="readable from this host but NOT from the Immich container at ${ARCHIVE_CONTAINER_PATH%/} — mount replaced under the container? Restart it: docker restart $IMMICH_SERVER_CONTAINER"
+        return 2
+      fi
     fi
     _ARCHIVE_DEST_REASON=""
     return 0
