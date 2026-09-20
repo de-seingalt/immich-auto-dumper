@@ -3,14 +3,41 @@ set -euo pipefail
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
+# Diagnostic convention, used by every function below that can fail to reach
+# something:
+#
+#   0  success, the result can be used
+#   1  a legitimate negative answer — absent, empty, not covered
+#   2  no conclusion possible — dependency unreachable, permission denied, timeout
+#
+# The audit found that every one of its false "all clear" verdicts came from the
+# same place: a function that could not tell 1 from 2 and answered 1. "The database
+# did not answer" and "the schema has changed" produced the identical message,
+# which invited the operator to edit a tool that writes to their database while the
+# container was merely stopped. Never turn an uncertainty into a negative.
+
 # `psql -c` never reads stdin, but `docker exec -i` keeps stdin open and drains it.
 # When called inside a `while read … done < <(…)` loop, that stdin IS the loop's
 # input pipe — docker would swallow the remaining rows and the loop would stop after
 # the first iteration. Redirect from /dev/null so the loop's input is left intact.
+#
+# Returns 2, never a silently empty result, when the query could not run: the caller
+# must be able to tell "no rows" from "no database". Standard error is left to flow
+# through to the caller, which is where psql explains itself.
 _db_exec() {
-  $DOCKER_CMD exec -i "$IMMICH_DB_CONTAINER" psql \
-    -U "$IMMICH_DB_USER" -d "$IMMICH_DB_NAME" -t -A -c "$1" </dev/null
+  local out rc=0
+  out=$($DOCKER_CMD exec -i "$IMMICH_DB_CONTAINER" psql \
+          -U "$IMMICH_DB_USER" -d "$IMMICH_DB_NAME" -t -A -c "$1" </dev/null) || rc=$?
+  (( rc == 0 )) || return 2
+  if [[ -n "$out" ]]; then
+    printf '%s\n' "$out"
+  fi
+  return 0
 }
+
+# True if the configured Immich Postgres container answers a trivial query.
+# Requires IMMICH_DB_CONTAINER / IMMICH_DB_USER / IMMICH_DB_NAME to be set first.
+_db_reachable() { _db_exec "SELECT 1;" &>/dev/null; }
 
 # Escapes single quotes for SQL string literals.
 _db_escape() {
@@ -32,7 +59,10 @@ _db_escape_regex() {
 # ── Schema validation ─────────────────────────────────────────────────────────
 
 # Verifies that required tables and columns exist in the Immich schema.
-# Returns 1 and logs errors if anything is missing.
+# Returns 0 when the schema matches, 1 when columns are genuinely missing, and 2
+# when the database could not be questioned at all — the distinction the previous
+# version could not make, and the reason a stopped container was reported as a
+# schema change.
 db_check_schema() {
   local expected_asset_columns=(
     "id" "originalPath" "isOffline" "isExternal" "libraryId"
@@ -45,29 +75,28 @@ db_check_schema() {
   local expected_library_columns=("id" "ownerId" "importPaths" "deletedAt")
 
   local missing=()
+  local table cols col rc
 
-  local asset_cols
-  asset_cols=$(_db_exec "SELECT column_name FROM information_schema.columns WHERE table_name='asset';" 2>/dev/null || true)
-  for col in "${expected_asset_columns[@]}"; do
-    if ! printf '%s\n' "$asset_cols" | grep -qx "$col"; then
-      missing+=("asset.$col")
+  # One query per table, each of which must actually run. A query that fails says
+  # nothing about the schema, so it stops the check instead of contributing an
+  # empty column list — which is what made every column look missing.
+  local -A expected=(
+    [asset]="${expected_asset_columns[*]}"
+    [asset_exif]="${expected_exif_columns[*]}"
+    [library]="${expected_library_columns[*]}"
+  )
+  for table in asset asset_exif library; do
+    rc=0
+    cols=$(_db_exec "SELECT column_name FROM information_schema.columns WHERE table_name='${table}';" 2>/dev/null) || rc=$?
+    if (( rc != 0 )); then
+      log_error "Cannot read Immich's schema: the database did not answer."
+      log_error "The schema itself was NOT checked — is container '${IMMICH_DB_CONTAINER}' running?"
+      log_error "  docker ps --filter name=${IMMICH_DB_CONTAINER}"
+      return 2
     fi
-  done
-
-  local exif_cols
-  exif_cols=$(_db_exec "SELECT column_name FROM information_schema.columns WHERE table_name='asset_exif';" 2>/dev/null || true)
-  for col in "${expected_exif_columns[@]}"; do
-    if ! printf '%s\n' "$exif_cols" | grep -qx "$col"; then
-      missing+=("asset_exif.$col")
-    fi
-  done
-
-  local library_cols
-  library_cols=$(_db_exec "SELECT column_name FROM information_schema.columns WHERE table_name='library';" 2>/dev/null || true)
-  for col in "${expected_library_columns[@]}"; do
-    if ! printf '%s\n' "$library_cols" | grep -qx "$col"; then
-      missing+=("library.$col")
-    fi
+    for col in ${expected[$table]}; do
+      printf '%s\n' "$cols" | grep -qx -- "$col" || missing+=("${table}.${col}")
+    done
   done
 
   if (( ${#missing[@]} > 0 )); then
@@ -245,46 +274,68 @@ db_asset_would_be_external() {
 # the external library path changed in Immich and that our config is now stale.
 
 # Echoes the internal library prefix (/.../library) derived from a current,
-# non-archived asset. Empty if undeterminable.
+# non-archived asset. 1 when no asset can serve as a sample (a legitimate answer:
+# an empty library), 2 when the database could not be questioned.
 db_current_library_prefix() {
-  local sample
+  local sample rc=0
   sample=$(_db_exec "SELECT \"originalPath\" FROM \"asset\"
                      WHERE \"originalPath\" LIKE '%/library/%'
                        AND \"deletedAt\" IS NULL
-                     LIMIT 1;" 2>/dev/null | head -1 || true)
-  [[ -z "$sample" ]] && return 0
+                     LIMIT 1;" 2>/dev/null) || rc=$?
+  (( rc == 0 )) || return 2
+  sample=$(printf '%s\n' "$sample" | head -1)
+  [[ -n "$sample" ]] || return 1
   printf '%s' "$sample" | sed 's|\(/[^/]*/library\)/.*|\1|'
 }
 
 # Echoes the number of active assets we archived (under ARCHIVE_CONTAINER_PATH)
 # that Immich currently reports offline. Meaningful as a "container path changed"
 # signal ONLY when the external storage is ready (files physically present).
+# Returns 2 rather than an empty string when the count cannot be obtained: an
+# absent number used to read as "nothing offline", i.e. as good news.
 db_count_offline_archived() {
-  local escaped
+  local escaped out rc=0
   escaped=$(_db_escape "$(_db_escape_like "${ARCHIVE_CONTAINER_PATH%/}")")
-  _db_exec "SELECT count(*) FROM \"asset\"
+  out=$(_db_exec "SELECT count(*) FROM \"asset\"
             WHERE \"deletedAt\" IS NULL
               AND \"isOffline\" = true
-              AND \"originalPath\" LIKE '${escaped}/%' ESCAPE '\\';" 2>/dev/null | head -1
+              AND \"originalPath\" LIKE '${escaped}/%' ESCAPE '\\';" 2>/dev/null) || rc=$?
+  (( rc == 0 )) || return 2
+  out=$(printf '%s\n' "$out" | head -1)
+  [[ "$out" =~ ^[0-9]+$ ]] || return 2
+  printf '%s' "$out"
 }
 
 # Read-only consistency check between our config and Immich's DB reality.
-# Echoes a human-readable report and returns 1 on inconsistency, 0 if consistent.
+# Echoes a human-readable report and returns 1 on inconsistency, 0 if consistent,
+# 2 if the database could not answer — because "no inconsistency found" and "found
+# nothing at all" are the two verdicts this check must never confuse. A caller that
+# treated 2 as 0 would let an archive run start blind.
 # The offline-archived signal must only be trusted when the storage is ready
 # (callers gate on check_archive_dest_ready first).
 db_check_path_consistency() {
-  local issues=()
+  local issues=() rc=0
 
   local current_prefix
-  current_prefix=$(db_current_library_prefix)
-  if [[ -n "$current_prefix" && -n "${IMMICH_DB_LIBRARY_PREFIX:-}" \
+  current_prefix=$(db_current_library_prefix) || rc=$?
+  if (( rc == 2 )); then
+    printf 'The Immich database did not answer; nothing could be verified.\n'
+    return 2
+  fi
+  # rc == 1 simply means no asset to derive a prefix from: nothing to compare.
+  if (( rc == 0 )) && [[ -n "$current_prefix" && -n "${IMMICH_DB_LIBRARY_PREFIX:-}" \
         && "$current_prefix" != "$IMMICH_DB_LIBRARY_PREFIX" ]]; then
     issues+=("Internal library prefix changed in DB: config='${IMMICH_DB_LIBRARY_PREFIX}' but DB shows '${current_prefix}'.")
   fi
 
   local offline
-  offline=$(db_count_offline_archived)
-  if [[ "$offline" =~ ^[0-9]+$ ]] && (( offline > 0 )); then
+  rc=0
+  offline=$(db_count_offline_archived) || rc=$?
+  if (( rc != 0 )); then
+    printf 'The count of offline archived assets could not be read; nothing could be verified.\n'
+    return 2
+  fi
+  if (( offline > 0 )); then
     issues+=("${offline} archived asset(s) under '${ARCHIVE_CONTAINER_PATH}' are offline while the storage is reachable — the external library path likely changed in Immich.")
   fi
 

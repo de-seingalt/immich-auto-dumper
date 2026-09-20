@@ -40,9 +40,16 @@ backup_db_run() {
   # Note: we intentionally do NOT run the path-consistency guard here — mirroring
   # DB dumps stays useful (and safe, it never touches the Immich DB) even while an
   # external library path change is being resolved.
-  if ! check_archive_dest_ready; then
-    return 0
-  fi
+  #
+  # Absent storage ends the run quietly; storage whose state cannot be established
+  # exits non-zero, so it is not mistaken for "nothing to do".
+  local dest_state=0
+  check_archive_dest_ready || dest_state=$?
+  case $dest_state in
+    0) ;;
+    1) return 0 ;;
+    *) return 1 ;;
+  esac
 
   local src_dir="$IMMICH_UPLOAD_LOCATION/backups"
   if [[ ! -d "$src_dir" ]]; then

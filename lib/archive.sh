@@ -194,9 +194,17 @@ _archive_move_sidecar() {
 # of truth: we never rewrite the DB. The user must fix the path in Immich and
 # re-run setup. Returns 1 on inconsistency, 0 otherwise.
 guard_path_consistency() {
-  local report
-  if report=$(db_check_path_consistency); then
+  local report state=0
+  report=$(db_check_path_consistency) || state=$?
+  if (( state == 0 )); then
     return 0
+  fi
+  if (( state >= 2 )); then
+    # Not "consistent" and not "inconsistent": unverified. Archiving on an
+    # unverified DB is how a stale configuration gets acted on.
+    log_error "Path consistency could not be verified — archiving refused:"
+    log_error "  - $report"
+    return 1
   fi
   log_error "Path inconsistency detected — Immich DB no longer matches config:"
   local line
@@ -228,10 +236,17 @@ archive_run() {
 
   check_prereqs
 
-  # Storage availability — agnostic to the storage type (marker-based).
-  if ! check_archive_dest_ready; then
-    return 0
-  fi
+  # Storage availability — agnostic to the storage type (marker-based). A storage
+  # that is simply not there is an ordinary state for a removable or remote volume:
+  # the run ends quietly. A storage whose state cannot be established is not, and
+  # exits non-zero so a cron run reports it.
+  local dest_state=0
+  check_archive_dest_ready || dest_state=$?
+  case $dest_state in
+    0) ;;
+    1) return 0 ;;
+    *) return 1 ;;
+  esac
 
   # Case B: external library path changed in Immich → pause, never touch the DB.
   if ! guard_path_consistency; then

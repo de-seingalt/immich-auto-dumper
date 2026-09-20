@@ -132,9 +132,8 @@ _ext_library_tree() {
      | LC_ALL=C sort | sed -e 's|^\./||' -e 's|[^/]*/|  |g')
 }
 
-# True if the configured Immich Postgres container answers a trivial query. Requires
-# IMMICH_DB_CONTAINER / IMMICH_DB_USER / IMMICH_DB_NAME to be set first.
-_db_reachable() { _db_exec "SELECT 1;" &>/dev/null; }
+# _db_reachable now lives in lib/db.sh, beside the query helper it is built on and
+# the checks that have to tell "unreachable" from "answered no".
 
 # Interactive liveness gate before writing the storage marker: makes sure the
 # storage is actually active, so we never write the marker into an empty local
@@ -379,12 +378,17 @@ _config_check() {
   # removable or remote mount is allowed to be down — so it is only a note. A
   # destination path that does not even exist on this host is a real problem.
   if [[ -n "${ARCHIVE_DEST_PATH:-}" ]]; then
-    if archive_dest_ready 2>/dev/null; then
+    local dest_state=0
+    archive_dest_ready 2>/dev/null || dest_state=$?
+    if (( dest_state == 0 )); then
       CFG_NOTES+=("External storage is reachable and its marker matches this config.")
     elif [[ ! -d "$ARCHIVE_DEST_PATH" ]]; then
       CFG_PROBLEMS+=("External library path '${ARCHIVE_DEST_PATH}' does not exist on this host.")
+    elif (( dest_state >= 2 )); then
+      # Not the same as "not plugged in": something is answering badly.
+      CFG_PROBLEMS+=("External storage state could not be established — ${_ARCHIVE_DEST_REASON}.")
     else
-      CFG_NOTES+=("External storage not reachable right now (marker missing, or another volume is mounted) — archiving stays paused until it is back.")
+      CFG_NOTES+=("External storage not reachable right now (${_ARCHIVE_DEST_REASON}) — archiving stays paused until it is back.")
     fi
   fi
 
@@ -407,8 +411,14 @@ _config_check() {
     return 0
   fi
 
-  db_check_schema >/dev/null 2>&1 \
-    || CFG_PROBLEMS+=("Immich's database schema no longer matches what this tool expects — review it before archiving again.")
+  local schema_state=0
+  db_check_schema >/dev/null 2>&1 || schema_state=$?
+  if (( schema_state == 1 )); then
+    CFG_PROBLEMS+=("Immich's database schema no longer matches what this tool expects — review it before archiving again.")
+  elif (( schema_state >= 2 )); then
+    # Not a schema problem. Saying so used to send people editing the tool.
+    CFG_NOTES+=("The schema could not be checked: the database stopped answering.")
+  fi
 
   # Every Immich user needs a destination folder: one added since the last setup
   # would otherwise have no place for its archived photos.
@@ -434,9 +444,12 @@ _config_check() {
 
   # Only trustworthy while the storage is actually there (see db_check_path_consistency).
   if archive_dest_ready 2>/dev/null; then
-    local report
-    if ! report=$(db_check_path_consistency 2>/dev/null); then
+    local report consistency_state=0
+    report=$(db_check_path_consistency 2>/dev/null) || consistency_state=$?
+    if (( consistency_state == 1 )); then
       CFG_PROBLEMS+=("Immich's paths no longer match this config: $(printf '%s' "$report" | tr '\n' ' ')")
+    elif (( consistency_state >= 2 )); then
+      CFG_NOTES+=("Immich's paths could not be checked: $(printf '%s' "$report" | tr '\n' ' ')")
     fi
   fi
 
@@ -1025,14 +1038,18 @@ _setup() {
   local log_dir="${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper}"
   local log_max_lines="${LOG_MAX_LINES:-1000}"
 
-  # Schema / path-consistency checks (non-blocking).
+  # Schema / path-consistency checks (non-blocking). Only a real mismatch is
+  # reported as one: an unanswering database says nothing about the schema.
   if _db_reachable; then
-    if ! db_check_schema 2>/dev/null; then
+    local wiz_schema_state=0
+    db_check_schema 2>/dev/null || wiz_schema_state=$?
+    if (( wiz_schema_state == 1 )); then
       ui_info "Schema check" "WARNING: Schema check failed — the Immich DB schema may have changed.\n\nReview the script before using it against this Immich version."
     fi
     if archive_dest_ready 2>/dev/null; then
-      local consistency_report
-      if ! consistency_report=$(db_check_path_consistency 2>/dev/null); then
+      local consistency_report wiz_consistency_state=0
+      consistency_report=$(db_check_path_consistency 2>/dev/null) || wiz_consistency_state=$?
+      if (( wiz_consistency_state == 1 )); then
         ui_info "Path consistency" "NOTE: Immich DB path inconsistency detected:\n\n$(printf '%s\n' "$consistency_report" | sed 's/^/  - /')\n\nMake sure the external library path still matches the one configured in Immich."
       fi
     fi
@@ -1206,29 +1223,45 @@ _status() {
     printf 'Library size         : unavailable (%s not found)\n' "$library_path"
   fi
 
-  local storage_ready=false
-  if archive_dest_ready 2>/dev/null; then
-    storage_ready=true
-    printf 'External storage     : ready  (%s)\n' "${ARCHIVE_DEST_PATH:-?}"
+  local storage_ready=false storage_state=0
+  archive_dest_ready 2>/dev/null || storage_state=$?
+  case $storage_state in
+    0) storage_ready=true
+       printf 'External storage     : ready  (%s)\n' "${ARCHIVE_DEST_PATH:-?}" ;;
+    1) printf 'External storage     : NOT READY  (%s) — %s\n' "${ARCHIVE_DEST_PATH:-?}" "$_ARCHIVE_DEST_REASON" ;;
+    *) printf 'External storage     : UNVERIFIABLE  (%s) — %s\n' "${ARCHIVE_DEST_PATH:-?}" "$_ARCHIVE_DEST_REASON" ;;
+  esac
+
+  # Schema + path consistency vs Immich DB. Every line is always printed, including
+  # when nothing could be checked: skipping the line altogether left a status report
+  # that looked entirely healthy while the database was down.
+  local schema_state=0
+  if ! probe_docker_cmd 2>/dev/null; then
+    printf 'Schema check         : not verified (Docker unreachable)\n'
+  elif ! _db_reachable; then
+    printf 'Schema check         : not verified (Immich database unreachable — is %s running?)\n' "${IMMICH_DB_CONTAINER:-the DB container}"
   else
-    printf 'External storage     : NOT READY  (%s)\n' "${ARCHIVE_DEST_PATH:-?}"
+    db_check_schema >/dev/null 2>&1 || schema_state=$?
+    case $schema_state in
+      0) printf 'Schema check         : OK\n' ;;
+      1) printf 'Schema check         : FAILED — Immich DB schema may have changed, review the script\n' ;;
+      *) printf 'Schema check         : not verified (the database stopped answering mid-check)\n' ;;
+    esac
   fi
 
-  # Schema + path consistency vs Immich DB (requires docker; best-effort, never fatal).
-  if probe_docker_cmd 2>/dev/null && _db_reachable; then
-    if db_check_schema >/dev/null 2>&1; then
-      printf 'Schema check         : OK\n'
-    else
-      printf 'Schema check         : FAILED — Immich DB schema may have changed, review the script\n'
-    fi
-  fi
-
-  if "$storage_ready" && probe_docker_cmd 2>/dev/null; then
-    if db_check_path_consistency >/dev/null 2>&1; then
-      printf 'Path consistency     : OK\n'
-    else
-      printf 'Path consistency     : INCONSISTENT — fix the path in Immich, then run setup\n'
-    fi
+  if ! probe_docker_cmd 2>/dev/null; then
+    printf 'Path consistency     : not verified (Docker unreachable)\n'
+  elif ! "$storage_ready"; then
+    # The offline-asset signal only means anything when the files are reachable.
+    printf 'Path consistency     : not verified (external storage not reachable)\n'
+  else
+    local consistency_state=0
+    db_check_path_consistency >/dev/null 2>&1 || consistency_state=$?
+    case $consistency_state in
+      0) printf 'Path consistency     : OK\n' ;;
+      1) printf 'Path consistency     : INCONSISTENT — fix the path in Immich, then run setup\n' ;;
+      *) printf 'Path consistency     : not verified (Immich database unreachable)\n' ;;
+    esac
   fi
 
   local backup_dir="${ARCHIVE_DEST_PATH:-}/.immich-backup"

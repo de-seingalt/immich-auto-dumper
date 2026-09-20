@@ -120,6 +120,17 @@ check_prereqs() {
     'printenv IMMICH_SOURCE_REF || printenv IMMICH_VERSION' 2>/dev/null </dev/null || true)
   log_info "Immich version: ${immich_version:-unknown}"
 
+  # Asked before the schema, so the two get different answers. A stopped database
+  # container used to surface as "Schema check failed … update this script if
+  # needed" — an invitation to edit a tool that writes to that database, over a
+  # container that only needed starting.
+  if ! _db_reachable; then
+    log_error "The Immich database did not answer (container '${IMMICH_DB_CONTAINER}')."
+    log_error "Nothing was checked and nothing was changed. Is the container running?"
+    log_error "  docker ps --filter name=${IMMICH_DB_CONTAINER}"
+    exit 1
+  fi
+
   # Validate the Immich DB schema before any operation touches the database.
   if ! db_check_schema; then
     exit 1
@@ -137,32 +148,75 @@ check_prereqs() {
 # Name of the marker file placed at the root of ARCHIVE_DEST_PATH.
 readonly ARCHIVE_MARKER_NAME=".immich-auto-dumper.id"
 
-# Quiet predicate: returns 0 if the storage is ready (marker present and, when an
-# ARCHIVE_STORAGE_ID is configured, matching). No logging — for status/probes.
-archive_dest_ready() {
+# Reads the marker and says what it found, following the diagnostic convention:
+#
+#   0  the storage is there and is the expected volume
+#   1  a clear negative — no marker (storage absent), or another volume's marker
+#   2  no conclusion — the read timed out, or the marker is there but unreadable
+#
+# 1 and 2 are not the same situation and must not lead to the same decision: a
+# removable disk that is simply unplugged is normal and a run should end quietly,
+# while a mount that hangs or denies reads is a fault worth surfacing.
+#
+# Echoes nothing; _archive_dest_state sets _ARCHIVE_DEST_REASON for callers that
+# want to explain themselves.
+_ARCHIVE_DEST_REASON=""
+_archive_dest_state() {
   local marker="${ARCHIVE_DEST_PATH%/}/$ARCHIVE_MARKER_NAME"
-  local id
-  # timeout guards against a dead FUSE/rclone mount that would hang on read.
-  id=$(timeout 10 cat "$marker" 2>/dev/null) || true
-  [[ -n "$id" ]] || return 1
-  [[ -z "${ARCHIVE_STORAGE_ID:-}" || "$id" == "$ARCHIVE_STORAGE_ID" ]]
+  local id rc=0
+  # timeout guards against a dead FUSE/rclone mount that would hang on read. Its
+  # own exit code 124 is what tells a hang apart from a missing file.
+  id=$(timeout 10 cat -- "$marker" 2>/dev/null) || rc=$?
+
+  if (( rc == 124 )); then
+    _ARCHIVE_DEST_REASON="reading '$marker' timed out after 10s — the mount is not answering"
+    return 2
+  fi
+
+  if (( rc == 0 )); then
+    if [[ -z "$id" ]]; then
+      _ARCHIVE_DEST_REASON="marker '$marker' is present but empty — the volume cannot be identified"
+      return 2
+    fi
+    if [[ -n "${ARCHIVE_STORAGE_ID:-}" && "$id" != "$ARCHIVE_STORAGE_ID" ]]; then
+      _ARCHIVE_DEST_REASON="marker id does not match ARCHIVE_STORAGE_ID — wrong volume mounted?"
+      return 1
+    fi
+    _ARCHIVE_DEST_REASON=""
+    return 0
+  fi
+
+  # The read failed without hanging: either the marker is not there (the storage
+  # is simply not mounted) or it is there and we cannot read it. Only the second
+  # is a fault. The existence test is itself bounded, since the mount may be sick.
+  if timeout 5 ls -d -- "$marker" >/dev/null 2>&1; then
+    _ARCHIVE_DEST_REASON="marker '$marker' exists but cannot be read — permissions, or a failing mount"
+    return 2
+  fi
+  _ARCHIVE_DEST_REASON="marker '$marker' is missing — is the storage mounted/connected?"
+  return 1
 }
 
-# Logging variant used by destructive operations: logs the precise reason and
-# returns 1 when the storage is not ready. Does not exit — caller decides.
+# Quiet predicate for status and probes: 0 ready, 1 absent/wrong volume, 2 unknown.
+# Callers that only test truth are unaffected; those that care can read the code.
+archive_dest_ready() {
+  _archive_dest_state
+}
+
+# Logging variant used by destructive operations. Same codes, with the reason
+# written to the log. Does not exit — the caller decides what a 1 and a 2 mean
+# for it.
 check_archive_dest_ready() {
-  local marker="${ARCHIVE_DEST_PATH%/}/$ARCHIVE_MARKER_NAME"
-  local id
-  id=$(timeout 10 cat "$marker" 2>/dev/null) || true
-  if [[ -z "$id" ]]; then
-    log_error "External storage not ready: marker '$marker' missing/unreadable. Is it mounted/connected?"
-    return 1
-  fi
-  if [[ -n "${ARCHIVE_STORAGE_ID:-}" && "$id" != "$ARCHIVE_STORAGE_ID" ]]; then
-    log_error "External storage mismatch: marker id != ARCHIVE_STORAGE_ID. Wrong volume mounted?"
-    return 1
-  fi
-  return 0
+  local state=0
+  _archive_dest_state || state=$?
+  case $state in
+    0) return 0 ;;
+    1) log_error "External storage not ready: ${_ARCHIVE_DEST_REASON}"
+       return 1 ;;
+    *) log_error "External storage state undetermined: ${_ARCHIVE_DEST_REASON}"
+       log_error "Refusing to act on a destination that cannot be verified."
+       return 2 ;;
+  esac
 }
 
 # Best-effort liveness signal used ONLY at setup to decide whether to auto-create
