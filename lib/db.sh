@@ -251,6 +251,26 @@ db_update_asset_path() {
   [[ -n "$DB_UPDATE_IS_EXTERNAL" ]]
 }
 
+# Echoes "<trashed|live> <originalPath>" for one asset. Echoes nothing (0) when the
+# asset no longer exists at all, and returns 2 when the database could not answer.
+#
+# The flag comes first and contains no space, so the path that follows keeps every
+# character it has. It is spelled out by a CASE rather than cast from the boolean:
+# `::text` renders true/false while psql DISPLAYS t/f, and comparing against the
+# display form silently treated every trashed asset as live.
+#
+# Used when resuming a journalled operation: Immich lives between runs, so the
+# database is re-read and has to agree before anything irreversible happens.
+db_asset_position() {
+  local escaped out rc=0
+  escaped=$(_db_escape "$1")
+  out=$(_db_exec "SELECT CASE WHEN \"deletedAt\" IS NOT NULL THEN 'trashed' ELSE 'live' END
+                         || ' ' || \"originalPath\"
+                  FROM \"asset\" WHERE \"id\" = '${escaped}';") || rc=$?
+  (( rc == 0 )) || return 2
+  printf '%s' "$(printf '%s\n' "$out" | head -1)"
+}
+
 # Echoes 't' when an external library of the asset's owner covers <path>, 'f'
 # otherwise. Read-only preview of the adoption decision above — used by dry runs
 # to surface a missing external library before any real archiving is attempted.

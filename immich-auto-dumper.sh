@@ -12,6 +12,7 @@ source "$SCRIPT_DIR/lib/config.sh"
 source "$SCRIPT_DIR/lib/ui.sh"
 source "$SCRIPT_DIR/lib/detect.sh"
 source "$SCRIPT_DIR/lib/db.sh"
+source "$SCRIPT_DIR/lib/runlog.sh"
 source "$SCRIPT_DIR/lib/backup_db.sh"
 source "$SCRIPT_DIR/lib/archive.sh"
 
@@ -44,6 +45,9 @@ Commands:
              Add --force to dump now regardless of MAX (still stops at TARGET).
   sync_now   Force an immediate copy of DB backups to external storage
   test_run   Verbose simulation of a forced dump + sync_now (implies --dry-run --force)
+  rollback   Undo one archive run: bring its files back into the Immich library and
+             point the database at them again. Takes a run id, as listed by status.
+             Never happens on its own — it is a decision, on one identified run.
   uninstall  Remove the tool's local footprint (keeps Immich and external storage intact)
 
 Flags:
@@ -1318,6 +1322,27 @@ _status() {
     stale)  printf 'Lock                 : stale (PID %s dead)\n' "${lock_info#* }" ;;
     *)      printf 'Lock                 : inactive\n' ;;
   esac
+
+  # Unfinished work has to be visible without opening a file: is there a run that
+  # did not complete, since when, how much is waiting, and how much is stuck.
+  local rl_pending rl_blocked rl_divergent rl_unreadable rl_files rl_oldest
+  read -r rl_pending rl_blocked rl_divergent rl_unreadable rl_files rl_oldest < <(runlog_summary)
+  if (( rl_files == 0 )); then
+    printf 'Unfinished runs      : none\n'
+  else
+    local since=""
+    local oldest_path="$(runlog_dir)/$rl_oldest"
+    [[ -f "$oldest_path" ]] && since=$(date -r "$oldest_path" '+%Y-%m-%d %H:%M' 2>/dev/null || true)
+    printf 'Unfinished runs      : %d (oldest: %s%s)\n' \
+      "$rl_files" "${rl_oldest%.*}" "${since:+, since $since}"
+    printf '                       %d entry(ies) to resume, %d blocked, %d divergent' \
+      "$rl_pending" "$rl_blocked" "$rl_divergent"
+    (( rl_unreadable > 0 )) && printf ', %d unreadable' "$rl_unreadable"
+    printf '\n'
+    if (( rl_blocked > 0 || rl_divergent > 0 )); then
+      printf '                       Details in %s — blocked and divergent entries need a decision.\n' "$(runlog_dir)"
+    fi
+  fi
 }
 
 # ── start ─────────────────────────────────────────────────────────────────────
@@ -1465,6 +1490,9 @@ main() {
       # either's outcome so a non-zero return under `set -e` never hides a preview.
       archive_run --force --dry-run || true
       backup_db_run --dry-run || true
+      ;;
+    rollback)
+      archive_rollback "${args[1]:-}"
       ;;
     uninstall)
       # Hand off to the standalone uninstaller (self-relocates before deleting the
