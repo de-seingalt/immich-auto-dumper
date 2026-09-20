@@ -32,8 +32,6 @@ archive_build_dest_path() {
   printf '%s/%s/%s\n' "$ARCHIVE_DEST_PATH" "$mapped_name" "$rest"
 }
 
-# ── File move helpers ─────────────────────────────────────────────────────────
-
 # ── Per-asset pipeline, journalled and resumable ──────────────────────────────
 
 # Where Immich currently says the asset is, answered against what the journal
@@ -187,11 +185,17 @@ _archive_process_asset() {
       # that a mere existence check would accept — and the source would then be
       # deleted. Both the exit code and the copied content are checked before
       # anything irreversible happens.
-      if ! cp "$src_host" "$dst_host"; then
+      # -p keeps the timestamps: without it every archived photo arrived on the
+      # external storage dated the day it was archived, losing the only file-level
+      # trace of when it was taken.
+      if ! cp -p "$src_host" "$dst_host"; then
         log_error "Copy failed: $src_host → $dst_host"
         rm -f "$dst_host"
         _park prevu; return $?
       fi
+      # Flushed BEFORE it is verified, so the fingerprint is taken of what is on
+      # the storage rather than of what is still in memory.
+      file_flush "$dst_host"
       local copied=0
       files_are_identical "$src_host" "$dst_host" || copied=$?
       if (( copied != 0 )); then
@@ -510,7 +514,16 @@ _archive_move_sidecar() {
   local src_host_path="$1"
   local dry_run="${2:-false}"
 
-  local base="${src_host_path%.*}"
+  # The extension is stripped from the FILE NAME, not from the whole path.
+  # `${src_host_path%.*}` cut at the last dot anywhere in the path, so an asset
+  # with no extension living under a directory that contains one — ".../v1/photo"
+  # — produced the base ".../v" and moved ".../v1.xmp", a file belonging to
+  # something else entirely, off to the external storage.
+  local folder base_name
+  folder=$(dirname "$src_host_path")
+  base_name=$(basename "$src_host_path")
+  local base="$folder/${base_name%.*}"
+
   local candidates=(
     "${src_host_path}.xmp"
     "${src_host_path}.json"
@@ -530,13 +543,25 @@ _archive_move_sidecar() {
     fi
 
     mkdir -p "$(dirname "$dst_sidecar")"
-    if cp "$sidecar" "$dst_sidecar" && stat "$dst_sidecar" &>/dev/null; then
-      # Same ownership constraint as the asset: remove the source via the container.
-      $DOCKER_CMD exec "$IMMICH_SERVER_CONTAINER" rm -f "$(host_path_to_db_path "$sidecar")" </dev/null \
-        || log_warn "Sidecar copied but could not remove source: $sidecar"
-    else
-      log_warn "Failed to move sidecar: $sidecar"
+    if ! cp -p "$sidecar" "$dst_sidecar"; then
+      log_warn "Failed to copy sidecar: $sidecar"
+      rm -f "$dst_sidecar"
+      continue
     fi
+    file_flush "$dst_sidecar"
+    # Held to the same standard as the asset: the source is only removed once the
+    # copy is proved identical. The previous test — does the destination exist —
+    # accepted a truncated file and then deleted the original.
+    local same=0
+    files_are_identical "$sidecar" "$dst_sidecar" || same=$?
+    if (( same != 0 )); then
+      log_warn "Sidecar copy does not match its source, source kept: $sidecar"
+      rm -f "$dst_sidecar"
+      continue
+    fi
+    # Same ownership constraint as the asset: remove the source via the container.
+    $DOCKER_CMD exec "$IMMICH_SERVER_CONTAINER" rm -f "$(host_path_to_db_path "$sidecar")" </dev/null \
+      || log_warn "Sidecar copied but could not remove source: $sidecar"
   done
 }
 
@@ -732,13 +757,13 @@ archive_run() {
 
   local freed_bytes=0
 
-  while IFS='|' read -r user_folder parent_dir folder_size; do
+  while IFS="$DB_FIELD_SEP" read -r user_folder parent_dir folder_size; do
     [[ -z "$user_folder" ]] && continue
 
     log_info "Candidate directory: $parent_dir (user: $user_folder, $(bytes_to_human "${folder_size:-0}"))"
 
     local dir_ok=0 dir_ko=0 dir_freed=0
-    while IFS='|' read -r asset_id original_path_db file_size; do
+    while IFS="$DB_FIELD_SEP" read -r asset_id original_path_db file_size; do
       [[ -z "$asset_id" ]] && continue
 
       local src_host

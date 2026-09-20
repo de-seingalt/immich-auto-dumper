@@ -434,7 +434,7 @@ _config_check() {
     mapfile -t _u <<< "$users_raw"
     for row in "${_u[@]}"; do
       [[ -z "$row" ]] && continue
-      IFS='|' read -r uid uname label <<< "$row"
+      IFS="$DB_FIELD_SEP" read -r uid uname label <<< "$row"
       [[ -z "$uid" ]] && continue
       key="${label:-$uid}"
       CFG_USER_NAME["$key"]="$uname"
@@ -962,7 +962,7 @@ _setup() {
       mapfile -t _libs <<< "$libs_raw"
       for lrow in "${_libs[@]}"; do
         [[ -z "$lrow" ]] && continue
-        IFS='|' read -r l_owner l_label l_path <<< "$lrow"
+        IFS="$DB_FIELD_SEP" read -r l_owner l_label l_path <<< "$lrow"
         [[ -z "$l_path" ]] && continue
         [[ "$l_path" != "${archive_container_path%/}"/* ]] && continue
         l_key="${l_label:-$l_owner}"
@@ -987,7 +987,7 @@ _setup() {
     local row uid name storage_label
     for row in "${_users[@]}"; do
       [[ -z "$row" ]] && continue
-      IFS='|' read -r uid name storage_label <<< "$row"
+      IFS="$DB_FIELD_SEP" read -r uid name storage_label <<< "$row"
       [[ -z "$uid" ]] && continue
       local key="${storage_label:-$uid}"
       user_name_by_key["$key"]="$name"

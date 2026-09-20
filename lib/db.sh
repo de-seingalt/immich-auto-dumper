@@ -24,10 +24,17 @@ set -euo pipefail
 # Returns 2, never a silently empty result, when the query could not run: the caller
 # must be able to tell "no rows" from "no database". Standard error is left to flow
 # through to the caller, which is where psql explains itself.
+# Column separator for multi-column results. psql's default under -A is '|', which
+# a file path is free to contain: a directory called "we|ird" split into three
+# fields, bash read a truncated parent directory and a size that was not a number,
+# and that directory was silently never archived. No path can hold \x01.
+DB_FIELD_SEP=$'\x01'
+
 _db_exec() {
   local out rc=0
   out=$($DOCKER_CMD exec -i "$IMMICH_DB_CONTAINER" psql \
-          -U "$IMMICH_DB_USER" -d "$IMMICH_DB_NAME" -t -A -c "$1" </dev/null) || rc=$?
+          -U "$IMMICH_DB_USER" -d "$IMMICH_DB_NAME" -t -A -F "$DB_FIELD_SEP" \
+          -c "$1" </dev/null) || rc=$?
   (( rc == 0 )) || return 2
   if [[ -n "$out" ]]; then
     printf '%s\n' "$out"

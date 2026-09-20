@@ -102,6 +102,13 @@ backup_db_run() {
   # window every time — which on a metered or write-back mount is the difference
   # between a few MB and a full GB, and avoids rewriting files the storage may still
   # be flushing from the previous run.
+  #
+  # Deliberately a size comparison and not a fingerprint, unlike everywhere else
+  # the tool decides two files are the same. Nothing is deleted on the strength of
+  # this answer — at worst a dump is re-copied — and a fingerprint would mean
+  # reading the entire retention window back from the remote every single run. What
+  # a fingerprint does guard is the copy we make ourselves, and that one is checked
+  # below, right after it is written.
   local copied=0 skipped=0
   for src in "${files[@]}"; do
     local filename src_size dst_size
@@ -119,7 +126,22 @@ backup_db_run() {
       log_warn "Re-copying $filename: size mismatch (local $src_size B, storage $dst_size B)"
     fi
 
-    cp "$src" "$dest_dir/$filename"
+    if ! cp -p "$src" "$dest_dir/$filename"; then
+      log_error "Failed to copy $filename to the external storage."
+      rm -f "$dest_dir/$filename"
+      continue
+    fi
+    # Same discipline as an archived photo: flush, then prove the copy is the
+    # dump before counting it as mirrored. A dump that is only nearly there is
+    # worse than an absent one — it looks like a safety net and is not.
+    file_flush "$dest_dir/$filename"
+    local same=0
+    files_are_identical "$src" "$dest_dir/$filename" || same=$?
+    if (( same != 0 )); then
+      log_error "The copy of $filename does not match the dump — removed, not counted as mirrored."
+      rm -f "$dest_dir/$filename"
+      continue
+    fi
     log_info "Backup copied: $filename"
     copied=$(( copied + 1 ))
   done

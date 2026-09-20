@@ -341,6 +341,22 @@ files_are_identical() {
   [[ "$ha" == "$hb" ]]
 }
 
+# Pushes a freshly written file out of the page cache before anything is verified
+# against it and, above all, before any source is deleted.
+#
+# When cp returns, the data may only be in memory. A size check then reports the
+# right number — it is reading that same cache — so the copy looks complete and
+# the source gets deleted; a power cut in between would leave a truncated file
+# and no original. `sync -d` flushes just this file where that is supported,
+# otherwise the whole filesystem, which is slower but never wrong.
+#
+# Honest limit: on an rclone mount this does not guarantee the remote upload has
+# finished. It closes the window fully on a local disk, a USB drive or a mounted
+# NAS; on a write-back cloud mount it only narrows it.
+file_flush() {
+  sync -d -- "$1" 2>/dev/null || sync 2>/dev/null || true
+}
+
 # ── Disk ──────────────────────────────────────────────────────────────────────
 
 # Apparent size (sum of file sizes) of a directory, in bytes. 0 if absent/unreadable.
