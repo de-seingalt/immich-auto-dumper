@@ -49,6 +49,19 @@ Curious how it works under the hood? Read the [technical documentation](docs/TEC
 
 - Linux with Immich deployed via **Docker Compose** (Ubuntu 22.04+ / Debian 12+ tested),
   and your user in the `docker` group.
+- **A tested Immich version.** Because the tool talks to Immich's database directly, it is
+  verified against specific releases rather than assumed to work with any of them:
+
+  | Immich | Status |
+  |---|---|
+  | **v3.2.0** | Tested end to end (September 2026) — schema check, archiving, library adoption, DB-dump mirroring. |
+  | **v2.7.5** | Tested end to end. |
+
+  Versions in between are expected to work — no schema change affecting the columns the
+  tool relies on was introduced — but have not been exercised. Whatever your version,
+  run `immich-auto-dumper test_run` after every Immich upgrade before re-enabling the
+  scheduled jobs; it changes nothing and tells you immediately if the database no longer
+  matches what the tool expects.
 - External storage **mounted on the host and into the Immich server container**, and
   registered in Immich as an **external library** — the setup wizard walks you through
   every step of this.
