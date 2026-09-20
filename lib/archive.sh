@@ -35,8 +35,9 @@ archive_build_dest_path() {
 # ── File move helpers ─────────────────────────────────────────────────────────
 
 # Moves one asset file to external storage and updates its DB path.
-# If destination already exists with the same size, treats it as already archived
-# (updates DB + removes source, no copy). If sizes differ, logs error and returns 1.
+# If the destination already holds a byte-for-byte copy of the source, treats it as
+# already archived (updates DB + removes source, no copy). Anything else — different
+# content, or content that cannot be read — skips the asset and keeps the source.
 # Returns 0 on success, 1 on any unrecoverable error.
 _archive_move_file() {
   local asset_id="$1"
@@ -51,17 +52,32 @@ _archive_move_file() {
   local already_archived=false
 
   if [[ -e "$dst_host" ]]; then
-    local src_size dst_size
-    src_size=$(stat --format='%s' "$src_host_path" 2>/dev/null || echo 0)
-    dst_size=$(stat --format='%s' "$dst_host" 2>/dev/null || echo 0)
-
-    if [[ "$src_size" == "$dst_size" ]]; then
-      log_warn "Already at destination (same size): $dst_host — updating DB only."
-      already_archived=true
-    else
-      log_error "Conflict: destination exists with different size: $dst_host (src=${src_size}B dst=${dst_size}B)"
-      return 1
-    fi
+    # Concluding "already archived" here means skipping the copy, pointing the DB at
+    # this file and deleting the source. Size equality was the proof, and it is not
+    # one: a foreign file of the same byte count was accepted, and the original photo
+    # was deleted in favour of it. Only a matching fingerprint earns that conclusion.
+    #
+    # The call must not be bare: files_are_identical returns 1 or 2 for the cases we
+    # handle, and under `set -e` a bare call would abort the whole run instead.
+    local identical=0
+    files_are_identical "$src_host_path" "$dst_host" || identical=$?
+    case $identical in
+      0)
+        log_warn "Already at destination, identity verified: $dst_host — updating DB only."
+        already_archived=true
+        ;;
+      1)
+        log_error "Destination exists with DIFFERENT content: $dst_host"
+        log_error "Another file already occupies that path — asset skipped, source kept."
+        log_error "Two users mapped to the same folder in USER_MAP is the usual cause."
+        return 1
+        ;;
+      *)
+        log_error "Cannot compare source and destination: $dst_host — asset skipped, source kept."
+        log_error "One of the two files is unreadable; the storage may be down."
+        return 1
+        ;;
+    esac
   fi
 
   if "$dry_run"; then
@@ -200,6 +216,13 @@ archive_run() {
     case "$arg" in
       --dry-run) dry_run=true ;;
       --force)   force=true ;;
+      # An argument this function does not understand used to be dropped in silence.
+      # `dump_now --force --dryrun` therefore archived for real — the exact opposite
+      # of what the flag was typed for. Refuse rather than guess.
+      *)
+        log_error "Unknown argument for the archive run: '$arg' — nothing was done."
+        return 1
+        ;;
     esac
   done
 

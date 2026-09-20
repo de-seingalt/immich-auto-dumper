@@ -3,7 +3,36 @@ set -euo pipefail
 
 backup_db_run() {
   local dry_run=false
-  [[ "${1:-}" == "--dry-run" ]] && dry_run=true
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --dry-run) dry_run=true ;;
+      # Same reasoning as archive_run: a flag that is not recognised is a typo, and
+      # the previous test (only ever comparing $1 to --dry-run) turned a misspelled
+      # "--dryrun" into a real run.
+      *)
+        log_error "Unknown argument for the backup run: '$arg' — nothing was done."
+        return 1
+        ;;
+    esac
+  done
+
+  # Retention decides how many mirrored dumps survive the run, so an unusable value
+  # is checked BEFORE anything is copied — and before the dry run reports on a
+  # policy it could not apply. An empty or zero value deleted every dump on the
+  # external storage and logged it at INFO, which a cron mail reads as a success;
+  # a non-numeric one crashed mid-rotation. This value is also re-read from disk
+  # between runs, so validating it at load time alone would not cover a hand edit.
+  #
+  # Refusing the whole run is deliberate. Copying while the rotation is broken piles
+  # dumps up for ever, and an invalid retention means the configuration needs fixing,
+  # not that a default should quietly stand in for it.
+  local retention="${BACKUP_RETENTION:-}"
+  if ! [[ "$retention" =~ ^[1-9][0-9]*$ ]]; then
+    log_error "BACKUP_RETENTION must be a whole number of dumps to keep, 1 or more (found '${retention}')."
+    log_error "Nothing was copied or deleted. Fix it in config.conf — run: immich-auto-dumper setup"
+    return 1
+  fi
 
   check_prereqs
 
@@ -47,7 +76,7 @@ backup_db_run() {
         log_info "DRY-RUN: would copy $dr_name → $dest_dir/"
       fi
     done
-    log_info "DRY-RUN: would apply retention policy (keep $BACKUP_RETENTION database archive files)"
+    log_info "DRY-RUN: would apply retention policy (keep $retention database archive files)"
     return 0
   fi
 
@@ -107,8 +136,8 @@ backup_db_run() {
   done < <(find "$dest_dir" -maxdepth 1 -type f ! -name '.*' -print0 | LC_ALL=C sort -z)
 
   local count=${#all_backups[@]}
-  if (( count > BACKUP_RETENTION )); then
-    local to_delete=$(( count - BACKUP_RETENTION ))
+  if (( count > retention )); then
+    local to_delete=$(( count - retention ))
     # Oldest first after the sort: delete the head, keep the tail.
     for (( i = 0; i < to_delete; i++ )); do
       log_info "Rotation: removing $(basename "${all_backups[$i]}")"

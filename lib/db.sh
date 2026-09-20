@@ -133,7 +133,9 @@ db_immich_backup_keep_last() {
   local v
   v=$(_db_exec "SELECT \"value\" #>> '{backup,database,keepLastAmount}'
                 FROM \"system_metadata\" WHERE \"key\" = 'system-config';" 2>/dev/null | head -1 || true)
-  [[ "$v" =~ ^[0-9]+$ ]] && printf '%s\n' "$v"
+  # 1 or more, not 0: `^[0-9]+$` let a zero through, and a suggested retention of 0
+  # written into config.conf makes every mirroring run delete all of its own dumps.
+  [[ "$v" =~ ^[1-9][0-9]*$ ]] && printf '%s\n' "$v"
   return 0
 }
 

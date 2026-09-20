@@ -347,6 +347,22 @@ _config_check() {
         CFG_PROBLEMS+=("USER_MAP[\"$mk\"]=\"${USER_MAP[$mk]}\" has a stray slash: archived paths would contain a double slash Immich cannot match. It should be \"${clean}\".")
       fi
     done
+
+    # Two users pointed at one folder archive into the same tree, where a single
+    # relative path names two different photos. The tool now refuses such an asset
+    # instead of destroying it, but the run stalls on every collision — so say so
+    # here, where it can still be fixed. A config hand-edited after setup, or written
+    # by a version without the wizard's guard, is how this state is reached.
+    local key_a key_b
+    local -a seen_keys=("${!USER_MAP[@]}")
+    local i j
+    for (( i = 0; i < ${#seen_keys[@]}; i++ )); do
+      for (( j = i + 1; j < ${#seen_keys[@]}; j++ )); do
+        key_a="${seen_keys[$i]}"; key_b="${seen_keys[$j]}"
+        [[ "${USER_MAP[$key_a]}" == "${USER_MAP[$key_b]}" ]] || continue
+        CFG_PROBLEMS+=("USER_MAP sends two users to the same folder \"${USER_MAP[$key_a]}\" (keys '$key_a' and '$key_b'): their photos would collide on identical paths. Give each user its own folder.")
+      done
+    done
   fi
 
   if [[ -n "${IMMICH_UPLOAD_LOCATION:-}" && ! -d "${IMMICH_UPLOAD_LOCATION}/library" ]]; then
@@ -473,7 +489,11 @@ _config_default_for() {
     BACKUP_RETENTION)
       local keep=""
       probe_docker_cmd 2>/dev/null && _db_reachable && keep=$(db_immich_backup_keep_last)
-      printf '%s' "${keep:-14}"
+      # `${keep:-14}` only substitutes for an EMPTY value, so a "0" coming back from
+      # Immich would have been written into config.conf as if it were advice — and a
+      # retention of 0 deletes every mirrored dump. Validate, never just default.
+      [[ "$keep" =~ ^[1-9][0-9]*$ ]] || keep=14
+      printf '%s' "$keep"
       ;;
     LOG_DIR)       printf '%s' "${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper" ;;
     LOG_MAX_LINES) printf '1000' ;;
@@ -963,11 +983,30 @@ _setup() {
           "Sub-folder name on the external library for this user's archived photos.\n\nUser        : $name\nstorageLabel: ${storage_label:-<empty>}${detected_note}${tree_note}" \
           "$default_folder" || { ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."; return 0; }
         folder_answer=$(_sanitize_folder "$UI_VALUE")
-        [[ -n "$folder_answer" ]] && break
-        # An empty folder would archive straight into the root of the external library,
-        # mixing every user's photos together and leaving no per-user path to register
-        # in Immich.
-        ui_info "Folder required" "Enter a sub-folder name for $name's archived photos — it cannot be empty."
+        if [[ -z "$folder_answer" ]]; then
+          # An empty folder would archive straight into the root of the external
+          # library, mixing every user's photos together and leaving no per-user path
+          # to register in Immich.
+          ui_info "Folder required" "Enter a sub-folder name for $name's archived photos — it cannot be empty."
+          continue
+        fi
+        # Two users sharing one folder merge their two libraries into it, and the
+        # same relative path below it then names two different photos. The second
+        # one archived finds the first already at its destination — the collision
+        # that used to be read as "already archived" and cost the original photo.
+        local clash="" taken_key
+        if [[ -n "${new_user_map[*]+x}" ]]; then
+          for taken_key in "${!new_user_map[@]}"; do
+            [[ "${new_user_map[$taken_key]}" == "$folder_answer" ]] || continue
+            clash="${user_name_by_key[$taken_key]:-$taken_key}"
+            break
+          done
+        fi
+        if [[ -n "$clash" ]]; then
+          ui_info "Folder already taken" "'$folder_answer' is already the archive folder for $clash.\n\nTwo users cannot share one folder: their photos would land on the same paths, and one would overwrite the other.\n\nChoose a different folder for $name."
+          continue
+        fi
+        break
       done
       new_user_map["$key"]="$folder_answer"
       # Remember the real archive path for this user (name + destination folder),
@@ -1322,6 +1361,18 @@ main() {
     case "$arg" in
       --dry-run) dry_run=true ;;
       --force)   force=true ;;
+      # Belongs to `uninstall`, which hands it straight to uninstall.sh. Listed so
+      # the guard below does not reject it.
+      -y|--yes)  args+=("$arg") ;;
+      # A flag that is not recognised was collected as a command argument and then
+      # ignored. `dump_now --force --dryrun` consequently archived for real, with no
+      # DRY-RUN prefix anywhere in its output — the one typo the flag exists to
+      # protect against. A misspelled safety flag must stop the run, not start it.
+      -*)
+        printf 'Unknown option: %s\n\n' "$arg" >&2
+        _usage >&2
+        exit 1
+        ;;
       *)         args+=("$arg") ;;
     esac
   done
