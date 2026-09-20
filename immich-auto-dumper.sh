@@ -8,21 +8,25 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/config.conf"
 
 source "$SCRIPT_DIR/lib/utils.sh"
+source "$SCRIPT_DIR/lib/config.sh"
 source "$SCRIPT_DIR/lib/ui.sh"
 source "$SCRIPT_DIR/lib/detect.sh"
 source "$SCRIPT_DIR/lib/db.sh"
 source "$SCRIPT_DIR/lib/backup_db.sh"
 source "$SCRIPT_DIR/lib/archive.sh"
 
-if [[ -f "$CONFIG_FILE" ]]; then
-  # shellcheck source=/dev/null
-  source "$CONFIG_FILE"
-fi
+# USER_MAP belongs to the tool, not to the file: the loader fills it, and declaring
+# it here means `${USER_MAP[x]:-...}` lookups never trip set -u even when the config
+# maps nobody.
+declare -A USER_MAP=()
 
-# Ensure USER_MAP exists even if a hand-edited config dropped its declaration, so
-# `${USER_MAP[x]:-...}` lookups don't trip set -u. Declaring an existing assoc array
-# does not clear it.
-declare -A USER_MAP 2>/dev/null || true
+# config.conf is READ, never executed — see lib/config.sh for why that matters.
+# A file that cannot be read leaves CONFIG_LOADED false; every command other than
+# setup and uninstall then refuses to run rather than act on half a configuration.
+CONFIG_LOADED=true
+if [[ -f "$CONFIG_FILE" ]]; then
+  config_load "$CONFIG_FILE" || CONFIG_LOADED=false
+fi
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -269,13 +273,8 @@ _cfg_target_mb() {
 # it back, and only then offers to reconfigure — so the user can see where they
 # stand instead of redoing everything "just in case".
 
-# Settings only the wizard can answer: they identify this specific Immich install.
-# A config missing one of these is broken, not merely old.
-_CFG_ESSENTIAL_KEYS=(
-  IMMICH_UPLOAD_LOCATION IMMICH_DB_LIBRARY_PREFIX IMMICH_DB_CONTAINER
-  IMMICH_SERVER_CONTAINER IMMICH_DB_NAME IMMICH_DB_USER
-  ARCHIVE_DEST_PATH ARCHIVE_CONTAINER_PATH ARCHIVE_STORAGE_ID
-)
+# _CFG_ESSENTIAL_KEYS lives in lib/config.sh, next to the loader that enforces it.
+#
 # Settings with a safe default, so a config written by an older version — which
 # simply did not know about them — can be topped up in place instead of redone.
 _CFG_BACKFILL_KEYS=(ARCHIVE_MIN_FREE_MB BACKUP_RETENTION LOG_DIR LOG_MAX_LINES)
@@ -303,7 +302,14 @@ _user_map_count() {
 # Every live check is best-effort: docker or the DB being unreachable downgrades the
 # verdict to a note, it never invents a problem. Always returns 0.
 _config_check() {
-  CFG_PROBLEMS=(); CFG_OUTDATED=(); CFG_NOTES=(); CFG_USER_NAME=()
+  # Whatever the loader refused is a config problem like any other, and belongs on
+  # the same screen — the log alone is not where someone running setup looks.
+  CFG_PROBLEMS=("${CFG_LOAD_PROBLEMS[@]}")
+  CFG_OUTDATED=(); CFG_NOTES=(); CFG_USER_NAME=()
+
+  if "$CFG_LEGACY_USER_MAP"; then
+    CFG_NOTES+=("The user mapping still uses the old 'declare -A USER_MAP' form. It is read correctly; finishing this setup rewrites it in the current format.")
+  fi
 
   local k
   for k in "${_CFG_ESSENTIAL_KEYS[@]}"; do
@@ -1061,9 +1067,11 @@ _setup() {
     return 0
   fi
 
-  local user_map_block="declare -A USER_MAP"$'\n'
+  # One line per user, no array declaration: config.conf is read, not executed,
+  # and `declare -A` was the last thing in it that needed a shell to make sense.
+  local user_map_block=""
   for k in "${!new_user_map[@]}"; do
-    user_map_block+="USER_MAP[\"${k}\"]=\"${new_user_map[$k]}\""$'\n'
+    user_map_block+="USER_MAP.${k}=${new_user_map[$k]}"$'\n'
   done
 
   cat > "$CONFIG_FILE" <<CONF
@@ -1382,6 +1390,14 @@ main() {
   # setup creates the config; uninstall must work even when no config exists.
   if [[ "$cmd" != "setup" && "$cmd" != "uninstall" && -n "$cmd" ]]; then
     _require_config
+    # Acting on a configuration that could not be read whole is how a run reported
+    # success while doing nothing. setup and uninstall stay reachable, since those
+    # are what a broken config needs.
+    if ! "$CONFIG_LOADED"; then
+      printf 'Error: config.conf could not be read (see the errors above).\n' >&2
+      printf 'Fix those lines, or run: immich-auto-dumper setup\n' >&2
+      exit 1
+    fi
   fi
 
   local dry_flag=()

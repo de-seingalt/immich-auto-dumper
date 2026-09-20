@@ -1,6 +1,13 @@
 # immich-auto-dumper — configuration
 # Copy this file to config.conf and fill in the values,
 # or use: immich-auto-dumper setup
+#
+# This file is READ, not executed. A value is taken exactly as written: no command
+# substitution, no variable expansion, no shell syntax of any kind. Surrounding
+# quotes are optional and simply stripped. The two exceptions, substituted as
+# plain text in path settings, are a leading "~/" and a leading "$HOME/".
+# Any setting not listed below is rejected by name, as is a value the setting
+# cannot hold — the tool refuses to run rather than act on half a configuration.
 
 # --- Immich ---
 IMMICH_UPLOAD_LOCATION="/path/to/immich/upload"  # Host path to UPLOAD_LOCATION
@@ -52,14 +59,20 @@ ARCHIVE_MIN_FREE_MB=10240           # e.g. 10 GiB
 BACKUP_RETENTION=14                # Number of dumps kept on the external storage
 
 # --- User → external folder mapping ---
-# Generated automatically by "setup"; can be edited manually.
-# Key: storageLabel (or UUID if storageLabel is empty).
-declare -A USER_MAP
-# USER_MAP["alice"]="Alice"
-# USER_MAP["bob"]="Bob"
+# One line per user, generated automatically by "setup"; can be edited manually.
+# The part after "USER_MAP." is the key: storageLabel, or the user's UUID when
+# storageLabel is empty. The value is a folder inside the external library, and
+# two users must never be given the same one.
+# USER_MAP.alice=Alice
+# USER_MAP.bob=Bob
+#
+# Configs written by earlier versions carry `declare -A USER_MAP` followed by
+# USER_MAP["alice"]="Alice" lines. Those are still read; setup rewrites them in
+# the form above the next time it runs.
 
 # --- Logs ---
-# Must be writable by the user running the tool (no sudo). Defaults to the XDG
-# state dir when unset.
-LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper"
+# Must be writable by the user running the tool (no sudo). An absolute path, or
+# one starting with ~/ — nothing here is expanded by a shell. Defaults to
+# $XDG_STATE_HOME/immich-auto-dumper (or ~/.local/state/…) when unset.
+LOG_DIR=~/.local/state/immich-auto-dumper
 LOG_MAX_LINES=1000

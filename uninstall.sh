@@ -34,11 +34,19 @@ assume_yes=false
 
 # Resolve LOG_DIR from the real config if present, else the XDG default — matches
 # the default used by lib/utils.sh and config.conf.example.
+#
+# The one value needed here is read out of the file, never executed. Sourcing it
+# ran whatever it contained BEFORE the confirmation prompt below — so a config
+# holding a command line executed it even when the answer was going to be "no".
 LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper"
 if [[ -f "$INSTALL_DIR/config.conf" ]]; then
-  # shellcheck source=/dev/null
-  cfg_log_dir="$(source "$INSTALL_DIR/config.conf" 2>/dev/null; printf '%s' "${LOG_DIR:-}")"
-  [[ -n "$cfg_log_dir" ]] && LOG_DIR="$cfg_log_dir"
+  cfg_log_dir="$(sed -n 's/^[[:space:]]*LOG_DIR[[:space:]]*=[[:space:]]*//p' \
+                   "$INSTALL_DIR/config.conf" 2>/dev/null | tail -1)"
+  cfg_log_dir="${cfg_log_dir%\"}"; cfg_log_dir="${cfg_log_dir#\"}"
+  cfg_log_dir="${cfg_log_dir%\'}"; cfg_log_dir="${cfg_log_dir#\'}"
+  [[ "$cfg_log_dir" == '~/'* ]] && cfg_log_dir="${HOME}${cfg_log_dir#\~}"
+  # Only an absolute path is usable, and only an absolute path is safe to rm -rf.
+  [[ "$cfg_log_dir" == /* ]] && LOG_DIR="$cfg_log_dir"
 fi
 
 # The lock is a directory beside the logs (see lib/utils.sh): removing LOG_DIR
