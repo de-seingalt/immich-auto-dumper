@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly LOCK_FILE="/tmp/immich-auto-dumper.lock"
+# Lock path used by versions up to and including the file-based lock. Removed on
+# the first run of the new directory lock so it does not linger in /tmp forever.
+readonly LEGACY_LOCK_FILE="/tmp/immich-auto-dumper.lock"
 
 # Docker command used throughout. This tool runs strictly as the invoking user and
 # never escalates privileges (no sudo): it is a matter of trust for its users.
@@ -94,8 +96,9 @@ check_prereqs() {
 
   local missing=()
   # Runtime dependencies actually used by the scripts (jq/curl were only needed
-  # by the removed Immich API integration). bc is used for byte arithmetic.
-  for cmd in bc; do
+  # by the removed Immich API integration). bc is used for byte arithmetic,
+  # sha256sum to prove two files are the same before deleting either of them.
+  for cmd in bc sha256sum; do
     if ! command -v "$cmd" &>/dev/null; then
       missing+=("$cmd")
     fi
@@ -233,6 +236,39 @@ disable_cron() {
   return 1
 }
 
+# ── File identity ─────────────────────────────────────────────────────────────
+#
+# Whenever the tool concludes that two files are "the same" it is about to delete
+# one of them, so the conclusion has to be earned. Size equality is not: a foreign
+# file that happened to match the source byte count was accepted as an already
+# archived copy, the DB was pointed at it and the original photo deleted.
+#
+# The cost is real — on a remote mount this reads the whole file back — and it is
+# the price of the guarantee. The alternative was measured, and it destroys photos.
+
+# Echoes the SHA-256 of <file>, or fails (1) if it cannot be computed. Never
+# echoes an empty digest: callers must be able to trust a successful return.
+file_fingerprint() {
+  local f="$1" h
+  h=$(sha256sum -- "$f" 2>/dev/null | cut -d' ' -f1) || return 1
+  [[ -n "$h" ]] || return 1
+  printf '%s' "$h"
+}
+
+# 0 if <a> and <b> are byte-for-byte identical, 1 if they differ, 2 if it cannot
+# be determined (unreadable file, dead mount, timeout).
+#
+# The third code is the whole point. The defect this replaces compared two `stat`
+# calls that had BOTH failed, read 0 == 0, and concluded "identical". An unknown
+# must never collapse into a yes; callers are expected to handle 2 as "do not
+# touch anything".
+files_are_identical() {
+  local a="$1" b="$2" ha hb
+  ha=$(file_fingerprint "$a") || return 2
+  hb=$(file_fingerprint "$b") || return 2
+  [[ "$ha" == "$hb" ]]
+}
+
 # ── Disk ──────────────────────────────────────────────────────────────────────
 
 # Apparent size (sum of file sizes) of a directory, in bytes. 0 if absent/unreadable.
@@ -287,23 +323,116 @@ bytes_to_human() {
 }
 
 # ── Lock ──────────────────────────────────────────────────────────────────────
+#
+# Two runs must never overlap: they rewrite the same DB rows and copy to the same
+# destination. The previous lock tested for a file and then created it, and that
+# gap was wide enough to walk through — two simultaneous forced dumps both started
+# in one attempt out of five.
+#
+# `mkdir` closes it: the kernel either creates the directory or fails, with
+# nothing in between, and it does not follow a symlink planted at the path.
+# `flock` would do as well, but this tool restricts itself to tools present
+# everywhere, and mkdir is as universal as it gets.
+
+# The lock lives beside the logs, NOT under $XDG_RUNTIME_DIR: cron runs have no
+# runtime dir, so keying the path on it would give the nightly run and a manual
+# one two different locks — i.e. no mutual exclusion in exactly the case that
+# matters. LOG_DIR is configured, stable and the same in both contexts.
+lock_dir_path() {
+  printf '%s/immich-auto-dumper.lock.d\n' \
+    "${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper}"
+}
+
+# Identifies the boot the recorded PID belongs to. A lock directory on persistent
+# storage survives a reboot, after which that PID may well be alive again as an
+# unrelated process — which would jam every subsequent run with a bogus "already
+# running". Empty when unavailable, in which case the check is simply skipped.
+_boot_id() {
+  cat /proc/sys/kernel/random/boot_id 2>/dev/null || true
+}
+
+# True when the recorded holder is still running, from this boot.
+_lock_holder_alive() {
+  local dir="$1" pid="$2"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  local recorded now
+  recorded=$(cat -- "$dir/boot" 2>/dev/null || true)
+  now=$(_boot_id)
+  [[ -z "$recorded" || -z "$now" || "$recorded" == "$now" ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+# Echoes "active <pid>", "stale <pid>" or "inactive". Read-only: used by status
+# and stop, which must report on the lock without ever taking it.
+lock_state() {
+  local dir
+  dir=$(lock_dir_path)
+  [[ -d "$dir" ]] || { printf 'inactive\n'; return 0; }
+  local pid
+  pid=$(cat -- "$dir/pid" 2>/dev/null || true)
+  if _lock_holder_alive "$dir" "$pid"; then
+    printf 'active %s\n' "$pid"
+  else
+    printf 'stale %s\n' "${pid:-unknown}"
+  fi
+}
 
 acquire_lock() {
-  if [[ -f "$LOCK_FILE" ]]; then
+  local dir
+  dir=$(lock_dir_path)
+  mkdir -p -- "$(dirname -- "$dir")" 2>/dev/null || true
+
+  local attempt
+  for attempt in 1 2; do
+    if mkdir -- "$dir" 2>/dev/null; then
+      printf '%d\n' "$$" > "$dir/pid"
+      _boot_id > "$dir/boot" 2>/dev/null || true
+      # Release on interruption too — nothing used to, so a Ctrl-C left a lock
+      # that only the next run's staleness check would clear.
+      trap 'release_lock' EXIT
+      trap 'release_lock; exit 130' INT TERM
+      rm -f -- "$LEGACY_LOCK_FILE" 2>/dev/null || true
+      return 0
+    fi
+
+    # Someone holds it. The holder writes its PID just after mkdir, so an absent
+    # PID file most often means "a run that started microseconds ago" — the very
+    # case this rewrite exists to serialise. Give it a moment to appear before
+    # declaring the lock orphaned, or two simultaneous starts would each decide
+    # the other's fresh lock was stale.
     local pid
-    pid=$(cat "$LOCK_FILE")
-    if kill -0 "$pid" 2>/dev/null; then
+    pid=$(cat -- "$dir/pid" 2>/dev/null || true)
+    if [[ -z "$pid" ]]; then
+      sleep 1
+      pid=$(cat -- "$dir/pid" 2>/dev/null || true)
+    fi
+
+    if _lock_holder_alive "$dir" "$pid"; then
       log_warn "Another operation is already running (PID $pid)."
       return 1
     fi
-    # Stale lock — clean it up
-    log_warn "Stale lock found (PID $pid), removing."
-    rm -f "$LOCK_FILE"
-  fi
 
-  printf '%d\n' "$$" > "$LOCK_FILE"
+    # Orphaned. Claim it by renaming: rename() succeeds for exactly one process,
+    # so a loser can never delete the fresh lock the winner just created — which
+    # a plain `rm -rf` here would let it do.
+    log_warn "Stale lock found (PID ${pid:-unknown}), removing."
+    local doomed="$dir.stale.$$"
+    if mv -- "$dir" "$doomed" 2>/dev/null; then
+      rm -rf -- "$doomed"
+    fi
+  done
+
+  log_warn "Could not acquire the lock at $dir."
+  return 1
 }
 
+# Removes the lock only if we are the process holding it. Idempotent, so the
+# explicit call and the EXIT trap can both run.
 release_lock() {
-  rm -f "$LOCK_FILE"
+  local dir
+  dir=$(lock_dir_path)
+  local pid
+  pid=$(cat -- "$dir/pid" 2>/dev/null || true)
+  [[ "$pid" == "$$" ]] || return 0
+  rm -rf -- "$dir"
 }

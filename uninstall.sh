@@ -25,7 +25,9 @@ fi
 INSTALL_DIR="${INSTALL_DIR:?relocation failed: INSTALL_DIR unset}"
 TMP_SELF="${TMP_SELF:-}"
 BIN_LINK="${HOME}/.local/bin/immich-auto-dumper"
-LOCK_FILE="/tmp/immich-auto-dumper.lock"
+# Lock path used by versions up to and including the file-based lock. Still
+# removed here so an upgrade-then-uninstall leaves nothing behind in /tmp.
+LEGACY_LOCK_FILE="/tmp/immich-auto-dumper.lock"
 
 assume_yes=false
 [[ "${1:-}" == "-y" || "${1:-}" == "--yes" ]] && assume_yes=true
@@ -39,12 +41,16 @@ if [[ -f "$INSTALL_DIR/config.conf" ]]; then
   [[ -n "$cfg_log_dir" ]] && LOG_DIR="$cfg_log_dir"
 fi
 
+# The lock is a directory beside the logs (see lib/utils.sh): removing LOG_DIR
+# takes it with it, but it is listed so the user sees everything that goes.
+LOCK_DIR="$LOG_DIR/immich-auto-dumper.lock.d"
+
 printf 'This will remove immich-auto-dumper from your system:\n'
 printf '  - symlink     : %s\n' "$BIN_LINK"
 printf '  - install dir : %s  (includes config.conf)\n' "$INSTALL_DIR"
 printf '  - cron entries: lines matching "immich-auto-dumper"\n'
 printf '  - logs        : %s\n' "$LOG_DIR"
-printf '  - lock file   : %s\n' "$LOCK_FILE"
+printf '  - lock        : %s\n' "$LOCK_DIR"
 printf '\n'
 printf 'It will NOT touch Immich (database, assets, containers) nor anything on the\n'
 printf 'external storage (.immich-auto-dumper.id, .immich-backup/, archived photos).\n'
@@ -88,8 +94,9 @@ if [[ -d "$LOG_DIR" ]]; then
   echo "Removed logs: $LOG_DIR"
 fi
 
-# 4. Remove the lock file.
-rm -f -- "$LOCK_FILE"
+# 4. Remove the lock, plus the file-based one older versions left in /tmp.
+rm -rf -- "$LOCK_DIR"
+rm -f -- "$LEGACY_LOCK_FILE"
 
 # 5. Remove the install directory last (safe now that we run from a temp copy).
 if [[ -d "$INSTALL_DIR" ]]; then

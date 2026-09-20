@@ -1231,17 +1231,13 @@ _status() {
     printf 'Last DB backup       : log file absent\n'
   fi
 
-  if [[ -f "$LOCK_FILE" ]]; then
-    local pid
-    pid=$(cat "$LOCK_FILE")
-    if kill -0 "$pid" 2>/dev/null; then
-      printf 'Lock                 : active (PID %s)\n' "$pid"
-    else
-      printf 'Lock                 : stale (PID %s dead)\n' "$pid"
-    fi
-  else
-    printf 'Lock                 : inactive\n'
-  fi
+  local lock_info
+  lock_info=$(lock_state)
+  case "${lock_info%% *}" in
+    active) printf 'Lock                 : active (PID %s)\n' "${lock_info#* }" ;;
+    stale)  printf 'Lock                 : stale (PID %s dead)\n' "${lock_info#* }" ;;
+    *)      printf 'Lock                 : inactive\n' ;;
+  esac
 }
 
 # ── start ─────────────────────────────────────────────────────────────────────
@@ -1296,21 +1292,20 @@ _stop() {
     echo "No immich-auto-dumper entries in crontab."
   fi
 
-  if [[ -f "$LOCK_FILE" ]]; then
-    local pid
-    pid=$(cat "$LOCK_FILE")
-    if kill -0 "$pid" 2>/dev/null; then
-      echo "Operation in progress (PID $pid), waiting (max 60s)..."
-      local elapsed=0
-      while [[ -f "$LOCK_FILE" ]] && kill -0 "$pid" 2>/dev/null && (( elapsed < 60 )); do
-        sleep 2
-        elapsed=$(( elapsed + 2 ))
-      done
-      if kill -0 "$pid" 2>/dev/null; then
-        echo "Warning: operation still running after 60s." >&2
-      else
-        echo "Operation finished."
-      fi
+  local lock_info
+  lock_info=$(lock_state)
+  if [[ "${lock_info%% *}" == "active" ]]; then
+    local pid="${lock_info#* }"
+    echo "Operation in progress (PID $pid), waiting (max 60s)..."
+    local elapsed=0
+    while [[ "$(lock_state)" == "active $pid" ]] && (( elapsed < 60 )); do
+      sleep 2
+      elapsed=$(( elapsed + 2 ))
+    done
+    if [[ "$(lock_state)" == "active $pid" ]]; then
+      echo "Warning: operation still running after 60s." >&2
+    else
+      echo "Operation finished."
     fi
   fi
 }

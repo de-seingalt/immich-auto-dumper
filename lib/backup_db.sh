@@ -51,6 +51,13 @@ backup_db_run() {
     return 0
   fi
 
+  # Mirroring took no lock at all, so two overlapping `sync_now` could run `cp`
+  # onto the same destination file and rotate the same directory underneath each
+  # other. The dry run above needs none — it writes nothing.
+  if ! acquire_lock; then
+    return 0
+  fi
+
   mkdir -p "$dest_dir"
 
   # Dumps are immutable and their name carries their timestamp, so a destination file
@@ -120,6 +127,8 @@ backup_db_run() {
     size=$(stat --format='%s' "$f")
     total_bytes=$(( total_bytes + size ))
   done
+
+  release_lock
 
   log_info "DB backup: ${#kept[@]} file(s) retained, $(bytes_to_human "$total_bytes") total."
 }
