@@ -70,6 +70,26 @@ _cfg_reject() {
 config_set() {
   local key="$1" value="$2" line="$3"
 
+  # An empty name is not merely an unknown setting. `_CFG_SEEN[""]` is not a
+  # valid subscript for an associative array, and under this file's `set -e` that
+  # assignment killed config_load where it stood — taking the whole tool with it,
+  # since the configuration is loaded at source time. A single line starting with
+  # "=" made every command die on a raw bash error, `setup` and `uninstall`
+  # included: the two a broken configuration is supposed to leave reachable.
+  if [[ -z "$key" ]]; then
+    _cfg_reject "$line" "a setting name is missing before the '='."
+    return 1
+  fi
+
+  # "Last one wins" is a reasonable convention and refusing would break
+  # configurations that work today, so this is a warning and not a rejection. But
+  # it must be said: _config_backfill appends to the end of the file, which makes
+  # this precisely a place where a second assignment turns up, and
+  # BACKUP_RETENTION=3 followed by BACKUP_RETENTION=99 used to give 99 in silence.
+  if [[ -n "${_CFG_SEEN[$key]:-}" ]]; then
+    log_warn "config.conf:$line — $key is set more than once; this later value ('${value}') wins over the earlier one."
+  fi
+
   # Recorded before validation, so a setting the file DID name but named badly is
   # reported as invalid and not, on top of that, as missing. An unrecognised key
   # is never an essential one, so it cannot mask a genuine absence.
@@ -181,6 +201,14 @@ config_load() {
   # `|| [[ -n "$raw" ]]` so a final line without a trailing newline is still read.
   while IFS= read -r raw || [[ -n "$raw" ]]; do
     n=$(( n + 1 ))
+    # A UTF-8 byte-order mark belongs to the file, not to the first setting. It
+    # is invisible, so the refusal it caused sent people looking in the wrong
+    # place entirely: "unknown setting 'IMMICH_UPLOAD_LOCATION'" followed by
+    # "IMMICH_UPLOAD_LOCATION is missing". Removed as punctuation, never
+    # interpreted — the same treatment already given to surrounding quotes. Only
+    # on the first line: anywhere else those bytes are part of a real name, and
+    # an unknown setting is exactly what they are.
+    (( n == 1 )) && raw="${raw#$'\xEF\xBB\xBF'}"
     line=$(_cfg_trim "$raw")
     [[ -z "$line" ]] && continue
     [[ "$line" == \#* ]] && continue

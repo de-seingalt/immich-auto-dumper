@@ -44,7 +44,15 @@ if [[ -f "$INSTALL_DIR/config.conf" ]]; then
                    "$INSTALL_DIR/config.conf" 2>/dev/null | tail -1)"
   cfg_log_dir="${cfg_log_dir%\"}"; cfg_log_dir="${cfg_log_dir#\"}"
   cfg_log_dir="${cfg_log_dir%\'}"; cfg_log_dir="${cfg_log_dir#\'}"
-  [[ "$cfg_log_dir" == '~/'* ]] && cfg_log_dir="${HOME}${cfg_log_dir#\~}"
+  # Both prefixes lib/config.sh accepts, and both that config.conf.example
+  # documents. Only "~/" was handled here, so a config saying LOG_DIR="$HOME/..."
+  # fell through to the XDG default: the uninstaller printed a path it was not
+  # going to remove, and the real log directory — lock included — stayed behind.
+  # shellcheck disable=SC2088  # a literal pattern, not a path to expand
+  case "$cfg_log_dir" in
+    '~/'*)     cfg_log_dir="${HOME}${cfg_log_dir#\~}" ;;
+    '$HOME/'*) cfg_log_dir="${HOME}${cfg_log_dir#\$HOME}" ;;
+  esac
   # Only an absolute path is usable, and only an absolute path is safe to rm -rf.
   [[ "$cfg_log_dir" == /* ]] && LOG_DIR="$cfg_log_dir"
 fi

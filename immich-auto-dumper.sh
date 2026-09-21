@@ -235,14 +235,21 @@ _resolve_storage_marker() {
 }
 
 # Recommended free-disk floor for the filesystem holding <path>: 10% of the disk,
-# clamped between 2 GB and 20 GB. Echoes 0 when the disk size cannot be read.
+# clamped between 2 GB and 20 GB. When the disk size cannot be read it falls back
+# to that same 2 GiB floor rather than to 0.
+#
+# Zero is a perfectly good value when the USER picks it — it means "turn the
+# free-disk trigger off". What is wrong is a DEFAULT choosing it for them: an
+# unreadable disk made this echo 0, the backfill wrote ARCHIVE_MIN_FREE_MB=0 into
+# their config, and the safety net was disabled while being presented as the
+# recommended setting.
 #
 # Rounded down to a whole GiB: mb_to_input renders the suggestion with two decimals
 # ("10.84G"), and parsing that back loses a few MiB — enough for simply accepting the
 # pre-filled default to be flagged as "below the recommended floor". A whole-GiB
 # value round-trips exactly, and reads better in the prompt.
 _recommended_min_free_mb() {
-  local path="$1" total=0 mb=0
+  local path="$1" total=0 mb=2048
   [[ -n "$path" && -d "$path" ]] && total=$(disk_total_bytes "$path")
   if (( total > 0 )); then
     mb=$(( total * 10 / 100 / 1048576 ))
@@ -533,8 +540,15 @@ _config_default_for() {
 
 # Appends the settings this version added to an existing config.conf, with their
 # default values. Only ever adds lines: the user's own values are never rewritten.
+#
+# Through a temporary copy and a rename, like every other write to this file: an
+# interruption mid-append would leave a truncated configuration, which the loader
+# now refuses outright — so the tool would simply stop starting. And it says what
+# it wrote, because a value that appears in a file on its own is a value nobody
+# chose.
 _config_backfill() {
-  local k v
+  local k v tmp="$CONFIG_FILE.tmp"
+  cp -f -- "$CONFIG_FILE" "$tmp" || return 1
   {
     printf '\n# --- Added by setup on %s (settings new in this version) ---\n' "$(date '+%Y-%m-%d %H:%M:%S')"
     for k in "${CFG_OUTDATED[@]}"; do
@@ -544,7 +558,11 @@ _config_backfill() {
         *)       printf '%s=%s\n'   "$k" "$v" ;;
       esac
     done
-  } >> "$CONFIG_FILE"
+  } >> "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$CONFIG_FILE" || { rm -f -- "$tmp"; return 1; }
+  for k in "${CFG_OUTDATED[@]}"; do
+    log_info "config.conf: added $k=$(_config_default_for "$k") (default for this version)"
+  done
 }
 
 # Renders cron/crontab.example with the real binary path and log dir, keeping only
@@ -1105,7 +1123,10 @@ _setup() {
     user_map_block+="USER_MAP.${k}=${new_user_map[$k]}"$'\n'
   done
 
-  cat > "$CONFIG_FILE" <<CONF
+  # Written to a temporary file and renamed into place. A `cat >` interrupted
+  # mid-write left a truncated configuration — which the loader now refuses
+  # outright, so the tool would simply stop starting.
+  cat > "$CONFIG_FILE.tmp" <<CONF
 # immich-auto-dumper — configuration
 # Generated on $(date '+%Y-%m-%d %H:%M:%S')
 
@@ -1141,6 +1162,11 @@ ${user_map_block}
 LOG_DIR="${log_dir}"
 LOG_MAX_LINES=${log_max_lines}
 CONF
+  if ! mv -f -- "$CONFIG_FILE.tmp" "$CONFIG_FILE"; then
+    rm -f -- "$CONFIG_FILE.tmp"
+    ui_info "config.conf NOT written" "Could not put the new configuration in place at ${CONFIG_FILE}.\n\nNothing was changed: your previous configuration is untouched."
+    return 1
+  fi
 
   # An external library can only point at a path that already exists, so create each
   # user's destination folder now if missing. We never touch Immich's own config; any
