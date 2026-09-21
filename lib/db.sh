@@ -199,6 +199,13 @@ db_get_archive_candidates() {
   escaped_library_prefix=$(_db_escape "$(_db_escape_regex "${IMMICH_DB_LIBRARY_PREFIX}/")")
   local escaped_archive_prefix
   escaped_archive_prefix=$(_db_escape "$(_db_escape_like "${ARCHIVE_CONTAINER_PATH}")")
+  # Same prefix again, escaped for LIKE this time. The selection used to offer
+  # every internal asset whatever its path, including one living outside
+  # IMMICH_DB_LIBRARY_PREFIX — for which split_part returns an empty user folder
+  # and no destination can be built at all. Not offering it is better than
+  # refusing it one layer later.
+  local escaped_like_prefix
+  escaped_like_prefix=$(_db_escape "$(_db_escape_like "${IMMICH_DB_LIBRARY_PREFIX}")")
 
   # Order by the oldest capture date in each directory so the genuinely oldest photos
   # are archived first, regardless of the storage template (template-agnostic). The
@@ -216,6 +223,7 @@ db_get_archive_candidates() {
     WHERE a.\"deletedAt\" IS NULL
       AND a.\"isOffline\" = false
       AND a.\"isExternal\" = false
+      AND a.\"originalPath\" LIKE '${escaped_like_prefix}/%' ESCAPE '\\'
       AND a.\"originalPath\" NOT LIKE '${escaped_archive_prefix}%' ESCAPE '\\'
     GROUP BY user_folder, parent_dir
     ORDER BY MIN(a.\"fileCreatedAt\") ASC;"

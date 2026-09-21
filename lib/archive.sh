@@ -19,13 +19,27 @@ host_path_to_db_path() {
 
 # Builds the archive destination host path for a given host source path.
 # Preserves the full subpath after <user_folder>/, regardless of storage template depth.
+#
+# Returns 1 and prints NOTHING when the source is not of the form
+# <upload location>/library/<user folder>/<rest>, both parts non-empty. It used
+# to assume that shape: a path from outside the library left user_folder empty,
+# asked USER_MAP[""] — a bad array subscript, printed to stderr and swallowed by
+# the `:-` — and produced "/mnt/external//var/other/a.jpg", a double slash
+# followed by the absolute source path. That is exactly the shape Immich's
+# library scan does not recognise, the one _sanitize_folder exists to prevent
+# elsewhere. The SQL selection no longer offers such an asset; this is the guard
+# that still holds if another caller ever appears, the same double cover as F3.
 archive_build_dest_path() {
   local src_host_path="$1"
   local library_prefix="$IMMICH_UPLOAD_LOCATION/library/"
 
+  [[ "$src_host_path" == "$library_prefix"* ]] || return 1
   local relative="${src_host_path#"$library_prefix"}"
   local user_folder="${relative%%/*}"
   local rest="${relative#"$user_folder/"}"
+  # `rest == relative` means the strip found no "<folder>/" to remove, i.e. the
+  # path names a file sitting directly in library/ with no user folder at all.
+  [[ -n "$user_folder" && -n "$rest" && "$rest" != "$relative" ]] || return 1
 
   local mapped_name="${USER_MAP["$user_folder"]:-$user_folder}"
 
@@ -323,7 +337,11 @@ _archive_move_file() {
   ARCHIVE_LAST_FREED_BYTES=0
 
   local dst_host
-  dst_host=$(archive_build_dest_path "$src_host_path")
+  if ! dst_host=$(archive_build_dest_path "$src_host_path"); then
+    log_error "Asset $asset_id is not under $IMMICH_UPLOAD_LOCATION/library/<user folder>/ — skipped, nothing touched: $src_host_path"
+    log_error "Only assets inside a user's folder of the internal library can be archived; there is no destination to build for this one."
+    return 1
+  fi
   local dst_db="${dst_host/#"$ARCHIVE_DEST_PATH"/"$ARCHIVE_CONTAINER_PATH"}"
   local src_db
   src_db=$(host_path_to_db_path "$src_host_path")
@@ -602,7 +620,10 @@ _archive_move_sidecar() {
     [[ -f "$sidecar" ]] || continue
 
     local dst_sidecar
-    dst_sidecar=$(archive_build_dest_path "$sidecar")
+    if ! dst_sidecar=$(archive_build_dest_path "$sidecar"); then
+      log_warn "Sidecar is not under a user folder of the internal library — left where it is: $sidecar"
+      continue
+    fi
 
     if "$dry_run"; then
       log_info "DRY-RUN: would move sidecar $sidecar → $dst_sidecar"
