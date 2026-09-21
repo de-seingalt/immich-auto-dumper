@@ -180,6 +180,19 @@ _archive_dest_state() {
       return 2
     fi
     if [[ -n "${ARCHIVE_STORAGE_ID:-}" && "$id" != "$ARCHIVE_STORAGE_ID" ]]; then
+      # 1, the same code as "no marker at all", and that is a decision rather
+      # than an oversight. Both answers mean the destination is not the one this
+      # configuration describes, and the only safe response to either is to act
+      # on nothing — which is what code 1 already produces: the run ends quietly,
+      # the lock is never taken, and not a single file is touched.
+      #
+      # Splitting them would buy a more precise label in `status` and nothing
+      # else, because the action would stay identical. The real question a
+      # distinct code invites — how does an operator get OUT of this state
+      # without suspending the schedule — has no answer here: a Docker bind mount
+      # attaches a path, not a device, so nothing in Immich's configuration names
+      # or verifies a volume. That is exactly why the marker exists, and
+      # answering it properly is a piece of work of its own, not a return code.
       _ARCHIVE_DEST_REASON="marker id does not match ARCHIVE_STORAGE_ID — wrong volume mounted?"
       return 1
     fi

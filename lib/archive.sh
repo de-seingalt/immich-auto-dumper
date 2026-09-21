@@ -60,6 +60,18 @@ declare -A ARCHIVE_IN_FLIGHT=()
 # failed move can never report the previous asset's figure.
 ARCHIVE_LAST_FREED_BYTES=0
 
+# Entries this run put into a state that needs a human: `bloque` and `divergent`,
+# and only those. `abandonne` is not one — the asset simply left Immich, which is
+# its owner's decision, not a failure.
+#
+# Counted as WRITTEN DURING THIS RUN rather than as found in runs/, deliberately.
+# Counting what is present would leave the light red night after night, since a
+# divergent entry survives until an operator deletes the run file. Counted this
+# way the non-zero exit falls exactly once, on the run that produced the problem:
+# archive_reconcile skips the states that are not resumable, so no later run
+# writes them again.
+ARCHIVE_TERMINAL_COUNT=0
+
 # ── Per-asset pipeline, journalled and resumable ──────────────────────────────
 
 # Where Immich currently says the asset is, answered against what the journal
@@ -146,11 +158,13 @@ _archive_process_asset() {
       # `|| true`: runlog_record reports its own failure, and parking is the
       # last thing left to record — failing it must not kill the run.
       runlog_record "" "$asset_id" bloque "$try" "$size" "$sha" "$src_host" "$src_db" "$dst_host" "$dst_db" || true
+      ARCHIVE_TERMINAL_COUNT=$(( ARCHIVE_TERMINAL_COUNT + 1 ))
       return 2
     fi
     runlog_record "" "$asset_id" "$etat" "$try" "$size" "$sha" "$src_host" "$src_db" "$dst_host" "$dst_db" || true
     case "$etat" in
-      divergent|abandonne) return 2 ;;
+      divergent) ARCHIVE_TERMINAL_COUNT=$(( ARCHIVE_TERMINAL_COUNT + 1 )); return 2 ;;
+      abandonne) return 2 ;;
       *) return 1 ;;
     esac
   }
@@ -347,18 +361,28 @@ _archive_move_file() {
   src_db=$(host_path_to_db_path "$src_host_path")
 
   if "$dry_run"; then
+    # What a real run would take off the library disk. It was left at zero for
+    # every asset, so a simulation reported "would free 0 B" whatever it was
+    # about to move, and its stop-at-target test — which compares that same
+    # total against what has to be freed — could never become true: every
+    # candidate directory got announced, where a real run stops after two.
+    local would_free=0
     if [[ -e "$dst_host" ]]; then
       local identical=0
       files_are_identical "$src_host_path" "$dst_host" || identical=$?
       case $identical in
-        0) log_info "DRY-RUN: would UPDATE DB only for asset $asset_id → $dst_db (identical copy already there)" ;;
+        0) log_info "DRY-RUN: would UPDATE DB only for asset $asset_id → $dst_db (identical copy already there)"
+           # No copy to make, but the source still goes.
+           would_free=$(stat --format='%s' "$src_host_path" 2>/dev/null || echo 0) ;;
         1) log_warn "DRY-RUN: destination already holds a DIFFERENT file — the real run would SKIP this asset: $dst_host" ;;
         *) log_warn "DRY-RUN: cannot compare source and destination — the real run would SKIP this asset: $dst_host" ;;
       esac
     else
       log_info "DRY-RUN: would copy $src_host_path → $dst_host"
       log_info "DRY-RUN: would UPDATE asset $asset_id originalPath → $dst_db"
+      would_free=$(stat --format='%s' "$src_host_path" 2>/dev/null || echo 0)
     fi
+    ARCHIVE_LAST_FREED_BYTES="$would_free"
     # Preview path: `|| true` on purpose. A mute database here costs this one
     # advisory line, and a simulation must still list its candidates. See the
     # note in _config_check for the whole family.
@@ -433,6 +457,7 @@ archive_reconcile() {
         # should count it among the ones needing a decision.
         log_error "Asset $asset has failed $attempts times — parked as blocked, it will not be retried."
         runlog_record "" "$asset" bloque "$attempts" "$size" "$sha" "$src" "$src_db" "$dst" "$dst_db" || true
+        ARCHIVE_TERMINAL_COUNT=$(( ARCHIVE_TERMINAL_COUNT + 1 ))
         stuck=$(( stuck + 1 ))
         continue
       fi
@@ -616,8 +641,15 @@ _archive_move_sidecar() {
     "${base}.json"
   )
 
+  # For an asset with no extension, "<path>.xmp" and "<base>.xmp" name the same
+  # file, so it appeared twice. Harmless in a real run — the second pass no
+  # longer finds it — but a simulation announced moving it twice.
+  local -A seen_sidecar=()
+  local sidecar
   for sidecar in "${candidates[@]}"; do
     [[ -f "$sidecar" ]] || continue
+    [[ -n "${seen_sidecar[$sidecar]:-}" ]] && continue
+    seen_sidecar["$sidecar"]=1
 
     local dst_sidecar
     if ! dst_sidecar=$(archive_build_dest_path "$sidecar"); then
@@ -746,6 +778,9 @@ archive_run() {
   if ! acquire_lock; then
     return 0
   fi
+
+  # Per-run, so the exit code below reflects what THIS run produced.
+  ARCHIVE_TERMINAL_COUNT=0
 
   # ── Decide first, act afterwards ────────────────────────────────────────────
   #
@@ -880,6 +915,12 @@ archive_run() {
   if ! "$will_archive"; then
     log_info "$idle_reason"
     release_lock
+    # Reconciliation ran just above and may well have parked something terminal.
+    # A run that ends here has still produced that, so it reports it.
+    if (( ARCHIVE_TERMINAL_COUNT > 0 )); then
+      log_error "$ARCHIVE_TERMINAL_COUNT asset(s) ended this run blocked or divergent — each one needs a decision. See: immich-auto-dumper status"
+      return 1
+    fi
     return 0
   fi
 
@@ -909,6 +950,9 @@ archive_run() {
   fi
 
   local freed_bytes=0
+  # Directories the database refused to list. Reported at the end rather than
+  # left to be inferred from scrolling back through the log.
+  local dirs_failed=0
 
   # Capture, check, THEN iterate — never iterate a process substitution.
   # `while … done < <(db_get_archive_candidates)` threw away the function's exit
@@ -946,12 +990,13 @@ archive_run() {
     assets_raw=$(db_get_folder_assets "$parent_dir") || asset_rc=$?
     if (( asset_rc != 0 )); then
       log_error "Could not list the assets of $parent_dir — the database stopped answering. Directory left untouched."
+      dirs_failed=$(( dirs_failed + 1 ))
       continue
     fi
     local -a assets=()
     [[ -n "$assets_raw" ]] && mapfile -t assets <<< "$assets_raw"
 
-    local dir_ok=0 dir_ko=0 dir_freed=0
+    local dir_ok=0 dir_ko=0 dir_held=0 dir_freed=0
     local arow asset_id original_path_db file_size
     for arow in "${assets[@]}"; do
       IFS="$DB_FIELD_SEP" read -r asset_id original_path_db file_size <<< "$arow"
@@ -960,7 +1005,13 @@ archive_run() {
       # Already spoken for by an unfinished run: reconciliation above owns it.
       # Taking it again here would open a parallel entry with a fresh attempt
       # counter, and the ceiling that parks a hopeless asset would never bite.
+      #
+      # Counted, not merely skipped. When a journal held EVERY asset of a
+      # directory the inner loop never ran, both counters stayed at zero, and the
+      # report read "all 0 asset(s) failed" — an error announced where nothing
+      # had even been attempted, which is F9's mistake the other way round.
       if [[ -n "${ARCHIVE_IN_FLIGHT[$asset_id]:-}" ]]; then
+        dir_held=$(( dir_held + 1 ))
         continue
       fi
 
@@ -985,17 +1036,26 @@ archive_run() {
     # "Directory archived" used to be printed whatever happened, so a directory
     # whose every asset had just failed was reported, at INFO, as archived — with
     # its full size, as if that space had been freed. Say what actually happened.
+    local held_note=""
+    (( dir_held > 0 )) && held_note=" ($dir_held more held by an unfinished run)"
     if "$dry_run"; then
-      log_info "DRY-RUN: would archive directory: $parent_dir — $(bytes_to_human "${folder_size:-0}") ($dir_ok asset(s))"
+      log_info "DRY-RUN: would archive directory: $parent_dir — $(bytes_to_human "$dir_freed") ($dir_ok asset(s))${held_note}"
+    elif (( dir_ok == 0 && dir_ko == 0 && dir_held > 0 )); then
+      # Nothing was tried here: every asset belongs to a journal that is waiting
+      # on something. That is not a failure, and calling it one sent people
+      # looking for a fault that did not exist.
+      log_warn "Directory left alone: $parent_dir — $dir_held asset(s) held by an unfinished run awaiting a decision. See: immich-auto-dumper status"
+    elif (( dir_ok == 0 && dir_ko == 0 )); then
+      log_info "Nothing left to archive in $parent_dir."
     elif (( dir_ok == 0 )); then
-      log_error "Directory NOT archived: $parent_dir — all $dir_ko asset(s) failed."
+      log_error "Directory NOT archived: $parent_dir — all $dir_ko asset(s) failed.${held_note}"
     elif (( dir_ko > 0 )); then
-      log_warn "Directory partially archived: $parent_dir — $dir_ok done ($(bytes_to_human "$dir_freed") freed), $dir_ko failed."
+      log_warn "Directory partially archived: $parent_dir — $dir_ok done ($(bytes_to_human "$dir_freed") freed), $dir_ko failed.${held_note}"
     else
       # The size reported is the one the disk gave up, not the one the metadata
       # advertised: with the exif rows missing the latter reads "0 B" for a
       # directory that just freed hundreds of kilobytes.
-      log_info "Directory archived: $parent_dir — $(bytes_to_human "$dir_freed") freed ($dir_ok asset(s))"
+      log_info "Directory archived: $parent_dir — $(bytes_to_human "$dir_freed") freed ($dir_ok asset(s))${held_note}"
     fi
 
     # Checked only after completing the current directory, never mid-directory —
@@ -1019,12 +1079,29 @@ archive_run() {
     runlog_rotate
   fi
   release_lock
+
+  local unread_note=""
+  (( dirs_failed > 0 )) && unread_note=" $dirs_failed directory(ies) could not be read and were left untouched."
+
   # A simulation must never log a line that reads as work done: `status` reports the
   # last "Archive complete" as history, so an unmarked dry run used to show an
   # archive that never happened, along with space it never freed.
   if "$dry_run"; then
-    log_info "DRY-RUN: would free $(bytes_to_human "$freed_bytes") in total. Nothing was moved."
-  else
-    log_info "Archive complete. Freed: $(bytes_to_human "$freed_bytes")."
+    log_info "DRY-RUN: would free $(bytes_to_human "$freed_bytes") in total. Nothing was moved.${unread_note}"
+    return 0
   fi
+
+  log_info "Archive complete. Freed: $(bytes_to_human "$freed_bytes").${unread_note}"
+
+  # The exit code says whether this run left something that needs a person. It is
+  # not an alert channel — the log is, and it is precise and timestamped. What it
+  # buys is an exact status something else can be built on, and alignment with
+  # archive_rollback, which already exits non-zero when it refused anything.
+  if (( ARCHIVE_TERMINAL_COUNT > 0 )); then
+    log_error "$ARCHIVE_TERMINAL_COUNT asset(s) ended this run blocked or divergent — each one needs a decision. See: immich-auto-dumper status"
+    return 1
+  fi
+  # A directory the database would not list is the same family of failure as the
+  # candidate list refusing to answer, which already ends the run non-zero.
+  (( dirs_failed == 0 ))
 }
