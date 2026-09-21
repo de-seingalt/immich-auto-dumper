@@ -94,7 +94,7 @@ detect_docker_cmd() {
 check_prereqs() {
   detect_docker_cmd
 
-  local missing=()
+  local missing=() cmd
   # Runtime dependencies actually used by the scripts (jq/curl were only needed
   # by the removed Immich API integration). bc is used for byte arithmetic,
   # sha256sum to prove two files are the same before deleting either of them.
@@ -483,7 +483,10 @@ acquire_lock() {
   dir=$(lock_dir_path)
   mkdir -p -- "$(dirname -- "$dir")" 2>/dev/null || true
 
+  # Two goes: the first may find a lock that turns out to be orphaned, the
+  # second then claims it. The counter itself is never read.
   local attempt
+  # shellcheck disable=SC2034  # the counter bounds the retries, it is never read
   for attempt in 1 2; do
     if mkdir -- "$dir" 2>/dev/null; then
       printf '%d\n' "$$" > "$dir/pid"

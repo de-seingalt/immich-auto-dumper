@@ -728,8 +728,28 @@ _setup() {
   IMMICH_DB_USER="$db_user"
   IMMICH_DB_NAME="$db_name"
 
+  # Several containers can match the patterns — two projects side by side on one
+  # host is ordinary. The first match still wins, but the operator is told there
+  # was a choice, and which way it went, so a wrong guess is visible here rather
+  # than discovered later against the wrong database.
+  local ambiguity="" n_db n_srv
+  n_db=$(detect_candidate_count "$DET_DB_CANDIDATES")
+  n_srv=$(detect_candidate_count "$DET_SERVER_CANDIDATES")
+  if (( n_db > 1 )); then
+    ambiguity+=$'\n\n'"$n_db running containers look like a PostgreSQL for Immich:"$'\n'
+    ambiguity+="$(printf '%s\n' "$DET_DB_CANDIDATES" | grep -v '^$' | sed 's/^/  - /')"
+    ambiguity+=$'\n'"Kept: $db_container. If that is the wrong one, rename the container or fix IMMICH_DB_CONTAINER in config.conf."
+    log_warn "Several PostgreSQL candidates ($(printf '%s' "$DET_DB_CANDIDATES" | tr '\n' ' ')) — using '$db_container'."
+  fi
+  if (( n_srv > 1 )); then
+    ambiguity+=$'\n\n'"$n_srv running containers look like the Immich server:"$'\n'
+    ambiguity+="$(printf '%s\n' "$DET_SERVER_CANDIDATES" | grep -v '^$' | sed 's/^/  - /')"
+    ambiguity+=$'\n'"Kept: $server_container. If that is the wrong one, rename the container or fix IMMICH_SERVER_CONTAINER in config.conf."
+    log_warn "Several Immich server candidates ($(printf '%s' "$DET_SERVER_CANDIDATES" | tr '\n' ' ')) — using '$server_container'."
+  fi
+
   ui_info "Immich detected" \
-    "Found your Immich installation:\n\n  server container   : $server_container\n  postgres container : $db_container\n  database           : $db_name (user: $db_user)\n\nThe next steps confirm what the wizard detected from this install."
+    "Found your Immich installation:\n\n  server container   : $server_container\n  postgres container : $db_container\n  database           : $db_name (user: $db_user)${ambiguity}\n\nThe next steps confirm what the wizard detected from this install."
 
   # ── 2. Library prefix (from the DB) and upload mount (from docker) ───────────
   local db_library_prefix=""
@@ -764,7 +784,7 @@ _setup() {
 
   local archive_dest="" archive_container_path=""
   if (( ${#ext_list[@]} == 1 )); then
-    IFS='|' read -r archive_dest archive_container_path <<< "${ext_list[0]}"
+    IFS="$DET_FIELD_SEP" read -r archive_dest archive_container_path <<< "${ext_list[0]}"
     if ! ui_yesno "External folder (from Docker)" \
       "Detected one external folder mounted into '$server_container' in Docker config — archived photos will be moved here:\n\n  host path      : $archive_dest\n  container path : $archive_container_path\n\nUse this folder as the archive destination?"; then
       ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."
@@ -775,14 +795,14 @@ _setup() {
     local -a menu_args=()
     local idx=1 host cont
     for e in "${ext_list[@]}"; do
-      IFS='|' read -r host cont <<< "$e"
+      IFS="$DET_FIELD_SEP" read -r host cont <<< "$e"
       menu_args+=("$idx" "$host  →  $cont")
       idx=$(( idx + 1 ))
     done
     ui_menu "Choose external library" \
       "Your Immich install has several external libraries. Pick the one immich-auto-dumper should move archived photos into:" \
       "${menu_args[@]}" || { ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."; return 0; }
-    IFS='|' read -r archive_dest archive_container_path <<< "${ext_list[$(( UI_VALUE - 1 ))]}"
+    IFS="$DET_FIELD_SEP" read -r archive_dest archive_container_path <<< "${ext_list[$(( UI_VALUE - 1 ))]}"
   fi
   ARCHIVE_CONTAINER_PATH="$archive_container_path"
 
@@ -1118,7 +1138,7 @@ _setup() {
 
   # One line per user, no array declaration: config.conf is read, not executed,
   # and `declare -A` was the last thing in it that needed a shell to make sense.
-  local user_map_block=""
+  local user_map_block="" k
   for k in "${!new_user_map[@]}"; do
     user_map_block+="USER_MAP.${k}=${new_user_map[$k]}"$'\n'
   done
@@ -1367,7 +1387,8 @@ _status() {
     printf 'Unfinished runs      : none\n'
   else
     local since=""
-    local oldest_path="$(runlog_dir)/$rl_oldest"
+    local oldest_path
+    oldest_path="$(runlog_dir)/$rl_oldest"
     [[ -f "$oldest_path" ]] && since=$(date -r "$oldest_path" '+%Y-%m-%d %H:%M' 2>/dev/null || true)
     printf 'Unfinished runs      : %d (oldest: %s%s)\n' \
       "$rl_files" "${rl_oldest%.*}" "${since:+, since $since}"
@@ -1459,6 +1480,7 @@ main() {
   local force=false
   local cmd=""
   local args=()
+  local arg
 
   for arg in "$@"; do
     case "$arg" in

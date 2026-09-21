@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034  # RUNLOG_DIRECTION and the ARCHIVE_* globals are
+# read from lib/runlog.sh and from the main script, both sourced at runtime
+# through $SCRIPT_DIR, which shellcheck cannot follow.
 set -euo pipefail
 
 # ── Path conversion helpers ───────────────────────────────────────────────────
@@ -502,6 +505,7 @@ _archive_move_file() {
 archive_reconcile() {
   ARCHIVE_IN_FLIGHT=()
   local -a files=()
+  local f
   while IFS= read -r f; do [[ -n "$f" ]] && files+=("$f"); done < <(runlog_unfinished_files)
   (( ${#files[@]} > 0 )) || return 0
 
@@ -871,6 +875,7 @@ _recent_usable_dump() {
 
 archive_run() {
   local dry_run=false force=false
+  local arg
   for arg in "$@"; do
     case "$arg" in
       --dry-run) dry_run=true ;;
@@ -1032,8 +1037,9 @@ archive_run() {
   # reason to refuse a fresh archive either: the moment the disk fills up is exactly
   # when the tool has to keep working.
   if "$dry_run"; then
-    local pending blocked divergent unreadable nfiles oldest
-    read -r pending blocked divergent unreadable nfiles oldest < <(runlog_summary)
+    local pending blocked divergent unreadable nfiles
+    # The sixth field, the oldest run's id, is not used here — status reports it.
+    read -r pending blocked divergent unreadable nfiles _ < <(runlog_summary)
     if (( nfiles > 0 )); then
       log_info "DRY-RUN: $nfiles earlier run(s) left work behind ($pending to resume, $blocked blocked, $divergent divergent, $unreadable unreadable); a real run would resume them first."
     fi
@@ -1126,9 +1132,11 @@ archive_run() {
     [[ -n "$assets_raw" ]] && mapfile -t assets <<< "$assets_raw"
 
     local dir_ok=0 dir_ko=0 dir_held=0 dir_freed=0
-    local arow asset_id original_path_db file_size
+    local arow asset_id original_path_db
     for arow in "${assets[@]}"; do
-      IFS="$DB_FIELD_SEP" read -r asset_id original_path_db file_size <<< "$arow"
+      # The third field, Immich's own fileSizeInByte, is only good enough to
+      # sort the candidates; what a move actually frees is read off the disk.
+      IFS="$DB_FIELD_SEP" read -r asset_id original_path_db _ <<< "$arow"
       [[ -z "$asset_id" ]] && continue
 
       # Already spoken for by an unfinished run: reconciliation above owns it.

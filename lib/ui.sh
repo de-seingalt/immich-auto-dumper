@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034  # the C_* colours and UI_VALUE are consumed by the
+# main script, sourced at runtime through $SCRIPT_DIR.
 # ──────────────────────────────────────────────────────────────────────────────
 # UI abstraction layer.
 #

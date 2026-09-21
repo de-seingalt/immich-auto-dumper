@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034  # the DET_* globals are this file's whole output:
+# it is sourced at runtime through $SCRIPT_DIR, which shellcheck cannot follow.
 # ──────────────────────────────────────────────────────────────────────────────
 # Auto-detection of Immich settings from the running Docker installation.
 #
@@ -14,7 +16,12 @@
 # All functions set DET_* globals and/or echo results; none are interactive.
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Raw "Type|Source|Destination" line per mount of a container.
+# Field separator for the mount listing below. A host path is free to contain a
+# "|" — that is the defect F12 fixed for database rows, and the same one was
+# sitting here on mount points. No path can contain \x01.
+DET_FIELD_SEP=$'\x01'
+
+# Raw "Type<SEP>Source<SEP>Destination" line per mount of a container.
 #
 # Note: only host paths (Source) and container paths (Destination) are read. A
 # Docker ":ro" mount mode is deliberately ignored — it restricts the *container*
@@ -24,25 +31,46 @@
 # marker file is written into ARCHIVE_DEST_PATH.
 _inspect_mounts() {
   $DOCKER_CMD inspect \
-    --format '{{range .Mounts}}{{.Type}}|{{.Source}}|{{.Destination}}{{"\n"}}{{end}}' \
+    --format '{{range .Mounts}}{{.Type}}{{printf "\x01"}}{{.Source}}{{printf "\x01"}}{{.Destination}}{{"\n"}}{{end}}' \
     "$1" 2>/dev/null || true
 }
 
 # detect_immich_containers
-# Sets DET_SERVER_CONTAINER and DET_DB_CONTAINER (empty when not found).
+# Sets DET_SERVER_CONTAINER and DET_DB_CONTAINER (empty when not found), plus
+# DET_DB_CANDIDATES / DET_SERVER_CANDIDATES: every running container that matched,
+# newline-separated.
+#
+# The choice stays automatic — `head -1` — but it stops being silent. On a host
+# running two Postgres containers (two projects side by side is ordinary, and it
+# is the case on the test VM) the first one simply won, and nothing anywhere said
+# there had been a choice to make. The candidates are reported by the caller, so
+# the operator sees immediately whether the tool picked the wrong one and can fix
+# config.conf or rename a container. A proper menu is the right answer the day
+# this happens for real; adding an interactive dialog to the most fragile part of
+# the code is not what this pass is for.
+DET_DB_CANDIDATES=""; DET_SERVER_CANDIDATES=""
 detect_immich_containers() {
   DET_SERVER_CONTAINER=""; DET_DB_CONTAINER=""
+  DET_DB_CANDIDATES="";    DET_SERVER_CANDIDATES=""
   local names
   names=$($DOCKER_CMD ps --format '{{.Names}}' 2>/dev/null || true)
-  DET_DB_CONTAINER=$(printf '%s\n' "$names" \
-    | grep -iE 'postgres|pgvecto|immich.*(db|database)|(db|database).*immich' | head -1 || true)
-  DET_SERVER_CONTAINER=$(printf '%s\n' "$names" \
-    | grep -iE 'immich[_-]?server' | head -1 || true)
+  DET_DB_CANDIDATES=$(printf '%s\n' "$names" \
+    | grep -iE 'postgres|pgvecto|immich.*(db|database)|(db|database).*immich' || true)
+  DET_DB_CONTAINER=$(printf '%s\n' "$DET_DB_CANDIDATES" | grep -v '^$' | head -1 || true)
+  DET_SERVER_CANDIDATES=$(printf '%s\n' "$names" \
+    | grep -iE 'immich[_-]?server' || true)
   # Fallback: a lone immich* container that is not the database is the server.
-  if [[ -z "$DET_SERVER_CONTAINER" ]]; then
-    DET_SERVER_CONTAINER=$(printf '%s\n' "$names" \
-      | grep -i 'immich' | grep -ivE 'postgres|redis|pgvecto|database|valkey|ml|machine' | head -1 || true)
+  if [[ -z "$DET_SERVER_CANDIDATES" ]]; then
+    DET_SERVER_CANDIDATES=$(printf '%s\n' "$names" \
+      | grep -i 'immich' | grep -ivE 'postgres|redis|pgvecto|database|valkey|ml|machine' || true)
   fi
+  DET_SERVER_CONTAINER=$(printf '%s\n' "$DET_SERVER_CANDIDATES" | grep -v '^$' | head -1 || true)
+}
+
+# How many running containers matched, for the caller to decide whether there was
+# an ambiguity worth reporting.
+detect_candidate_count() {
+  printf '%s\n' "$1" | grep -cv '^$' || true
 }
 
 # detect_db_credentials <server_container>
@@ -69,7 +97,7 @@ detect_upload_mount() {
   # prefix (e.g. prefix /data/library -> mount dest /data).
   if [[ -n "$prefix" ]]; then
     local want="${prefix%/library}"
-    while IFS='|' read -r type src dst; do
+    while IFS="$DET_FIELD_SEP" read -r type src dst; do
       [[ "$type" == "bind" ]] || continue
       if [[ "$dst" == "$want" ]]; then
         DET_UPLOAD_LOCATION="$src"; DET_UPLOAD_CONTAINER="$dst"; return 0
@@ -79,7 +107,7 @@ detect_upload_mount() {
 
   # Canonical Immich upload destinations: modern images bind to /data, older ones
   # to /usr/src/app/upload.
-  while IFS='|' read -r type src dst; do
+  while IFS="$DET_FIELD_SEP" read -r type src dst; do
     [[ "$type" == "bind" ]] || continue
     if [[ "$dst" == "/data" || "$dst" == "/usr/src/app/upload" ]]; then
       DET_UPLOAD_LOCATION="$src"; DET_UPLOAD_CONTAINER="$dst"; return 0
@@ -87,7 +115,7 @@ detect_upload_mount() {
   done <<< "$mounts"
 
   # Last resort: a bind mount whose host side actually holds a library/ folder.
-  while IFS='|' read -r type src dst; do
+  while IFS="$DET_FIELD_SEP" read -r type src dst; do
     [[ "$type" == "bind" ]] || continue
     if [[ -n "$src" && -d "$src/library" ]]; then
       DET_UPLOAD_LOCATION="$src"; DET_UPLOAD_CONTAINER="$dst"; return 0
@@ -98,7 +126,7 @@ detect_upload_mount() {
 }
 
 # detect_external_libraries <server_container> <upload_container_path>
-# Echoes one "host_path|container_path" line per external-library candidate:
+# Echoes one "host_path<SEP>container_path" line per external-library candidate:
 # bind mounts that are neither the upload mount nor Immich/system internals.
 #
 # The Docker mount mode (:ro / :rw) is intentionally NOT used to filter: ":ro"
@@ -109,7 +137,7 @@ detect_external_libraries() {
   local container="$1" upload_dst="$2"
   local mounts type src dst
   mounts=$(_inspect_mounts "$container")
-  while IFS='|' read -r type src dst; do
+  while IFS="$DET_FIELD_SEP" read -r type src dst; do
     [[ "$type" == "bind" ]] || continue
     [[ -z "$src" || -z "$dst" ]] && continue
     [[ -n "$upload_dst" && "$dst" == "$upload_dst" ]] && continue
@@ -121,6 +149,6 @@ detect_external_libraries() {
     case "$src" in
       /etc/localtime|/etc/timezone) continue ;;
     esac
-    printf '%s|%s\n' "$src" "$dst"
+    printf '%s%s%s\n' "$src" "$DET_FIELD_SEP" "$dst"
   done <<< "$mounts"
 }

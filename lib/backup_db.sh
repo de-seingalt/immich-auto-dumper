@@ -3,7 +3,7 @@ set -euo pipefail
 
 backup_db_run() {
   local dry_run=false
-  local arg
+  local arg src i
   for arg in "$@"; do
     case "$arg" in
       --dry-run) dry_run=true ;;
@@ -59,6 +59,7 @@ backup_db_run() {
 
   # Skip hidden marker files (e.g. Immich's `.immich`) — only mirror real dumps.
   local files=()
+  local f
   while IFS= read -r -d '' f; do
     files+=("$f")
   done < <(find "$src_dir" -maxdepth 1 -type f ! -name '.*' -print0)
@@ -75,7 +76,13 @@ backup_db_run() {
     for src in "${files[@]}"; do
       local dr_name dr_src_size dr_dst_size
       dr_name=$(basename "$src")
-      dr_src_size=$(stat --format='%s' "$src")
+      # Guarded like the real run below: Immich rotates its own dumps, and one
+      # can vanish between the find and the stat.
+      dr_src_size=$(stat --format='%s' "$src" 2>/dev/null || echo -1)
+      if (( dr_src_size < 0 )); then
+        log_info "DRY-RUN: would skip $dr_name (it has gone since the listing)"
+        continue
+      fi
       dr_dst_size=$(stat --format='%s' "$dest_dir/$dr_name" 2>/dev/null || echo -1)
       if [[ "$dr_dst_size" == "$dr_src_size" ]]; then
         log_info "DRY-RUN: would skip $dr_name (already mirrored)"
@@ -113,7 +120,15 @@ backup_db_run() {
   for src in "${files[@]}"; do
     local filename src_size dst_size
     filename=$(basename "$src")
-    src_size=$(stat --format='%s' "$src")
+    # Unguarded, this killed the script under set -e in the middle of mirroring:
+    # Immich rotates its own dumps, so a file listed a moment ago can be gone by
+    # the time it is measured. SKIPPED rather than counted as zero — a size of 0
+    # would never match the destination and the dump would be re-copied for ever.
+    src_size=$(stat --format='%s' "$src" 2>/dev/null || echo -1)
+    if (( src_size < 0 )); then
+      log_warn "Dump vanished before it could be copied (Immich's own rotation?), skipped: $filename"
+      continue
+    fi
     dst_size=$(stat --format='%s' "$dest_dir/$filename" 2>/dev/null || echo -1)
 
     if [[ "$dst_size" == "$src_size" ]]; then
@@ -160,6 +175,7 @@ backup_db_run() {
   # placeholder date. An mtime-based rotation then sees the dumps it has just copied
   # as the oldest on the volume and deletes them, cancelling their upload in flight.
   local all_backups=()
+  local f
   while IFS= read -r -d '' f; do
     all_backups+=("$f")
   done < <(find "$dest_dir" -maxdepth 1 -type f ! -name '.*' -print0 | LC_ALL=C sort -z)
@@ -182,7 +198,9 @@ backup_db_run() {
   local total_bytes=0
   for f in "${kept[@]}"; do
     local size
-    size=$(stat --format='%s' "$f")
+    # Same guard: this only feeds a report, so a file that disappeared between
+    # the listing and here contributes nothing rather than ending the run.
+    size=$(stat --format='%s' "$f" 2>/dev/null || echo 0)
     total_bytes=$(( total_bytes + size ))
   done
 

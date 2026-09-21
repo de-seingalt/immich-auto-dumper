@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034  # the settings assigned below are this file's whole
+# output, read by the main script that sources it at runtime through $SCRIPT_DIR.
 set -euo pipefail
 
 # ── config.conf, read as data ─────────────────────────────────────────────────
@@ -48,6 +50,9 @@ _cfg_trim() {
 # Literal rewrite of the two prefixes a hand-written path is likely to start with.
 # Exactly these two, substituted as text: no expansion of anything else, and no
 # evaluation. Configs copied from the shipped example carried "$HOME" here.
+# shellcheck disable=SC2088  # the tildes below are literal patterns to MATCH,
+# not paths to expand — expanding them is precisely what this function refuses
+# to do, since config.conf is read and never evaluated.
 _cfg_expand_home() {
   local v="$1"
   case "$v" in

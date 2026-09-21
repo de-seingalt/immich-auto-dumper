@@ -76,12 +76,41 @@ _dir_is_empty() {
 
 # Force the working tree to exactly match origin/<BRANCH>, discarding local edits to
 # tracked files. Ignored files (config.conf, logs) are left intact.
+#
+# Those edits used to go without a word. config.conf is git-ignored so it was
+# never at risk, but a patched lib/ or a hand-fixed script was — and the person
+# who made the change is exactly the person who needs to hear about it. In
+# interactive use it asks; under -y / ASSUME_YES it goes ahead and lists what it
+# discarded, because the documented non-interactive path must not start waiting
+# for an answer nobody is there to give.
+_warn_local_changes() {
+  local dirty
+  dirty=$(_git status --porcelain --untracked-files=no 2>/dev/null || true)
+  [[ -n "$dirty" ]] || return 0
+
+  printf '\nLocal changes to tracked files in %s:\n' "$INSTALL_DIR" >&2
+  printf '%s\n' "$dirty" | sed 's/^/  /' >&2
+  printf 'Updating to origin/%s will discard them. (config.conf and logs are not affected.)\n' "$BRANCH" >&2
+
+  if [[ "$ASSUME_YES" == "1" ]] || ! _have_tty; then
+    printf 'Continuing anyway (non-interactive): the changes above are being discarded.\n' >&2
+    return 0
+  fi
+  local ans=""
+  read -r -p "Discard them and continue? [y/N] " ans </dev/tty || ans=""
+  if [[ "$ans" != "y" && "$ans" != "Y" ]]; then
+    printf 'Left unchanged.\n'
+    exit 0
+  fi
+}
+
 _sync_to_branch() {
   _git fetch --prune origin
   if ! _git rev-parse --verify --quiet "origin/${BRANCH}" >/dev/null; then
     printf 'Error: branch "%s" was not found on origin.\n' "$BRANCH" >&2
     exit 1
   fi
+  _warn_local_changes
   _git checkout -f -B "$BRANCH" "origin/${BRANCH}"
   _git reset --hard "origin/${BRANCH}"
   # Ignore executable-bit changes so the chmod below never dirties the tree and

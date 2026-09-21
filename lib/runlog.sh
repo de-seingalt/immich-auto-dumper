@@ -357,6 +357,7 @@ runlog_rotate() {
   dir=$(runlog_dir)
   [[ -d "$dir" ]] || return 0
   local -a done_files=()
+  local f
   while IFS= read -r -d '' f; do
     done_files+=("$f")
   done < <(find "$dir" -maxdepth 1 -type f -name '*.done' -print0 2>/dev/null | LC_ALL=C sort -z)
@@ -375,7 +376,9 @@ runlog_resolve() {
   dir=$(runlog_dir)
   local -a hits=()
   local ext
-  for ext in active failed done; do
+  # Quoted: bash parses a bare `done` in this list fine, but it reads as the
+  # loop keyword to anyone — and to shellcheck (SC1010).
+  for ext in active failed 'done'; do
     [[ -f "$dir/$id.$ext" ]] && hits+=("$dir/$id.$ext")
   done
   # Allow the bare file name too, so pasting what status printed just works.
