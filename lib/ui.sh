@@ -158,20 +158,73 @@ _ui_term_lines() {
   [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 10 )) || n=24
   printf '%s' "$n"
 }
+# How many rows one logical line actually occupies once whiptail has wrapped it
+# to <width>. Wrapping is done on words, as whiptail does: a word that does not
+# fit starts a new row, and a word longer than the box is broken across rows. An
+# empty line still occupies one row.
+#
+# `read -ra` rather than an unquoted expansion, so a body containing `*` is split
+# into words without being expanded against the filesystem. The answer goes into
+# a global rather than stdout: a command substitution would fork a subshell per
+# LINE, and not forking per dialog is the point of doing this in bash at all.
+_UI_ROWS=1
+_wt_rows() {
+  local text="$1" width="$2"
+  local -a words=()
+  read -ra words <<< "$text"
+  if (( ${#words[@]} == 0 )); then _UI_ROWS=1; return 0; fi
+  local rows=0 col=0 word len
+  for word in "${words[@]}"; do
+    len=${#word}
+    if (( col > 0 && col + 1 + len <= width )); then
+      col=$(( col + 1 + len ))
+      continue
+    fi
+    # Starts a fresh row — and spans several when it is longer than the box.
+    rows=$(( rows + (len + width - 1) / width ))
+    col=$(( len % width ))
+    (( col == 0 )) && col=$width
+  done
+  (( rows < 1 )) && rows=1
+  _UI_ROWS=$rows
+}
+
 _wt_geometry() {
   local body="$1" extra="${2:-7}"
-  local real lit lines h maxh
+  local lines h maxh
   _UI_CLIPPED=0
-  # Counted with pure parameter expansion, no subprocess. The previous
-  # `grep -o '\\n' <<< "$body" | wc -l` was a landmine: a body with no literal "\n"
-  # sequence (one built from real newlines) makes grep exit 1, and under
-  # `set -o pipefail` that failed the assignment and killed the whole wizard —
-  # only ever in the whiptail branch, since the text backend never sizes a box.
-  local only_newlines="${body//[^$'\n']/}"
-  real=$(( ${#only_newlines} + 1 ))
-  local without_literals="${body//\\n/}"
-  lit=$(( (${#body} - ${#without_literals}) / 2 ))
-  lines=$(( real + lit ))
+
+  # This counted LOGICAL lines and whiptail renders WRAPPED ones. A body of 8
+  # logical lines that wrapped to 11 was given a box sized for 8, whiptail cut
+  # the end off — and because the computed height stayed under the terminal cap,
+  # _UI_CLIPPED stayed 0 and --scrolltext was not added either. Both safety nets
+  # failed together, silently. On the real review screen that is what turned
+  # "For information:" into a heading followed by nothing, and the same mechanism
+  # can swallow the CFG_PROBLEMS list — the blocking problems the screen exists
+  # to show.
+  #
+  # Still pure parameter expansion and builtins, no subprocess per dialog, which
+  # was the point of the version this replaces. ${#word} counts CHARACTERS and
+  # not bytes under a UTF-8 locale, so the accents and the ▼/▲ of the summary are
+  # measured correctly.
+  #
+  # whiptail renders a literal "\n" as a break exactly like a real one, so the
+  # two are normalised before counting instead of being counted separately.
+  local normalised="${body//\\n/$'\n'}"
+  local usable=$(( _UI_W - 4 ))
+  (( usable < 1 )) && usable=1
+
+  local -a logical=()
+  mapfile -t logical <<< "$normalised"
+
+  lines=0
+  local line
+  for line in "${logical[@]}"; do
+    _wt_rows "$line" "$usable"
+    lines=$(( lines + _UI_ROWS ))
+  done
+  (( lines < 1 )) && lines=1
+
   h=$(( lines + extra ))
   maxh=$(( $(_ui_term_lines) - 1 ))
   (( h > maxh )) && { h=$maxh; _UI_CLIPPED=1; }
