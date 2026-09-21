@@ -72,6 +72,100 @@ ARCHIVE_LAST_FREED_BYTES=0
 # writes them again.
 ARCHIVE_TERMINAL_COUNT=0
 
+# ── Primitives shared by both directions ──────────────────────────────────────
+#
+# Archiving and rolling back are not mirror images — the mechanics differ by who
+# owns the files. On the way out, `cp -p` on the host is enough: the external
+# storage belongs to the invoking user. On the way back the target is inside the
+# library, which belongs to the container's root, and this tool never uses sudo,
+# so the write goes through `docker exec`. Two implementations, not a swap of two
+# variables.
+#
+# What IS the same in both directions is the discipline: write, push it out of
+# the cache, read it back, compare it against the fingerprint taken before
+# anything moved, and only then let the caller remove the other copy. That lives
+# here, in one place, so that both directions are held to it — and so that the
+# guard against overwriting an occupied path, which archiving had and rolling
+# back did not, now covers both.
+
+# Writes <src> to <dst>, on the side named by <side>, and proves the result
+# carries <expected_sha> before returning 0. Reads the copy back through the same
+# side it was written on: for the container that also proves Immich can see what
+# we just wrote, which is the whole lesson of the 11 September incident.
+# Leaves nothing behind on failure. 0 written and verified, 1 otherwise.
+_transfer_and_verify() {
+  local side="$1" src="$2" dst="$3" expected_sha="$4"
+  local back=""
+
+  case "$side" in
+    host)
+      if ! cp -p -- "$src" "$dst"; then
+        log_error "Copy failed: $src → $dst"
+        rm -f -- "$dst"
+        return 1
+      fi
+      # Flushed BEFORE it is verified, so the fingerprint is taken of what is on
+      # the storage rather than of what is still in memory.
+      file_flush "$dst"
+      back=$(file_fingerprint "$dst") || back=""
+      ;;
+    container)
+      if ! $DOCKER_CMD exec "$IMMICH_SERVER_CONTAINER" \
+             mkdir -p "$(dirname "$dst")" </dev/null; then
+        log_error "Could not create the folder inside the container: $(dirname "$dst")"
+        return 1
+      fi
+      if ! $DOCKER_CMD exec -i "$IMMICH_SERVER_CONTAINER" \
+             sh -c 'cat > "$1"' _ "$dst" < "$src"; then
+        log_error "Could not write the file inside the container: $dst"
+        $DOCKER_CMD exec "$IMMICH_SERVER_CONTAINER" rm -f "$dst" </dev/null || true
+        return 1
+      fi
+      # Only `cat` is assumed to exist in the Immich image.
+      back=$($DOCKER_CMD exec "$IMMICH_SERVER_CONTAINER" cat -- "$dst" </dev/null \
+             | sha256sum | cut -d' ' -f1) || back=""
+      ;;
+    *)
+      log_error "Internal error: unknown transfer side '$side'."
+      return 1 ;;
+  esac
+
+  if [[ "$back" != "$expected_sha" ]]; then
+    log_error "What was written does not match the recorded fingerprint: $dst"
+    # An interrupted or truncated write leaves a PARTIAL file that a mere
+    # existence check would accept — and the other copy would then be deleted.
+    # It goes, on both sides: nothing is lost, the original is still there.
+    case "$side" in
+      host)      rm -f -- "$dst" ;;
+      container) $DOCKER_CMD exec "$IMMICH_SERVER_CONTAINER" rm -f "$dst" </dev/null || true ;;
+    esac
+    log_error "The incomplete file was removed; the other copy is still in place."
+    return 1
+  fi
+  return 0
+}
+
+# Says what is already sitting at <path>, against the fingerprint we expect:
+#   0  nothing there — go ahead and write
+#   1  already there and identical — no need to write, and nothing to refuse
+#   2  already there and DIFFERENT, or impossible to compare — refuse
+#
+# Concluding "already archived" means skipping the copy, pointing the database at
+# that file and deleting the source. Size equality was the proof, and it is not
+# one: a foreign file of the same byte count was accepted and the original photo
+# deleted in its favour. Only a matching fingerprint earns it.
+#
+# The rollback did not have this guard at all: it wrote over the library path
+# with `cat >` without looking at what was there.
+_refuse_if_occupied() {
+  local path="$1" expected_sha="$2"
+  [[ -e "$path" ]] || return 0
+  local current
+  current=$(file_fingerprint "$path") || return 2
+  [[ "$current" == "$expected_sha" ]] && return 1
+  return 2
+}
+
 # ── Per-asset pipeline, journalled and resumable ──────────────────────────────
 
 # Where Immich currently says the asset is, answered against what the journal
@@ -208,52 +302,28 @@ _archive_process_asset() {
       return 1
     fi
 
+    # The call must not be bare: _refuse_if_occupied answers 1 and 2 for cases we
+    # handle, and under `set -e` a bare call would abort the whole run instead.
+    local occupied=0
+    _refuse_if_occupied "$dst_host" "$sha" || occupied=$?
     local need_copy=true
-    if [[ -e "$dst_host" ]]; then
-      # Concluding "already archived" means skipping the copy, pointing the database
-      # at this file and deleting the source. Size equality was the proof, and it is
-      # not one: a foreign file of the same byte count was accepted and the original
-      # photo deleted in its favour. Only a matching fingerprint earns it.
-      #
-      # The call must not be bare: files_are_identical answers 1 and 2 for cases we
-      # handle, and under `set -e` a bare call would abort the whole run instead.
-      local identical=0
-      files_are_identical "$src_host" "$dst_host" || identical=$?
-      case $identical in
-        0) log_warn "Already at destination, identity verified: $dst_host — updating DB only."
-           need_copy=false ;;
-        1) log_error "Destination exists with DIFFERENT content: $dst_host"
-           log_error "Another file already occupies that path — asset skipped, source kept."
-           log_error "Two users mapped to the same folder in USER_MAP is the usual cause."
-           _park prevu; return $? ;;
-        *) log_error "Cannot compare source and destination: $dst_host — asset skipped, source kept."
-           log_error "One of the two files is unreadable; the storage may be down."
-           _park prevu; return $? ;;
-      esac
-    fi
+    case $occupied in
+      0) ;;
+      1) log_warn "Already at destination, identity verified: $dst_host — updating DB only."
+         need_copy=false ;;
+      *) log_error "Destination exists with DIFFERENT content, or cannot be read: $dst_host"
+         log_error "Another file already occupies that path — asset skipped, source kept."
+         log_error "Two users mapped to the same folder in USER_MAP is the usual cause."
+         _park prevu; return $? ;;
+    esac
 
     if "$need_copy"; then
       mkdir -p "$(dirname "$dst_host")" 2>/dev/null || true
-      # A failed or interrupted cp (full disk, dead mount) can leave a PARTIAL file
-      # that a mere existence check would accept — and the source would then be
-      # deleted. Both the exit code and the copied content are checked before
-      # anything irreversible happens.
       # -p keeps the timestamps: without it every archived photo arrived on the
       # external storage dated the day it was archived, losing the only file-level
-      # trace of when it was taken.
-      if ! cp -p "$src_host" "$dst_host"; then
-        log_error "Copy failed: $src_host → $dst_host"
-        rm -f "$dst_host"
-        _park prevu; return $?
-      fi
-      # Flushed BEFORE it is verified, so the fingerprint is taken of what is on
-      # the storage rather than of what is still in memory.
-      file_flush "$dst_host"
-      local copied=0
-      files_are_identical "$src_host" "$dst_host" || copied=$?
-      if (( copied != 0 )); then
-        log_error "The copy does not match its source: $dst_host — removed, asset skipped."
-        rm -f "$dst_host"
+      # trace of when it was taken. The write, the flush, the read-back and the
+      # cleanup of a partial file all live in _transfer_and_verify now.
+      if ! _transfer_and_verify host "$src_host" "$dst_host" "$sha"; then
         _park prevu; return $?
       fi
     fi
@@ -483,7 +553,9 @@ archive_reconcile() {
     while IFS="$RUNLOG_SEP" read -r asset etat _; do
       [[ -n "$asset" ]] || continue
       case "$etat" in
-        source_supprimee|abandonne) ;;
+        # `annule` included: a rollback put that asset back in the library, so it
+        # is an ordinary candidate again and must not stay held for ever.
+        source_supprimee|abandonne|annule) ;;
         *) ARCHIVE_IN_FLIGHT["$asset"]=1 ;;
       esac
     done < <(runlog_read "$f2")
@@ -495,31 +567,43 @@ archive_reconcile() {
 
 # ── Rollback ──────────────────────────────────────────────────────────────────
 
-# Copies a file back INTO the library through the container, which owns it, and
-# verifies the result by reading it back out. Only `cat` is assumed to exist in
-# the Immich image. 0 restored and verified, 1 otherwise.
+# Puts a file back INTO the library, holding the way back to the same discipline
+# as the way out: refuse an occupied path unless what is there is already the
+# right file, then write, flush, read back and compare — all of it in the shared
+# primitives. 0 restored (or already correctly there), 1 refused or failed.
+#
+# <src_host> is the library path seen from the host, used only to look at what is
+# already there; the write itself goes through the container, which owns it.
 _archive_restore_file() {
-  local dst_host="$1" src_db="$2" expected_sha="$3"
+  local dst_host="$1" src_host="$2" src_db="$3" expected_sha="$4"
 
-  if ! $DOCKER_CMD exec "$IMMICH_SERVER_CONTAINER" \
-         mkdir -p "$(dirname "$src_db")" </dev/null; then
-    log_error "Could not create the library folder inside the container: $(dirname "$src_db")"
-    return 1
-  fi
-  if ! $DOCKER_CMD exec -i "$IMMICH_SERVER_CONTAINER" \
-         sh -c 'cat > "$1"' _ "$src_db" < "$dst_host"; then
-    log_error "Could not write the file back into the library: $src_db"
-    return 1
-  fi
-  local back
-  back=$($DOCKER_CMD exec "$IMMICH_SERVER_CONTAINER" cat -- "$src_db" </dev/null \
-         | sha256sum | cut -d' ' -f1) || back=""
-  if [[ "$back" != "$expected_sha" ]]; then
-    log_error "The restored file does not match its recorded fingerprint: $src_db"
-    log_error "Nothing else was changed; the external copy is still in place."
-    return 1
-  fi
-  return 0
+  local occupied=0
+  _refuse_if_occupied "$src_host" "$expected_sha" || occupied=$?
+  case $occupied in
+    0) ;;
+    1) # Already back, and proven to be the right file. Nothing to write.
+       return 0 ;;
+    *) log_error "A DIFFERENT file already occupies the library path, or it cannot be read: $src_db"
+       log_error "Refused rather than overwritten — the archived copy is untouched."
+       return 1 ;;
+  esac
+
+  _transfer_and_verify container "$dst_host" "$src_db" "$expected_sha"
+}
+
+# The sidecar candidates for an asset, derived from its path exactly as
+# _archive_move_sidecar derives them on the way out — including stripping the
+# extension from the FILE NAME and not from the whole path (F10). Echoed one per
+# line, deduplicated: for an asset with no extension, "<path>.xmp" and
+# "<base>.xmp" are the same file.
+_sidecar_candidates() {
+  local path="$1"
+  local folder base_name
+  folder=$(dirname "$path")
+  base_name=$(basename "$path")
+  local base="$folder/${base_name%.*}"
+  printf '%s\n' "${path}.xmp" "${path}.json" "${base}.xmp" "${base}.json" \
+    | awk '!seen[$0]++'
 }
 
 # immich-auto-dumper rollback <run-id> — explicit, never automatic. Bringing files
@@ -559,15 +643,29 @@ archive_rollback() {
   log_info "Rolling back $(basename "$file")."
   # The rollback keeps its own journal: it is an operation in its own right, and
   # the original file stays a truthful record of what that run did.
+  RUNLOG_DIRECTION="rollback"
   runlog_open "rollback" || true
 
   local asset etat attempts size sha src src_db dst dst_db
-  local undone=0 refused=0
+  local undone=0 refused=0 already=0
   while IFS="$RUNLOG_SEP" read -r asset etat attempts size sha src src_db dst dst_db; do
     [[ -n "$asset" ]] || continue
     if [[ "$etat" == "illisible" ]]; then
       log_error "Entry for asset $asset cannot be read — skipped."
       refused=$(( refused + 1 )); continue
+    fi
+    # Undone already, by an earlier rollback of THIS run. Without this the same
+    # run could be rolled back again and again: the only question asked was "does
+    # the database point at the recorded destination?", which cannot tell this
+    # run's work from a LATER run that archived the same asset to the same path.
+    # Replaying rollback A after run B had re-archived those assets undid B's
+    # work instead, left B's journal claiming a job that no longer existed, and
+    # could be repeated indefinitely.
+    #
+    # Counted apart, not as a refusal: nothing is wrong, there is simply nothing
+    # left to undo.
+    if [[ "$etat" == "annule" ]]; then
+      already=$(( already + 1 )); continue
     fi
     # Only entries that actually completed have anything to undo.
     [[ "$etat" == "source_supprimee" ]] || continue
@@ -595,7 +693,7 @@ archive_rollback() {
       continue
     fi
 
-    if ! _archive_restore_file "$dst" "$src_db" "$sha"; then
+    if ! _archive_restore_file "$dst" "$src" "$src_db" "$sha"; then
       refused=$(( refused + 1 )); continue
     fi
     if ! db_update_asset_path "$asset" "$src_db"; then
@@ -606,16 +704,65 @@ archive_rollback() {
       continue
     fi
     rm -f -- "$dst"
+    _rollback_sidecars "$dst" "$src"
     runlog_record "" "$asset" source_supprimee 1 "$size" "$sha" "$dst" "$dst_db" "$src" "$src_db" || true
+    # Written into the ORIGINAL run's journal, not this one. It does not falsify
+    # that run's account of what it did — it extends it with what happened to it
+    # afterwards, which makes it more faithful, not less. A rollback that was
+    # only partly accepted marks nothing beyond the entries it completed, so it
+    # can be run again once the cause of the refusals is dealt with.
+    RUNLOG_DIRECTION="archive"
+    runlog_record "$file" "$asset" annule "$attempts" "$size" "$sha" "$src" "$src_db" "$dst" "$dst_db" || true
+    RUNLOG_DIRECTION="rollback"
     undone=$(( undone + 1 ))
   done < <(runlog_read "$file")
 
   runlog_close
   runlog_rotate
   release_lock
+  RUNLOG_DIRECTION="archive"
 
-  log_info "Rollback of $(basename "$file"): $undone asset(s) brought back, $refused refused."
+  local already_note=""
+  (( already > 0 )) && already_note=", $already already undone by an earlier rollback"
+  log_info "Rollback of $(basename "$file"): $undone asset(s) brought back, $refused refused${already_note}."
   (( refused == 0 ))
+}
+
+# Brings an asset's sidecars back alongside it. They are not in the journal —
+# Immich v3.2.0 does not track them in the database at all, it finds them by
+# naming convention when it scans — so they are DERIVED from the destination
+# path, exactly as they were derived from the source path on the way out.
+#
+# Honest about what that is worth: no fingerprint was recorded for these files
+# when they were archived, so the verification below proves the transfer was
+# intact, not that the sidecar was not edited on the storage since. That is
+# strictly better than abandoning it, and it is all the journal allows. A file
+# already present in the library at that path is never overwritten unless it is
+# identical — the same discipline as the asset.
+_rollback_sidecars() {
+  local dst_asset="$1" src_asset="$2"
+  local ext_sidecar rel lib_sidecar lib_db sha
+  while IFS= read -r ext_sidecar; do
+    [[ -f "$ext_sidecar" ]] || continue
+    # The sidecar sits beside the asset on both sides, so its library path is the
+    # asset's library path with the same trailing difference.
+    rel="${ext_sidecar#"$dst_asset"}"
+    if [[ "$rel" != "$ext_sidecar" ]]; then
+      lib_sidecar="${src_asset}${rel}"                 # "<asset>.xmp" form
+    else
+      lib_sidecar="${src_asset%.*}${ext_sidecar#"${dst_asset%.*}"}"   # "<base>.xmp" form
+    fi
+    lib_db=$(host_path_to_db_path "$lib_sidecar")
+    if ! sha=$(file_fingerprint "$ext_sidecar"); then
+      log_warn "Cannot read the archived sidecar, left where it is: $ext_sidecar"
+      continue
+    fi
+    if ! _archive_restore_file "$ext_sidecar" "$lib_sidecar" "$lib_db" "$sha"; then
+      log_warn "Sidecar not brought back, archived copy kept: $ext_sidecar"
+      continue
+    fi
+    rm -f -- "$ext_sidecar"
+  done < <(_sidecar_candidates "$dst_asset")
 }
 
 # Moves sidecar files (XMP, JSON) alongside an asset to external storage.
@@ -624,32 +771,17 @@ _archive_move_sidecar() {
   local src_host_path="$1"
   local dry_run="${2:-false}"
 
-  # The extension is stripped from the FILE NAME, not from the whole path.
-  # `${src_host_path%.*}` cut at the last dot anywhere in the path, so an asset
-  # with no extension living under a directory that contains one — ".../v1/photo"
-  # — produced the base ".../v" and moved ".../v1.xmp", a file belonging to
-  # something else entirely, off to the external storage.
-  local folder base_name
-  folder=$(dirname "$src_host_path")
-  base_name=$(basename "$src_host_path")
-  local base="$folder/${base_name%.*}"
+  # Derived by the same helper the rollback uses, so what goes out and what comes
+  # back are decided in one place. It strips the extension from the FILE NAME and
+  # not from the whole path (F10), and deduplicates: for an asset with no
+  # extension, "<path>.xmp" and "<base>.xmp" are the same file, which a
+  # simulation used to announce twice.
+  local -a candidates=()
+  mapfile -t candidates < <(_sidecar_candidates "$src_host_path")
 
-  local candidates=(
-    "${src_host_path}.xmp"
-    "${src_host_path}.json"
-    "${base}.xmp"
-    "${base}.json"
-  )
-
-  # For an asset with no extension, "<path>.xmp" and "<base>.xmp" name the same
-  # file, so it appeared twice. Harmless in a real run — the second pass no
-  # longer finds it — but a simulation announced moving it twice.
-  local -A seen_sidecar=()
   local sidecar
   for sidecar in "${candidates[@]}"; do
     [[ -f "$sidecar" ]] || continue
-    [[ -n "${seen_sidecar[$sidecar]:-}" ]] && continue
-    seen_sidecar["$sidecar"]=1
 
     local dst_sidecar
     if ! dst_sidecar=$(archive_build_dest_path "$sidecar"); then
@@ -662,21 +794,18 @@ _archive_move_sidecar() {
       continue
     fi
 
-    mkdir -p "$(dirname "$dst_sidecar")"
-    if ! cp -p "$sidecar" "$dst_sidecar"; then
-      log_warn "Failed to copy sidecar: $sidecar"
-      rm -f "$dst_sidecar"
+    # Held to the same standard as the asset, through the same primitives: the
+    # source is only removed once the copy is proved identical. The test this
+    # replaced — does the destination exist — accepted a truncated file and then
+    # deleted the original.
+    local sc_sha
+    if ! sc_sha=$(file_fingerprint "$sidecar"); then
+      log_warn "Cannot read sidecar to fingerprint it, source kept: $sidecar"
       continue
     fi
-    file_flush "$dst_sidecar"
-    # Held to the same standard as the asset: the source is only removed once the
-    # copy is proved identical. The previous test — does the destination exist —
-    # accepted a truncated file and then deleted the original.
-    local same=0
-    files_are_identical "$sidecar" "$dst_sidecar" || same=$?
-    if (( same != 0 )); then
-      log_warn "Sidecar copy does not match its source, source kept: $sidecar"
-      rm -f "$dst_sidecar"
+    mkdir -p "$(dirname "$dst_sidecar")"
+    if ! _transfer_and_verify host "$sidecar" "$dst_sidecar" "$sc_sha"; then
+      log_warn "Sidecar not archived, source kept: $sidecar"
       continue
     fi
     # Same ownership constraint as the asset: remove the source via the container.

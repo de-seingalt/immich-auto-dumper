@@ -59,6 +59,28 @@ RUNLOG_KEEP_DONE=30
 # no path can contain it.
 RUNLOG_SEP=$'\x01'
 
+# Which way the operation this run records was going: `archive` or `rollback`.
+# Written into every record so a journal says on its face what it was doing —
+# the two directions share the same state vocabulary, and "source removed" means
+# opposite things depending on the direction.
+#
+# A scalar, and read back with `archive` as the default, so every journal written
+# before this field existed stays valid and nothing in the parser has to change.
+# That is exactly why it is not a list of sidecars: the JSON here is written and
+# read by hand, and the whole resumption depends on that parser.
+RUNLOG_DIRECTION="archive"
+
+# States an entry can carry:
+#   prevu             decided, nothing done yet
+#   copie             written at the far end, database not yet pointed at it
+#   base_a_jour       database points at the far end, other copy still present
+#   source_supprimee  finished
+#   annule            finished, then undone by a rollback of this very run
+#   bloque            gave up after RUNLOG_MAX_ATTEMPTS tries — needs a person
+#   divergent         Immich disagrees with the journal — needs a person
+#   abandonne         the asset left Immich; nothing left to resume
+#   illisible         the record could not be parsed; authorises nothing
+
 runlog_dir() {
   printf '%s/runs\n' "${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper}"
 }
@@ -167,8 +189,8 @@ runlog_record() {
   local src="$7" src_db="$8" dst="$9" dst_db="${10}"
   # Braced for the same reason as in runlog_open: 2>/dev/null must be in place
   # before the append is attempted, or the shell's own error message escapes.
-  if ! { printf '{"ts":"%s","asset":"%s","etat":"%s","tentatives":%d,"taille":%d,"sha":"%s","src":"%s","src_db":"%s","dst":"%s","dst_db":"%s"}\n' \
-    "$(date '+%Y-%m-%dT%H:%M:%S%z')" \
+  if ! { printf '{"ts":"%s","sens":"%s","asset":"%s","etat":"%s","tentatives":%d,"taille":%d,"sha":"%s","src":"%s","src_db":"%s","dst":"%s","dst_db":"%s"}\n' \
+    "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$RUNLOG_DIRECTION" \
     "$(_runlog_escape "$asset")" "$etat" "$attempts" "$size" "$(_runlog_escape "$sha")" \
     "$(_runlog_escape "$src")" "$(_runlog_escape "$src_db")" \
     "$(_runlog_escape "$dst")" "$(_runlog_escape "$dst_db")" \
@@ -210,7 +232,7 @@ runlog_close() {
   while IFS="$RUNLOG_SEP" read -r _ etat _; do
     [[ -z "$etat" ]] && continue
     case "$etat" in
-      source_supprimee|abandonne) ;;
+      source_supprimee|abandonne|annule) ;;
       *) left=$(( left + 1 )) ;;
     esac
   done < <(runlog_read "$file")
