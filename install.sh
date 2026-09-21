@@ -1,40 +1,56 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ──────────────────────────────────────────────────────────────────────────────
-# immich-auto-dumper installer / updater.
-#
-# Always brings the install up to the latest origin/main, then hands off to the
-# setup wizard (which owns the ~/.local/bin symlink). On an install that already has
-# a config.conf, setup opens on a review of that config — checks, summary and cron
-# status — not on the step-by-step, so handing off is always the right move here.
-#
-#   Nothing installed yet  : clones origin/main (the `curl ... | bash` path).
-#   Installation present    : asks whether to update keeping the local config,
-#                             update and reset the local config, or cancel.
-#                             A non-git directory (e.g. files copied in by hand)
-#                             is adopted into git, then synced to origin/main.
-#
-# config.conf and logs are git-ignored, so a plain update never touches them;
-# "reset config" explicitly backs config.conf up to config.conf.bak and removes
-# it so the wizard regenerates a fresh one.
-#
-# Usage:
-#   install.sh [-y|--yes]
-#     -y, --yes   Assume "yes": non-interactive update, keeping the local config.
-#   Env overrides: INSTALL_DIR, REPO, BRANCH (defaults to main), ASSUME_YES=1
-# ──────────────────────────────────────────────────────────────────────────────
+# immich-auto-dumper installer / updater. Clones the repository on a first
+# install, brings an existing one up to origin/<BRANCH> afterwards, then hands
+# off to the setup wizard. The help text is in _usage.
 
 INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/share/immich-auto-dumper}"
 REPO="${REPO:-https://github.com/de-seingalt/immich-auto-dumper.git}"
 BRANCH="${BRANCH:-main}"
 ASSUME_YES="${ASSUME_YES:-0}"
 
+# Prints the help text, in full. A heredoc and not a slice of the comment block
+# above, whose line numbers a single added line was enough to shift.
+_usage() {
+  cat <<'EOF'
+immich-auto-dumper installer / updater.
+
+Usage:
+  install.sh [-y|--yes]
+  install.sh -h|--help
+
+Options:
+  -y, --yes     Assume "yes": non-interactive update, keeping the local config.
+  -h, --help    Show this help and exit.
+
+Environment overrides:
+  INSTALL_DIR   Where to install  (default: ~/.local/share/immich-auto-dumper)
+  REPO          Repository to clone from
+  BRANCH        Branch to track   (default: main)
+  ASSUME_YES    Set to 1, same as --yes
+
+What it does:
+  Nothing installed yet   Clones the repository into INSTALL_DIR. This is the
+                          "curl ... | bash" path.
+  Installation present    Asks whether to update keeping the local config,
+                          update and reset it, or cancel. A directory that is
+                          not a git checkout is adopted into git first.
+
+  config.conf and the logs are git-ignored, so a plain update never touches
+  them. Resetting the config backs it up to config.conf.bak and removes it, so
+  the wizard writes a fresh one.
+
+  It then runs "immich-auto-dumper setup", which owns the ~/.local/bin symlink.
+  With --yes, or with no terminal to answer it, that step is skipped.
+EOF
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -y|--yes)  ASSUME_YES=1 ;;
-    -h|--help) sed -n '4,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) printf 'Unknown argument: %s\n' "$1" >&2; exit 1 ;;
+    -h|--help) _usage; exit 0 ;;
+    *) printf 'Unknown argument: %s\n\n' "$1" >&2; _usage >&2; exit 1 ;;
   esac
   shift
 done
