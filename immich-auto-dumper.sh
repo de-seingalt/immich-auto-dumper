@@ -428,6 +428,14 @@ _config_check() {
   # would otherwise have no place for its archived photos.
   local users_raw row uid uname label key
   local -a unmapped=()
+  # `|| true` here is an arbitrage, not an oversight: db_get_users propagates the
+  # 2 that means "the database did not answer", and this screen absorbs it on
+  # purpose. The config review must open even against a mute Immich — a user list
+  # that cannot be read downgrades the display, it does not invent a problem and
+  # it must not keep the user from seeing and fixing their configuration. The
+  # same reasoning covers db_get_external_libraries, db_detect_library_prefix,
+  # db_immich_backup_keep_last and db_asset_would_be_external: every one of them
+  # is on a setup or preview path. Nothing on the archiving path absorbs a 2.
   users_raw=$(db_get_users 2>/dev/null || true)
   if [[ -n "$users_raw" ]]; then
     local -a _u=()
@@ -946,6 +954,8 @@ _setup() {
   local -a user_paths=()
   local users_raw=""
   if _db_reachable; then
+    # Setup path: see the note in _config_check. A mute database costs the
+    # pre-filled folder suggestions, not the wizard.
     users_raw=$(db_get_users 2>/dev/null || true)
   fi
 

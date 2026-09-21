@@ -341,6 +341,9 @@ _archive_move_file() {
       log_info "DRY-RUN: would copy $src_host_path → $dst_host"
       log_info "DRY-RUN: would UPDATE asset $asset_id originalPath → $dst_db"
     fi
+    # Preview path: `|| true` on purpose. A mute database here costs this one
+    # advisory line, and a simulation must still list its candidates. See the
+    # note in _config_check for the whole family.
     if [[ "$(db_asset_would_be_external "$asset_id" "$dst_db" || true)" == "f" ]]; then
       log_warn "DRY-RUN: no external library in Immich covers $dst_db for this asset's owner — the real run would SKIP this asset (Immich's library scan would otherwise re-import it as a duplicate). Create the external library first (see setup)."
     fi
@@ -886,13 +889,51 @@ archive_run() {
 
   local freed_bytes=0
 
-  while IFS="$DB_FIELD_SEP" read -r user_folder parent_dir folder_size; do
+  # Capture, check, THEN iterate — never iterate a process substitution.
+  # `while … done < <(db_get_archive_candidates)` threw away the function's exit
+  # code: _db_exec answers 2 when psql could not run, but the loop simply saw no
+  # rows and the run reported "Archive complete. Freed: 0 B." with rc=0. A
+  # database that stops answering after check_prereqs is indistinguishable from
+  # "nothing left to archive" — the library quietly stops being archived and the
+  # cron reports success every night. That is the 11 September failure family.
+  #
+  # Iterating an array also leaves stdin alone, which is why _config_check and
+  # _setup already do it this way.
+  local candidates_raw cand_rc=0
+  candidates_raw=$(db_get_archive_candidates) || cand_rc=$?
+  if (( cand_rc != 0 )); then
+    log_error "Could not read the list of directories to archive — the database stopped answering."
+    log_error "Nothing was archived. This is NOT 'nothing to do'."
+    "$dry_run" || runlog_close
+    release_lock
+    return 1
+  fi
+  local -a candidates=()
+  [[ -n "$candidates_raw" ]] && mapfile -t candidates <<< "$candidates_raw"
+
+  local row user_folder parent_dir folder_size
+  for row in "${candidates[@]}"; do
+    IFS="$DB_FIELD_SEP" read -r user_folder parent_dir folder_size <<< "$row"
     [[ -z "$user_folder" ]] && continue
 
     log_info "Candidate directory: $parent_dir (user: $user_folder, $(bytes_to_human "${folder_size:-0}"))"
 
+    # Same treatment for the inner query, where the failure is per-directory: log
+    # it, count the directory as not processed, and above all do not announce it
+    # as archived.
+    local assets_raw asset_rc=0
+    assets_raw=$(db_get_folder_assets "$parent_dir") || asset_rc=$?
+    if (( asset_rc != 0 )); then
+      log_error "Could not list the assets of $parent_dir — the database stopped answering. Directory left untouched."
+      continue
+    fi
+    local -a assets=()
+    [[ -n "$assets_raw" ]] && mapfile -t assets <<< "$assets_raw"
+
     local dir_ok=0 dir_ko=0 dir_freed=0
-    while IFS="$DB_FIELD_SEP" read -r asset_id original_path_db file_size; do
+    local arow asset_id original_path_db file_size
+    for arow in "${assets[@]}"; do
+      IFS="$DB_FIELD_SEP" read -r asset_id original_path_db file_size <<< "$arow"
       [[ -z "$asset_id" ]] && continue
 
       # Already spoken for by an unfinished run: reconciliation above owns it.
@@ -918,7 +959,7 @@ archive_run() {
       # weighs. file_size is only good enough to sort the candidates.
       dir_freed=$((   dir_freed   + ARCHIVE_LAST_FREED_BYTES ))
       freed_bytes=$(( freed_bytes + ARCHIVE_LAST_FREED_BYTES ))
-    done < <(db_get_folder_assets "$parent_dir")
+    done
 
     # "Directory archived" used to be printed whatever happened, so a directory
     # whose every asset had just failed was reported, at INFO, as archived — with
@@ -950,7 +991,7 @@ archive_run() {
         break
       fi
     fi
-  done < <(db_get_archive_candidates)
+  done
 
   if ! "$dry_run"; then
     runlog_close
