@@ -31,9 +31,13 @@ set -euo pipefail
 # anything else. A line that does not parse makes its asset untouchable rather
 # than guessed at: an unreadable memo authorises nothing.
 #
-# Honest limit: records are appended without fsync. A killed process, a restarted
-# container or a reboot keep them (they are in the page cache); a power cut can
-# lose the last lines — but a power cut also loses the operation they describe.
+# Each record is pushed to the disk as it is written (_runlog_flush), because a
+# memo that only exists in the page cache does not survive the power cut it is
+# there to protect against. The flush is deliberately narrow: `sync -d` on the
+# journal alone, WITHOUT file_flush's fallback to a global `sync`. Losing a line
+# costs traceability, not a photo, and a global sync on a busy host would cost
+# far more than that. Four small writes per asset are nothing beside copying the
+# photo itself.
 
 # Where records are appended right now. Reconciliation retargets it at each older
 # file it works through, so that a resumed transition lands in the run it belongs to.
@@ -113,18 +117,26 @@ runlog_path_is_recordable() {
 
 # Opens a run file. Not called for a dry run: a simulation must leave nothing that
 # later reads as work done.
+# The messages here only state the fact. What it means is the caller's to decide:
+# archive_run treats it as a refusal to archive at all, since a journal directory
+# that cannot be written signals a problem on the very disk that carries both this
+# script and Immich.
 runlog_open() {
   local dir
   dir=$(runlog_dir)
   mkdir -p "$dir" 2>/dev/null || {
-    log_warn "Cannot create $dir — this run will not be resumable."
+    log_warn "Cannot create the run journal directory: $dir"
     RUNLOG_FILE=""; RUNLOG_ID=""
     return 1
   }
   RUNLOG_ID="${1:-run}-$(date '+%Y%m%dT%H%M%S')"
   RUNLOG_FILE="$dir/$RUNLOG_ID.active"
-  : > "$RUNLOG_FILE" 2>/dev/null || {
-    log_warn "Cannot write $RUNLOG_FILE — this run will not be resumable."
+  # Braced: bash sets redirections up left to right, so a bare
+  # `: > "$f" 2>/dev/null` fails on the first one while stderr is still the
+  # terminal — and the raw "Permission denied" landed next to the tool's own
+  # message. Grouping puts 2>/dev/null in front of the redirection that fails.
+  { : > "$RUNLOG_FILE"; } 2>/dev/null || {
+    log_warn "Cannot write the run journal: $RUNLOG_FILE"
     RUNLOG_FILE=""; RUNLOG_ID=""
     return 1
   }
@@ -132,20 +144,41 @@ runlog_open() {
   return 0
 }
 
+# Pushes the journal out of the page cache. `sync -d` on that one small local
+# file, and NO fallback to a global sync: see the note at the top of this file.
+_runlog_flush() { sync -d -- "$1" 2>/dev/null || true; }
+
 # runlog_record <file> <asset> <etat> <attempts> <size> <sha> <src> <src_db> <dst> <dst_db>
-# Appends to <file>, or to the current run when <file> is empty. A no-op when no
-# journal is open, so the callers need no conditionals.
+# Appends to <file>, or to the current run when <file> is empty.
+#
+# Returns non-zero when the record could NOT be written. It used to warn and
+# return 0, so the caller went straight on to the irreversible act the record was
+# meant to describe — the exact opposite of the guarantee this file exists for.
+# The three callers that stand in front of an irreversible step check the answer
+# and skip the asset; see _archive_process_asset.
+#
+# Still a silent no-op when no journal is open at all: that is the rollback's
+# case, whose own journal is informational (the run file it undoes is the
+# authority), and archive_run now refuses to run at all without one.
 runlog_record() {
   local file="${1:-$RUNLOG_FILE}"
   [[ -n "$file" ]] || return 0
   local asset="$2" etat="$3" attempts="$4" size="$5" sha="$6"
   local src="$7" src_db="$8" dst="$9" dst_db="${10}"
-  printf '{"ts":"%s","asset":"%s","etat":"%s","tentatives":%d,"taille":%d,"sha":"%s","src":"%s","src_db":"%s","dst":"%s","dst_db":"%s"}\n' \
+  # Braced for the same reason as in runlog_open: 2>/dev/null must be in place
+  # before the append is attempted, or the shell's own error message escapes.
+  if ! { printf '{"ts":"%s","asset":"%s","etat":"%s","tentatives":%d,"taille":%d,"sha":"%s","src":"%s","src_db":"%s","dst":"%s","dst_db":"%s"}\n' \
     "$(date '+%Y-%m-%dT%H:%M:%S%z')" \
     "$(_runlog_escape "$asset")" "$etat" "$attempts" "$size" "$(_runlog_escape "$sha")" \
     "$(_runlog_escape "$src")" "$(_runlog_escape "$src_db")" \
     "$(_runlog_escape "$dst")" "$(_runlog_escape "$dst_db")" \
-    >> "$file" 2>/dev/null || log_warn "Could not append to the run journal $file."
+    >> "$file"; } 2>/dev/null
+  then
+    log_warn "Could not append to the run journal $file."
+    return 1
+  fi
+  _runlog_flush "$file"
+  return 0
 }
 
 # States an entry can still be moved on from. Anything else is terminal.
@@ -181,10 +214,24 @@ runlog_close() {
       *) left=$(( left + 1 )) ;;
     esac
   done < <(runlog_read "$file")
-  if (( left > 0 )); then
-    mv -f -- "$file" "$base.failed" 2>/dev/null || true
-  else
-    mv -f -- "$file" "$base.done" 2>/dev/null || true
+  # A rename that fails leaves the file `.active`, which the next run reads as a
+  # killed run — the right behaviour, and the right one to keep. But it used to
+  # happen in complete silence, so the operator had no way of knowing why a run
+  # that finished cleanly kept turning up as unfinished.
+  local target="$base.done"
+  (( left > 0 )) && target="$base.failed"
+  # Reconciliation closes the very files it worked through, and one that still
+  # holds pending entries keeps the name it already had. `mv` refuses to rename a
+  # file onto itself, so without this the ordinary nightly case would warn twice.
+  if [[ "$file" == "$target" ]]; then
+    [[ "$file" == "$RUNLOG_FILE"     ]] && RUNLOG_FILE=""
+    [[ "$file" == "$RUNLOG_OWN_FILE" ]] && RUNLOG_OWN_FILE=""
+    return 0
+  fi
+  if ! mv -f -- "$file" "$target" 2>/dev/null; then
+    log_warn "Could not rename the run journal $file to $(basename "$target")."
+    log_warn "It stays .active, so the next run will treat it as a killed run and pick its entries up again."
+    return 0
   fi
   [[ "$file" == "$RUNLOG_FILE"     ]] && RUNLOG_FILE=""
   [[ "$file" == "$RUNLOG_OWN_FILE" ]] && RUNLOG_OWN_FILE=""
@@ -210,7 +257,10 @@ runlog_read() {
     [[ -z "$line" ]] && continue
     asset=$(_runlog_field "$line" asset) || asset=""
     if [[ -z "$asset" ]]; then
-      log_warn "Unreadable record in $(basename "$file") — ignored: ${line:0:80}"
+      # To stderr, not stdout: this function's stdout IS the record stream its
+      # callers parse with `while IFS=$RUNLOG_SEP read`. A log line written there
+      # arrives as a bogus record whose asset name is the message itself.
+      log_warn "Unreadable record in $(basename "$file") — ignored: ${line:0:80}" >&2
       continue
     fi
     etat=$(_runlog_field "$line" etat)          || etat="illisible"

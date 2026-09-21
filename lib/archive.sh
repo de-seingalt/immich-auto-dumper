@@ -129,10 +129,12 @@ _archive_process_asset() {
     local etat="$1"
     if [[ "$etat" != "divergent" && "$etat" != "abandonne" ]] && (( try >= RUNLOG_MAX_ATTEMPTS )); then
       log_error "Asset $asset_id has failed $try times — parked as blocked, it will not be retried."
-      runlog_record "" "$asset_id" bloque "$try" "$size" "$sha" "$src_host" "$src_db" "$dst_host" "$dst_db"
+      # `|| true`: runlog_record reports its own failure, and parking is the
+      # last thing left to record — failing it must not kill the run.
+      runlog_record "" "$asset_id" bloque "$try" "$size" "$sha" "$src_host" "$src_db" "$dst_host" "$dst_db" || true
       return 2
     fi
-    runlog_record "" "$asset_id" "$etat" "$try" "$size" "$sha" "$src_host" "$src_db" "$dst_host" "$dst_db"
+    runlog_record "" "$asset_id" "$etat" "$try" "$size" "$sha" "$src_host" "$src_db" "$dst_host" "$dst_db" || true
     case "$etat" in
       divergent|abandonne) return 2 ;;
       *) return 1 ;;
@@ -165,9 +167,18 @@ _archive_process_asset() {
     esac
   fi
 
+  # Each of the three transitions below is written down BEFORE the act it
+  # describes, and a record that cannot be written stops that act. `return 1`
+  # rather than `_park` on purpose: _park would write to the same journal (and
+  # fail in the same way), and above all nothing has been attempted, so the
+  # attempt counter must not move.
+
   # ── → copie ─────────────────────────────────────────────────────────────────
   if [[ -z "$state" || "$state" == "prevu" ]]; then
-    runlog_record "" "$asset_id" prevu "$try" "$size" "$sha" "$src_host" "$src_db" "$dst_host" "$dst_db"
+    if ! runlog_record "" "$asset_id" prevu "$try" "$size" "$sha" "$src_host" "$src_db" "$dst_host" "$dst_db"; then
+      log_error "Cannot write the run journal — asset $asset_id skipped, nothing touched."
+      return 1
+    fi
 
     local need_copy=true
     if [[ -e "$dst_host" ]]; then
@@ -219,7 +230,11 @@ _archive_process_asset() {
       fi
     fi
 
-    runlog_record "" "$asset_id" copie "$try" "$size" "$sha" "$src_host" "$src_db" "$dst_host" "$dst_db"
+    if ! runlog_record "" "$asset_id" copie "$try" "$size" "$sha" "$src_host" "$src_db" "$dst_host" "$dst_db"; then
+      log_error "Cannot write the run journal — asset $asset_id skipped before the database update."
+      log_error "The copy at $dst_host is left in place; the database still points at the source, so the asset is intact."
+      return 1
+    fi
     state="copie"
   fi
 
@@ -258,7 +273,11 @@ _archive_process_asset() {
       _park divergent; return $?
     fi
 
-    runlog_record "" "$asset_id" base_a_jour "$try" "$size" "$sha" "$src_host" "$src_db" "$dst_host" "$dst_db"
+    if ! runlog_record "" "$asset_id" base_a_jour "$try" "$size" "$sha" "$src_host" "$src_db" "$dst_host" "$dst_db"; then
+      log_error "Cannot write the run journal — asset $asset_id left with the database on the copy, source kept."
+      log_error "The asset is intact and readable; the next run will finish removing the source."
+      return 1
+    fi
     state="base_a_jour"
   fi
 
@@ -280,7 +299,10 @@ _archive_process_asset() {
       _park base_a_jour; return $?
     fi
     ARCHIVE_LAST_FREED_BYTES="$freed_now"
-    runlog_record "" "$asset_id" source_supprimee "$try" "$size" "$sha" "$src_host" "$src_db" "$dst_host" "$dst_db"
+    # The ONE record written after its act rather than before it, so its
+    # failure stays a warning: the next run re-reads the database, finds the
+    # asset at its destination and finishes cleanly.
+    runlog_record "" "$asset_id" source_supprimee "$try" "$size" "$sha" "$src_host" "$src_db" "$dst_host" "$dst_db" || true
   fi
 
   return 0
@@ -389,7 +411,7 @@ archive_reconcile() {
         # should say out loud that this entry has been given up on, and status
         # should count it among the ones needing a decision.
         log_error "Asset $asset has failed $attempts times — parked as blocked, it will not be retried."
-        runlog_record "" "$asset" bloque "$attempts" "$size" "$sha" "$src" "$src_db" "$dst" "$dst_db"
+        runlog_record "" "$asset" bloque "$attempts" "$size" "$sha" "$src" "$src_db" "$dst" "$dst_db" || true
         stuck=$(( stuck + 1 ))
         continue
       fi
@@ -534,11 +556,11 @@ archive_rollback() {
       log_error "File restored but the database could not be pointed back at it: $src_db"
       log_error "The external copy is KEPT so the asset still has a file behind it."
       refused=$(( refused + 1 ))
-      runlog_record "" "$asset" divergent 1 "$size" "$sha" "$src" "$src_db" "$dst" "$dst_db"
+      runlog_record "" "$asset" divergent 1 "$size" "$sha" "$src" "$src_db" "$dst" "$dst_db" || true
       continue
     fi
     rm -f -- "$dst"
-    runlog_record "" "$asset" source_supprimee 1 "$size" "$sha" "$dst" "$dst_db" "$src" "$src_db"
+    runlog_record "" "$asset" source_supprimee 1 "$size" "$sha" "$dst" "$dst_db" "$src" "$src_db" || true
     undone=$(( undone + 1 ))
   done < <(runlog_read "$file")
 
@@ -843,7 +865,24 @@ archive_run() {
 
   # Opened only now that there is actually something to archive: a journal file per
   # nightly no-op run would push the ones that matter out of the retention window.
-  "$dry_run" || runlog_open "run" || true
+  #
+  # And no longer `|| true`. A run used to archive for real with no journal at
+  # all — no resumption, no `rollback`, rc=0, a single WARN for the whole thing.
+  # A $LOG_DIR/runs that cannot be written is not a permissions detail: it points
+  # at a problem on the disk that carries both this script and Immich — full,
+  # remounted read-only, failing. Moving photos at that moment is exactly what
+  # must not happen, so the run stops before touching anything.
+  if ! "$dry_run"; then
+    if ! runlog_open "run"; then
+      log_error "Cannot open a run journal in $(runlog_dir) — nothing was archived."
+      log_error "Without it a run is neither resumable nor undoable, and a journal directory that refuses writes usually means the disk holding Immich is full, read-only or failing."
+      local df_line
+      df_line=$(df -h -- "${LOG_DIR:-$HOME}" 2>/dev/null | tail -1 || true)
+      [[ -n "$df_line" ]] && log_error "  df ${LOG_DIR:-$HOME}: $df_line"
+      release_lock
+      return 1
+    fi
+  fi
 
   local freed_bytes=0
 
