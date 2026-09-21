@@ -2,19 +2,15 @@
 set -euo pipefail
 
 # immich-auto-dumper — uninstaller.
-# Removes ONLY the tool's own local footprint: the ~/.local/bin symlink, the
+# Removes only the tool's own local footprint: the ~/.local/bin symlink, the
 # install directory (which holds config.conf), the cron entries, the log dir and
-# the lock file. It NEVER touches Immich (DB, assets, containers) nor anything on
-# the external storage (the .immich-auto-dumper.id marker, .immich-backup/ and the
-# archived photos) — those archived files are live Immich assets. Because external
-# storage is never touched, this can run with the external library offline.
+# the lock. It touches neither Immich (DB, assets, containers) nor anything on the
+# external storage, so it runs with the external library offline.
 
-# This script lives inside the directory it must delete. Bash may re-read the file
-# while running, so we relocate a copy to a temp path and re-exec from there before
-# removing anything. INSTALL_DIR carries the original location across the re-exec.
+# Re-execs from a temporary copy before anything is removed. INSTALL_DIR carries
+# the original location across the re-exec.
 if [[ "${IAD_RELOCATED:-}" != "1" ]]; then
-  # pwd -P (physical) so INSTALL_DIR is canonical and comparable to the readlink -f
-  # symlink target below, even when a component of $HOME is itself a symlink.
+  # pwd -P: a canonical path, comparable to the readlink -f target below.
   src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
   tmp_self="$(mktemp)"
   cp -- "${BASH_SOURCE[0]}" "$tmp_self"
@@ -25,40 +21,32 @@ fi
 INSTALL_DIR="${INSTALL_DIR:?relocation failed: INSTALL_DIR unset}"
 TMP_SELF="${TMP_SELF:-}"
 BIN_LINK="${HOME}/.local/bin/immich-auto-dumper"
-# Lock path used by versions up to and including the file-based lock. Still
-# removed here so an upgrade-then-uninstall leaves nothing behind in /tmp.
+# Lock path of the file-based lock older versions used.
 LEGACY_LOCK_FILE="/tmp/immich-auto-dumper.lock"
 
 assume_yes=false
 [[ "${1:-}" == "-y" || "${1:-}" == "--yes" ]] && assume_yes=true
 
-# Resolve LOG_DIR from the real config if present, else the XDG default — matches
-# the default used by lib/utils.sh and config.conf.example.
-#
-# The one value needed here is read out of the file, never executed. Sourcing it
-# ran whatever it contained BEFORE the confirmation prompt below — so a config
-# holding a command line executed it even when the answer was going to be "no".
+# LOG_DIR from config.conf when it is there, else the XDG default. The value is
+# read out of the file, never executed.
 LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper"
 if [[ -f "$INSTALL_DIR/config.conf" ]]; then
   cfg_log_dir="$(sed -n 's/^[[:space:]]*LOG_DIR[[:space:]]*=[[:space:]]*//p' \
                    "$INSTALL_DIR/config.conf" 2>/dev/null | tail -1)"
   cfg_log_dir="${cfg_log_dir%\"}"; cfg_log_dir="${cfg_log_dir#\"}"
   cfg_log_dir="${cfg_log_dir%\'}"; cfg_log_dir="${cfg_log_dir#\'}"
-  # Both prefixes lib/config.sh accepts, and both that config.conf.example
-  # documents. Only "~/" was handled here, so a config saying LOG_DIR="$HOME/..."
-  # fell through to the XDG default: the uninstaller printed a path it was not
-  # going to remove, and the real log directory — lock included — stayed behind.
+  # The two prefixes lib/config.sh accepts, substituted as text.
   # shellcheck disable=SC2088  # a literal pattern, not a path to expand
   case "$cfg_log_dir" in
     '~/'*)     cfg_log_dir="${HOME}${cfg_log_dir#\~}" ;;
     '$HOME/'*) cfg_log_dir="${HOME}${cfg_log_dir#\$HOME}" ;;
   esac
-  # Only an absolute path is usable, and only an absolute path is safe to rm -rf.
+  # Only an absolute path is used.
   [[ "$cfg_log_dir" == /* ]] && LOG_DIR="$cfg_log_dir"
 fi
 
-# The lock is a directory beside the logs (see lib/utils.sh): removing LOG_DIR
-# takes it with it, but it is listed so the user sees everything that goes.
+# The lock directory sits beside the logs, so removing LOG_DIR takes it too. It
+# is listed on screen all the same.
 LOCK_DIR="$LOG_DIR/immich-auto-dumper.lock.d"
 
 printf 'This will remove immich-auto-dumper from your system:\n'
@@ -92,8 +80,7 @@ if crontab -l 2>/dev/null | grep -q 'immich-auto-dumper'; then
   echo "Removed cron entries."
 fi
 
-# 2. Remove the symlink, but only if it actually points into our install dir, so we
-#    never delete an unrelated file that happens to share the name.
+# 2. Remove the symlink, only when it points into the install dir.
 if [[ -L "$BIN_LINK" ]]; then
   target="$(readlink -f "$BIN_LINK" 2>/dev/null || true)"
   if [[ "$target" == "$INSTALL_DIR"/* ]]; then
@@ -114,7 +101,7 @@ fi
 rm -rf -- "$LOCK_DIR"
 rm -f -- "$LEGACY_LOCK_FILE"
 
-# 5. Remove the install directory last (safe now that we run from a temp copy).
+# 5. Remove the install directory, last.
 if [[ -d "$INSTALL_DIR" ]]; then
   rm -rf -- "$INSTALL_DIR"
   echo "Removed install dir: $INSTALL_DIR"

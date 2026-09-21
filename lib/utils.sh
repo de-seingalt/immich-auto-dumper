@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Lock path used by versions up to and including the file-based lock. Removed on
-# the first run of the new directory lock so it does not linger in /tmp forever.
+# Lock path of the file-based lock older versions used. Removed when the
+# directory lock below is taken.
 readonly LEGACY_LOCK_FILE="/tmp/immich-auto-dumper.lock"
 
-# Docker command used throughout. This tool runs strictly as the invoking user and
-# never escalates privileges (no sudo): it is a matter of trust for its users.
+# Docker command used throughout. The tool runs as the invoking user and never
+# escalates privileges.
 DOCKER_CMD="docker"
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
+# Writes one timestamped line at <level> to the terminal — coloured on a TTY,
+# errors on stderr — and appends it to the log file.
 _log() {
   local level="$1"
   local message="$2"
@@ -31,14 +33,13 @@ _log() {
     esac
   fi
 
-  # File logging must never abort the program (set -e). If the log directory is not
-  # writable — e.g. the old /var/log default under a non-root, no-sudo install — we
-  # simply skip file logging instead of killing the run. Default lives under the
-  # user's XDG state dir so it works without privileges.
+  # A log directory that cannot be written skips file logging; it never aborts
+  # the run. The default lives under the user's XDG state dir.
   local log_file="${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper}/immich-auto-dumper.log"
   mkdir -p "$(dirname "$log_file")" 2>/dev/null || return 0
   printf '%s\n' "$line" >> "$log_file" 2>/dev/null || return 0
 
+  # Truncated to its last LOG_MAX_LINES lines once it grows past them.
   local max_lines="${LOG_MAX_LINES:-1000}"
   local current_lines
   current_lines=$(wc -l < "$log_file" 2>/dev/null || echo 0)
@@ -59,20 +60,17 @@ log_error() { _log ERROR "$1"; }
 
 # ── Prerequisites ─────────────────────────────────────────────────────────────
 
-# Probe whether docker runs as the current (unprivileged) user.
-# Non-fatal: returns 0 on success, 1 on failure. Used where exiting is undesirable
-# (e.g. status). detect_docker_cmd wraps it and exits on failure.
-# This tool never uses sudo: if the user cannot reach the daemon directly, it is
-# advised to join the docker group rather than having the script escalate for them.
+# True when docker answers as the current user. Non-fatal, for callers that must
+# not exit — status among them.
 probe_docker_cmd() {
   docker ps &>/dev/null
 }
 
-# Build advice explaining why docker is unreachable and how to fix it without sudo.
+# Logs why docker is unreachable and how to fix it without sudo.
 _docker_access_advice() {
   if id -nG 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
-    # Already in the group: either the daemon is down or the group membership has
-    # not taken effect in this session yet.
+    # Already in the group: the daemon is down, or the membership has not taken
+    # effect in this session yet.
     log_error "Cannot reach the Docker daemon although '$USER' is in the docker group."
     log_error "Check the daemon is running (systemctl status docker), or open a new"
     log_error "session if you joined the docker group during this one."
@@ -83,7 +81,7 @@ _docker_access_advice() {
   fi
 }
 
-# Verify docker runs as the current user. Exits on failure with actionable advice.
+# Same probe, but exits with the advice above when docker does not answer.
 detect_docker_cmd() {
   if ! probe_docker_cmd; then
     _docker_access_advice
@@ -91,13 +89,16 @@ detect_docker_cmd() {
   fi
 }
 
+# Pre-flight shared by every operation that touches Immich: docker reachable as
+# this user, the external commands present, the database answering and its schema
+# the one this tool expects. Logs the running Immich version. Exits on any
+# failure, before anything has been done.
 check_prereqs() {
   detect_docker_cmd
 
   local missing=() cmd
-  # Runtime dependencies actually used by the scripts (jq/curl were only needed
-  # by the removed Immich API integration). bc is used for byte arithmetic,
-  # sha256sum to prove two files are the same before deleting either of them.
+  # bc for byte arithmetic, sha256sum to prove two files identical before either
+  # of them is deleted.
   for cmd in bc sha256sum; do
     if ! command -v "$cmd" &>/dev/null; then
       missing+=("$cmd")
@@ -110,20 +111,15 @@ check_prereqs() {
     exit 1
   fi
 
-  # Log the running Immich version so schema failures in the log can be tied to
-  # the exact Immich upgrade that introduced them. Purely informational.
-  # IMMICH_SOURCE_REF is baked into the image at build time (exact release, e.g.
-  # v2.7.5); IMMICH_VERSION is only the compose-file tag the user pinned (can be
-  # a bare major or "release") and serves as fallback.
+  # IMMICH_SOURCE_REF is the exact release baked into the image at build time;
+  # IMMICH_VERSION, the fallback, is only the compose-file tag the user pinned.
   local immich_version
   immich_version=$($DOCKER_CMD exec "$IMMICH_SERVER_CONTAINER" sh -c \
     'printenv IMMICH_SOURCE_REF || printenv IMMICH_VERSION' 2>/dev/null </dev/null || true)
   log_info "Immich version: ${immich_version:-unknown}"
 
-  # Asked before the schema, so the two get different answers. A stopped database
-  # container used to surface as "Schema check failed … update this script if
-  # needed" — an invitation to edit a tool that writes to that database, over a
-  # container that only needed starting.
+  # Asked before the schema, so that a database which is merely down gets its own
+  # answer rather than being reported as a schema change.
   if ! _db_reachable; then
     log_error "The Immich database did not answer (container '${IMMICH_DB_CONTAINER}')."
     log_error "Nothing was checked and nothing was changed. Is the container running?"
@@ -131,7 +127,6 @@ check_prereqs() {
     exit 1
   fi
 
-  # Validate the Immich DB schema before any operation touches the database.
   if ! db_check_schema; then
     exit 1
   fi
@@ -139,11 +134,10 @@ check_prereqs() {
 
 # ── External storage availability ─────────────────────────────────────────────
 #
-# The destination is verified through a MARKER file written on the external
-# storage itself, so the check is agnostic to the storage type (local dir, OS
-# mount, FUSE/rclone, NFS, intermittently-attached disk...). The marker proves the
-# storage is actually reachable: when an "external mount" is not active, its mount
-# point is an empty local directory with no marker.
+# The destination is verified through a MARKER file on the external storage
+# itself, which makes the check agnostic to the storage type: local directory, OS
+# mount, FUSE/rclone, NFS, an intermittently-attached disk. An inactive mount
+# point is an empty local directory, and carries no marker.
 
 # Name of the marker file placed at the root of ARCHIVE_DEST_PATH.
 readonly ARCHIVE_MARKER_NAME=".immich-auto-dumper.id"
@@ -155,18 +149,14 @@ readonly ARCHIVE_MARKER_NAME=".immich-auto-dumper.id"
 #   2  no conclusion — the read timed out, the marker is there but unreadable, or
 #      the host can read it and the Immich container cannot
 #
-# 1 and 2 are not the same situation and must not lead to the same decision: a
-# removable disk that is simply unplugged is normal and a run should end quietly,
-# while a mount that hangs or denies reads is a fault worth surfacing.
-#
-# Echoes nothing; _archive_dest_state sets _ARCHIVE_DEST_REASON for callers that
-# want to explain themselves.
+# Echoes nothing, and sets _ARCHIVE_DEST_REASON for callers that explain
+# themselves.
 _ARCHIVE_DEST_REASON=""
 _archive_dest_state() {
   local marker="${ARCHIVE_DEST_PATH%/}/$ARCHIVE_MARKER_NAME"
   local id rc=0
-  # timeout guards against a dead FUSE/rclone mount that would hang on read. Its
-  # own exit code 124 is what tells a hang apart from a missing file.
+  # Bounded, since a dead FUSE/rclone mount hangs on read. timeout's own exit
+  # code 124 is what tells a hang from a missing file.
   id=$(timeout 10 cat -- "$marker" 2>/dev/null) || rc=$?
 
   if (( rc == 124 )); then
@@ -180,29 +170,15 @@ _archive_dest_state() {
       return 2
     fi
     if [[ -n "${ARCHIVE_STORAGE_ID:-}" && "$id" != "$ARCHIVE_STORAGE_ID" ]]; then
-      # 1, the same code as "no marker at all", and that is a decision rather
-      # than an oversight. Both answers mean the destination is not the one this
-      # configuration describes, and the only safe response to either is to act
-      # on nothing — which is what code 1 already produces: the run ends quietly,
-      # the lock is never taken, and not a single file is touched.
-      #
-      # Splitting them would buy a more precise label in `status` and nothing
-      # else, because the action would stay identical. The real question a
-      # distinct code invites — how does an operator get OUT of this state
-      # without suspending the schedule — has no answer here: a Docker bind mount
-      # attaches a path, not a device, so nothing in Immich's configuration names
-      # or verifies a volume. That is exactly why the marker exists, and
-      # answering it properly is a piece of work of its own, not a return code.
+      # Another volume's marker answers 1, the same code as no marker at all:
+      # in both cases the destination is not the one this configuration
+      # describes, and the only safe response is to act on nothing.
       _ARCHIVE_DEST_REASON="marker id does not match ARCHIVE_STORAGE_ID — wrong volume mounted?"
       return 1
     fi
-    # The host seeing the storage is not the same thing as Immich seeing it. In the
-    # state that caused the 11 September incident the host read the marker fine
-    # while the container answered "Transport endpoint is not connected" — and the
-    # tool reported itself green, archived nothing and alerted nobody.
-    #
-    # Only asked when Docker answers at all: "Docker is down" is a different fault,
-    # reported in its own right, and must not masquerade as a storage problem.
+    # The host seeing the storage is not Immich seeing it, so the marker is read
+    # again from inside the container. Only asked when Docker answers at all,
+    # since a Docker that is down is a fault of its own.
     if [[ -n "${IMMICH_SERVER_CONTAINER:-}" && -n "${ARCHIVE_CONTAINER_PATH:-}" ]] \
        && probe_docker_cmd 2>/dev/null; then
       local seen_by_container
@@ -217,9 +193,9 @@ _archive_dest_state() {
     return 0
   fi
 
-  # The read failed without hanging: either the marker is not there (the storage
-  # is simply not mounted) or it is there and we cannot read it. Only the second
-  # is a fault. The existence test is itself bounded, since the mount may be sick.
+  # The read failed without hanging: the marker is either absent — the storage is
+  # not mounted — or present and unreadable, which is the fault. The existence
+  # test is bounded too, since the mount may be sick.
   if timeout 5 ls -d -- "$marker" >/dev/null 2>&1; then
     _ARCHIVE_DEST_REASON="marker '$marker' exists but cannot be read — permissions, or a failing mount"
     return 2
@@ -228,15 +204,14 @@ _archive_dest_state() {
   return 1
 }
 
-# Quiet predicate for status and probes: 0 ready, 1 absent/wrong volume, 2 unknown.
-# Callers that only test truth are unaffected; those that care can read the code.
+# Quiet form of the state above, for status and probes: 0 ready, 1 absent or
+# wrong volume, 2 unknown. Writes nothing.
 archive_dest_ready() {
   _archive_dest_state
 }
 
-# Logging variant used by destructive operations. Same codes, with the reason
-# written to the log. Does not exit — the caller decides what a 1 and a 2 mean
-# for it.
+# Logging form, for the operations that write: the same codes, with the reason
+# logged. Never exits — what a 1 and a 2 mean is the caller's to decide.
 check_archive_dest_ready() {
   local state=0
   _archive_dest_state || state=$?
@@ -250,11 +225,10 @@ check_archive_dest_ready() {
   esac
 }
 
-# Best-effort liveness signal used ONLY at setup to decide whether to auto-create
-# the marker. Returns 0 if <path> is backed by an active non-root mount (separate
-# device / network / FUSE), 1 if it resolves to the root filesystem (plain local
-# folder, or a mount that is currently down). findmnt --target also covers the case
-# where the mount is at a parent directory (which mountpoint -q would miss).
+# True when <path> is backed by an active non-root mount — a separate device, a
+# network or FUSE filesystem. False when it resolves to the root filesystem: a
+# plain local folder, or a mount that is currently down. `findmnt --target` also
+# covers a mount at a parent directory. Used by setup alone.
 archive_dest_is_mounted() {
   local path="$1"
   command -v findmnt &>/dev/null || return 1
@@ -263,8 +237,8 @@ archive_dest_is_mounted() {
   [[ -n "$target" && "$target" != "/" ]]
 }
 
-# Writes the storage marker on the external storage and verifies the read-back.
-# Returns 1 if the write or read-back fails (read-only / inactive mount).
+# Writes the storage marker at the root of ARCHIVE_DEST_PATH and reads it back.
+# Returns 1 when either fails: a read-only or inactive mount.
 write_archive_marker() {
   local id="$1"
   local marker="${ARCHIVE_DEST_PATH%/}/$ARCHIVE_MARKER_NAME"
@@ -277,13 +251,13 @@ write_archive_marker() {
 
 # ── Cron control ──────────────────────────────────────────────────────────────
 
-# Echoes what our crontab entries are currently doing:
+# Echoes what the tool's crontab entries are currently doing:
 #   active   — at least one live (uncommented) immich-auto-dumper schedule
-#   disabled — schedules present but commented out (what `stop` leaves behind)
+#   disabled — schedules present but commented out, as `stop` leaves them
 #   absent   — no immich-auto-dumper schedule at all
-# Only lines whose payload starts like a cron schedule (digit, '*' or '@') count, so
-# a plain user comment mentioning the tool is never reported as a job. The commented
-# form matched here is exactly the one disable_cron writes and `start` reverses.
+# Only a line whose payload starts like a cron schedule — a digit, '*' or '@' —
+# counts as one. The commented form matched here is the one disable_cron writes
+# and `start` reverses.
 cron_state() {
   local current
   current=$(crontab -l 2>/dev/null || true)
@@ -296,19 +270,15 @@ cron_state() {
   fi
 }
 
-# Echoes our crontab schedules (live and commented out), for display to the user.
+# Echoes the tool's crontab schedules, live and commented out, for display.
 cron_entries() {
   crontab -l 2>/dev/null | grep -E '^#?[0-9*@].*immich-auto-dumper' || true
 }
 
-# Comments out our schedule lines in the current user's crontab.
-# Returns 0 if live schedules were found and disabled, 1 if there were none.
-#
-# Only schedule lines are touched — the same set cron_state reports on and `start`
-# re-enables. The pattern used to comment out ANY uncommented line merely containing
-# "immich-auto-dumper", so a MAILTO= or PATH= line mentioning the tool's path was
-# commented out too; `start`'s un-comment step only restores lines whose payload
-# starts with a digit, '*' or '@', so such a line stayed disabled for good.
+# Comments out the tool's live schedule lines in the current user's crontab.
+# Returns 0 when live schedules were found and disabled, 1 when there were none.
+# Touches only schedule lines, the set cron_state reports on and `start`
+# re-enables.
 disable_cron() {
   local current
   current=$(crontab -l 2>/dev/null || true)
@@ -323,16 +293,11 @@ disable_cron() {
 
 # ── File identity ─────────────────────────────────────────────────────────────
 #
-# Whenever the tool concludes that two files are "the same" it is about to delete
-# one of them, so the conclusion has to be earned. Size equality is not: a foreign
-# file that happened to match the source byte count was accepted as an already
-# archived copy, the DB was pointed at it and the original photo deleted.
-#
-# The cost is real — on a remote mount this reads the whole file back — and it is
-# the price of the guarantee. The alternative was measured, and it destroys photos.
+# Two files count as the same only when their SHA-256 match, never on their size.
+# On a remote mount that reads the whole file back.
 
-# Echoes the SHA-256 of <file>, or fails (1) if it cannot be computed. Never
-# echoes an empty digest: callers must be able to trust a successful return.
+# Echoes the SHA-256 of <file>, or fails (1) when it cannot be computed. Never
+# echoes an empty digest, so a successful return can be trusted.
 file_fingerprint() {
   local f="$1" h
   h=$(sha256sum -- "$f" 2>/dev/null | cut -d' ' -f1) || return 1
@@ -340,13 +305,9 @@ file_fingerprint() {
   printf '%s' "$h"
 }
 
-# 0 if <a> and <b> are byte-for-byte identical, 1 if they differ, 2 if it cannot
-# be determined (unreadable file, dead mount, timeout).
-#
-# The third code is the whole point. The defect this replaces compared two `stat`
-# calls that had BOTH failed, read 0 == 0, and concluded "identical". An unknown
-# must never collapse into a yes; callers are expected to handle 2 as "do not
-# touch anything".
+# 0 when <a> and <b> are byte-for-byte identical, 1 when they differ, 2 when it
+# cannot be determined: an unreadable file, a dead mount, a timeout. Callers are
+# expected to treat 2 as "touch nothing", never as a yes.
 files_are_identical() {
   local a="$1" b="$2" ha hb
   ha=$(file_fingerprint "$a") || return 2
@@ -354,48 +315,37 @@ files_are_identical() {
   [[ "$ha" == "$hb" ]]
 }
 
-# Pushes a freshly written file out of the page cache before anything is verified
-# against it and, above all, before any source is deleted.
+# Pushes a freshly written file out of the page cache, before it is verified and
+# before any source is deleted. `sync -d` flushes that one file where it is
+# supported, and the whole filesystem otherwise.
 #
-# When cp returns, the data may only be in memory. A size check then reports the
-# right number — it is reading that same cache — so the copy looks complete and
-# the source gets deleted; a power cut in between would leave a truncated file
-# and no original. `sync -d` flushes just this file where that is supported,
-# otherwise the whole filesystem, which is slower but never wrong.
-#
-# Honest limit: on an rclone mount this does not guarantee the remote upload has
-# finished. It closes the window fully on a local disk, a USB drive or a mounted
-# NAS; on a write-back cloud mount it only narrows it.
+# On a local disk, a USB drive or a mounted NAS the file is on the medium when
+# this returns. On a write-back mount (rclone, async NFS) it is not: the upload
+# may still be pending, and a read-back is served by the local cache.
 file_flush() {
   sync -d -- "$1" 2>/dev/null || sync 2>/dev/null || true
 }
 
 # ── Disk ──────────────────────────────────────────────────────────────────────
 
-# Apparent size (sum of file sizes) of a directory, in bytes. 0 if absent/unreadable.
-# Measures the library directory itself rather than the whole filesystem, so archiving
-# is driven by Immich's actual footprint, not by unrelated data on the same disk.
+# Apparent size of a directory — the sum of its file sizes — in bytes, and 0 when
+# it is absent or unreadable.
 dir_size_bytes() {
   local path="$1"
   [[ -d "$path" ]] || { printf '0\n'; return 0; }
-  # Capture then validate. du can exit non-zero (e.g. an unreadable subdir under a
-  # no-sudo install) while still printing a partial total; with pipefail that would
-  # trip set -e, and chaining `|| printf 0` onto the pipeline would emit a SECOND
-  # line on top of du's output, corrupting later arithmetic. Keep one clean integer.
+  # Captured, then validated: du can exit non-zero while still printing a partial
+  # total. Exactly one integer is echoed, whatever happens.
   local size
   size=$(du -sb "$path" 2>/dev/null | cut -f1) || true
   [[ "$size" =~ ^[0-9]+$ ]] || size=0
   printf '%s\n' "$size"
 }
 
-# Total / available size, in bytes, of the filesystem hosting <path>. Used only to
-# show hints and to translate a percentage boundary into an absolute size.
+# Total and available size, in bytes, of the filesystem hosting <path>. Echo 0
+# when the path is empty or missing, which callers read as "no disk info".
 #
-# Uses POSIX `df -kP` (1K-blocks, portable column layout) rather than GNU-only
-# `df -B1 --output=...`, which silently produced empty output on non-GNU df and
-# left the wizard showing "0 B total". The -P "portable" format guarantees one
-# data line even when the device name is long enough to wrap. Output is 0 when
-# the path is empty/missing so callers can detect "no disk info".
+# POSIX `df -kP`: 1K blocks and the portable column layout, which guarantees one
+# data line even when the device name is long enough to wrap.
 disk_total_bytes() {
   local v
   v=$(df -kP "$1" 2>/dev/null | awk 'NR==2 {printf "%.0f", $2 * 1024}')
@@ -407,11 +357,11 @@ disk_free_bytes() {
   [[ "$v" =~ ^[0-9]+$ ]] && printf '%s\n' "$v" || printf '0\n'
 }
 
+# Echoes <bytes> as a readable label: "512 B", "1.5 KB", "12.3 MB", "1.25 GB".
 bytes_to_human() {
   local bytes="$1"
-  # bc does the rounding and prints the decimal string itself (always with a '.'),
-  # which is then emitted with %s. Passing bc's dotted output to printf %f would
-  # fail under locales whose decimal separator is ',' (e.g. fr_FR): "invalid number".
+  # bc rounds and prints the decimal string itself, emitted with %s. printf %f
+  # would reject bc's dotted output under a ',' decimal locale.
   if (( bytes < 1024 )); then
     printf '%d B\n' "$bytes"
   elif (( bytes < 1048576 )); then
@@ -426,28 +376,20 @@ bytes_to_human() {
 # ── Lock ──────────────────────────────────────────────────────────────────────
 #
 # Two runs must never overlap: they rewrite the same DB rows and copy to the same
-# destination. The previous lock tested for a file and then created it, and that
-# gap was wide enough to walk through — two simultaneous forced dumps both started
-# in one attempt out of five.
-#
-# `mkdir` closes it: the kernel either creates the directory or fails, with
-# nothing in between, and it does not follow a symlink planted at the path.
-# `flock` would do as well, but this tool restricts itself to tools present
-# everywhere, and mkdir is as universal as it gets.
+# destination. The lock is a DIRECTORY, taken with `mkdir`, which either creates
+# it or fails with nothing in between and does not follow a symlink planted at
+# the path.
 
-# The lock lives beside the logs, NOT under $XDG_RUNTIME_DIR: cron runs have no
-# runtime dir, so keying the path on it would give the nightly run and a manual
-# one two different locks — i.e. no mutual exclusion in exactly the case that
-# matters. LOG_DIR is configured, stable and the same in both contexts.
+# Echoes the lock path, beside the logs and not under $XDG_RUNTIME_DIR, which a
+# cron run does not have. LOG_DIR is the same in both contexts.
 lock_dir_path() {
   printf '%s/immich-auto-dumper.lock.d\n' \
     "${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper}"
 }
 
-# Identifies the boot the recorded PID belongs to. A lock directory on persistent
-# storage survives a reboot, after which that PID may well be alive again as an
-# unrelated process — which would jam every subsequent run with a bogus "already
-# running". Empty when unavailable, in which case the check is simply skipped.
+# Identifies the boot the recorded PID belongs to, since a lock directory
+# survives a reboot and a PID does not. Empty when unavailable, which skips the
+# check in _lock_holder_alive.
 _boot_id() {
   cat /proc/sys/kernel/random/boot_id 2>/dev/null || true
 }
@@ -463,8 +405,8 @@ _lock_holder_alive() {
   kill -0 "$pid" 2>/dev/null
 }
 
-# Echoes "active <pid>", "stale <pid>" or "inactive". Read-only: used by status
-# and stop, which must report on the lock without ever taking it.
+# Echoes "active <pid>", "stale <pid>" or "inactive". Read-only: it reports on
+# the lock without ever taking it.
 lock_state() {
   local dir
   dir=$(lock_dir_path)
@@ -478,21 +420,22 @@ lock_state() {
   fi
 }
 
+# Takes the lock, recording this PID and this boot in it. Returns 0 when it is
+# held, 1 when another live run holds it or it could not be taken. A lock found
+# orphaned is claimed on the second go.
 acquire_lock() {
   local dir
   dir=$(lock_dir_path)
   mkdir -p -- "$(dirname -- "$dir")" 2>/dev/null || true
 
-  # Two goes: the first may find a lock that turns out to be orphaned, the
-  # second then claims it. The counter itself is never read.
+  # Two goes: the first may find an orphaned lock, the second then claims it.
   local attempt
   # shellcheck disable=SC2034  # the counter bounds the retries, it is never read
   for attempt in 1 2; do
     if mkdir -- "$dir" 2>/dev/null; then
       printf '%d\n' "$$" > "$dir/pid"
       _boot_id > "$dir/boot" 2>/dev/null || true
-      # Release on interruption too — nothing used to, so a Ctrl-C left a lock
-      # that only the next run's staleness check would clear.
+      # Released on interruption as well as on exit.
       trap 'release_lock' EXIT
       trap 'release_lock; exit 130' INT TERM
       rm -f -- "$LEGACY_LOCK_FILE" 2>/dev/null || true
@@ -500,10 +443,7 @@ acquire_lock() {
     fi
 
     # Someone holds it. The holder writes its PID just after mkdir, so an absent
-    # PID file most often means "a run that started microseconds ago" — the very
-    # case this rewrite exists to serialise. Give it a moment to appear before
-    # declaring the lock orphaned, or two simultaneous starts would each decide
-    # the other's fresh lock was stale.
+    # PID file is given a moment to appear before the lock is called orphaned.
     local pid
     pid=$(cat -- "$dir/pid" 2>/dev/null || true)
     if [[ -z "$pid" ]]; then
@@ -516,9 +456,9 @@ acquire_lock() {
       return 1
     fi
 
-    # Orphaned. Claim it by renaming: rename() succeeds for exactly one process,
-    # so a loser can never delete the fresh lock the winner just created — which
-    # a plain `rm -rf` here would let it do.
+    # Orphaned, and claimed by renaming it aside: rename() succeeds for exactly
+    # one process, where a plain `rm -rf` would let a loser delete the winner's
+    # fresh lock.
     log_warn "Stale lock found (PID ${pid:-unknown}), removing."
     local doomed="$dir.stale.$$"
     if mv -- "$dir" "$doomed" 2>/dev/null; then
@@ -530,8 +470,8 @@ acquire_lock() {
   return 1
 }
 
-# Removes the lock only if we are the process holding it. Idempotent, so the
-# explicit call and the EXIT trap can both run.
+# Removes the lock, and only when this process is the one holding it. Idempotent,
+# so the explicit call and the EXIT trap can both run.
 release_lock() {
   local dir
   dir=$(lock_dir_path)

@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Mirrors Immich's database dumps to <storage>/.immich-backup/ and rotates the
+# copies down to BACKUP_RETENTION. Never reads or writes the Immich database.
 backup_db_run() {
   local dry_run=false
   local arg src i
   for arg in "$@"; do
     case "$arg" in
       --dry-run) dry_run=true ;;
-      # Same reasoning as archive_run: a flag that is not recognised is a typo, and
-      # the previous test (only ever comparing $1 to --dry-run) turned a misspelled
-      # "--dryrun" into a real run.
+      # An unrecognised flag ends the run rather than being dropped.
       *)
         log_error "Unknown argument for the backup run: '$arg' — nothing was done."
         return 1
@@ -17,16 +17,9 @@ backup_db_run() {
     esac
   done
 
-  # Retention decides how many mirrored dumps survive the run, so an unusable value
-  # is checked BEFORE anything is copied — and before the dry run reports on a
-  # policy it could not apply. An empty or zero value deleted every dump on the
-  # external storage and logged it at INFO, which a cron mail reads as a success;
-  # a non-numeric one crashed mid-rotation. This value is also re-read from disk
-  # between runs, so validating it at load time alone would not cover a hand edit.
-  #
-  # Refusing the whole run is deliberate. Copying while the rotation is broken piles
-  # dumps up for ever, and an invalid retention means the configuration needs fixing,
-  # not that a default should quietly stand in for it.
+  # Retention is validated before anything is copied, and an unusable value ends
+  # the whole run — including a dry run, which would otherwise report on a policy
+  # it cannot apply. No default stands in for it.
   local retention="${BACKUP_RETENTION:-}"
   if ! [[ "$retention" =~ ^[1-9][0-9]*$ ]]; then
     log_error "BACKUP_RETENTION must be a whole number of dumps to keep, 1 or more (found '${retention}')."
@@ -36,13 +29,9 @@ backup_db_run() {
 
   check_prereqs
 
-  # Storage availability — agnostic to the storage type (marker-based).
-  # Note: we intentionally do NOT run the path-consistency guard here — mirroring
-  # DB dumps stays useful (and safe, it never touches the Immich DB) even while an
-  # external library path change is being resolved.
-  #
-  # Absent storage ends the run quietly; storage whose state cannot be established
-  # exits non-zero, so it is not mistaken for "nothing to do".
+  # Storage availability, read off the marker. Absent storage ends the run
+  # quietly; a state that cannot be established exits non-zero. The
+  # path-consistency guard is not run here.
   local dest_state=0
   check_archive_dest_ready || dest_state=$?
   case $dest_state in
@@ -57,7 +46,7 @@ backup_db_run() {
     return 0
   fi
 
-  # Skip hidden marker files (e.g. Immich's `.immich`) — only mirror real dumps.
+  # Hidden files are skipped: only real dumps are mirrored.
   local files=()
   local f
   while IFS= read -r -d '' f; do
@@ -76,8 +65,7 @@ backup_db_run() {
     for src in "${files[@]}"; do
       local dr_name dr_src_size dr_dst_size
       dr_name=$(basename "$src")
-      # Guarded like the real run below: Immich rotates its own dumps, and one
-      # can vanish between the find and the stat.
+      # A dump can vanish between the listing and here.
       dr_src_size=$(stat --format='%s' "$src" 2>/dev/null || echo -1)
       if (( dr_src_size < 0 )); then
         log_info "DRY-RUN: would skip $dr_name (it has gone since the listing)"
@@ -94,36 +82,22 @@ backup_db_run() {
     return 0
   fi
 
-  # Mirroring took no lock at all, so two overlapping `sync_now` could run `cp`
-  # onto the same destination file and rotate the same directory underneath each
-  # other. The dry run above needs none — it writes nothing.
+  # Taken here and not above: the dry run writes nothing and needs no lock.
   if ! acquire_lock; then
     return 0
   fi
 
   mkdir -p "$dest_dir"
 
-  # Dumps are immutable and their name carries their timestamp, so a destination file
-  # of the same size IS the same dump, already mirrored. Skipping it keeps each run
-  # proportional to what is actually new instead of re-uploading the whole retention
-  # window every time — which on a metered or write-back mount is the difference
-  # between a few MB and a full GB, and avoids rewriting files the storage may still
-  # be flushing from the previous run.
-  #
-  # Deliberately a size comparison and not a fingerprint, unlike everywhere else
-  # the tool decides two files are the same. Nothing is deleted on the strength of
-  # this answer — at worst a dump is re-copied — and a fingerprint would mean
-  # reading the entire retention window back from the remote every single run. What
-  # a fingerprint does guard is the copy we make ourselves, and that one is checked
-  # below, right after it is written.
+  # A destination of the same size counts as the same dump, already mirrored, and
+  # is left alone. A size comparison and not a fingerprint: nothing is deleted on
+  # the strength of this answer. The copy this run makes is fingerprinted below.
   local copied=0 skipped=0
   for src in "${files[@]}"; do
     local filename src_size dst_size
     filename=$(basename "$src")
-    # Unguarded, this killed the script under set -e in the middle of mirroring:
-    # Immich rotates its own dumps, so a file listed a moment ago can be gone by
-    # the time it is measured. SKIPPED rather than counted as zero — a size of 0
-    # would never match the destination and the dump would be re-copied for ever.
+    # A dump listed a moment ago can be gone by the time it is measured: -1 marks
+    # it and it is skipped, rather than being read as a size of zero.
     src_size=$(stat --format='%s' "$src" 2>/dev/null || echo -1)
     if (( src_size < 0 )); then
       log_warn "Dump vanished before it could be copied (Immich's own rotation?), skipped: $filename"
@@ -135,8 +109,7 @@ backup_db_run() {
       skipped=$(( skipped + 1 ))
       continue
     fi
-    # Present but a different size: a previous copy was truncated (interrupted run,
-    # full storage, cancelled upload). Overwrite it rather than keep a corrupt dump.
+    # Present with a different size: a truncated copy, overwritten.
     if (( dst_size >= 0 )); then
       log_warn "Re-copying $filename: size mismatch (local $src_size B, storage $dst_size B)"
     fi
@@ -146,9 +119,7 @@ backup_db_run() {
       rm -f "$dest_dir/$filename"
       continue
     fi
-    # Same discipline as an archived photo: flush, then prove the copy is the
-    # dump before counting it as mirrored. A dump that is only nearly there is
-    # worse than an absent one — it looks like a safety net and is not.
+    # Flushed, then proved identical to the dump before it counts as mirrored.
     file_flush "$dest_dir/$filename"
     local same=0
     files_are_identical "$src" "$dest_dir/$filename" || same=$?
@@ -165,15 +136,9 @@ backup_db_run() {
     log_info "Backup: $skipped file(s) already mirrored, $copied copied."
   fi
 
-  # Retention: keep the newest BACKUP_RETENTION dumps, delete the rest.
-  #
-  # Ordering is by FILENAME, never by mtime. Dump names start with an ISO-like
-  # timestamp (immich-db-backup-YYYYMMDDTHHMMSS-...), so lexicographic order is
-  # chronological order — and unlike mtime, it cannot be misreported by the storage.
-  # On a write-back mount (rclone --vfs-write-back, NFS async...) a file whose upload
-  # is still pending has no known modification time and the mount answers with a
-  # placeholder date. An mtime-based rotation then sees the dumps it has just copied
-  # as the oldest on the volume and deletes them, cancelling their upload in flight.
+  # Retention: keep the newest BACKUP_RETENTION dumps, delete the rest. Ordered by
+  # FILENAME, never by mtime — dump names begin with a timestamp, so lexicographic
+  # order is chronological order.
   local all_backups=()
   local f
   while IFS= read -r -d '' f; do
@@ -198,8 +163,7 @@ backup_db_run() {
   local total_bytes=0
   for f in "${kept[@]}"; do
     local size
-    # Same guard: this only feeds a report, so a file that disappeared between
-    # the listing and here contributes nothing rather than ending the run.
+    # A file gone since the listing contributes nothing to the total.
     size=$(stat --format='%s' "$f" 2>/dev/null || echo 0)
     total_bytes=$(( total_bytes + size ))
   done

@@ -1,45 +1,32 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2034  # the settings assigned below are this file's whole
-# output, read by the main script that sources it at runtime through $SCRIPT_DIR.
+# shellcheck disable=SC2034  # the settings assigned below are this file's output
 set -euo pipefail
 
 # ── config.conf, read as data ─────────────────────────────────────────────────
 #
-# The file used to be `source`d. That made every value in it executable code:
-# ARCHIVE_DEST_PATH="/mnt/external/$(whoami)" ran that command, and so would
-# anything else written there. It ran for EVERY command — including `status`,
-# which announces itself as read-only, and including the uninstaller, before its
-# confirmation prompt — and most often from cron, unattended.
-#
-# So the file is now parsed. A line is a setting and a value; the setting must be
-# one this tool knows; the value must match what that setting is allowed to hold;
-# and nothing in it is ever evaluated. Quotes are stripped as punctuation, not
-# interpreted — that non-interpretation is the entire point.
-#
-# The same pass closes a second hole the tests found: two essential settings left
-# empty let a run go all the way to "complete" while doing nothing. A setting that
-# cannot be used is now a refusal at load, named by line number.
+# config.conf is parsed, never evaluated. A line is a setting and a value; the
+# setting must be one this tool knows; the value must match what that setting is
+# allowed to hold. Surrounding quotes are stripped as punctuation. A setting that
+# cannot be used is a refusal at load, named by line number.
 
-# Settings only the wizard can answer: they identify this specific Immich install.
-# A config missing one of these is broken, not merely old. Lives here because the
-# loader is what enforces their presence.
+# Settings only the wizard can answer: they identify this Immich install. Their
+# absence is a refusal, not a backfill.
 _CFG_ESSENTIAL_KEYS=(
   IMMICH_UPLOAD_LOCATION IMMICH_DB_LIBRARY_PREFIX IMMICH_DB_CONTAINER
   IMMICH_SERVER_CONTAINER IMMICH_DB_NAME IMMICH_DB_USER
   ARCHIVE_DEST_PATH ARCHIVE_CONTAINER_PATH ARCHIVE_STORAGE_ID
 )
 
-# Findings from the last config_load, replayed by _config_check so the setup review
-# shows them next to everything else rather than only in the log.
+# Findings from the last config_load, read back by _config_check.
 CFG_LOAD_PROBLEMS=()
-# True when the file still carries the `declare -A USER_MAP` form, which setup
-# rewrites on its next run.
+# True when the file carries the `declare -A USER_MAP` form, which setup rewrites
+# on its next run.
 CFG_LEGACY_USER_MAP=false
-# Keys the file actually assigned, so "missing" and "set to something unusable"
-# stay distinguishable — and so a leftover environment variable cannot stand in
-# for a setting the file never gave.
+# Keys the file actually assigned. Tells "missing" from "set to something
+# unusable", and from a name that only exists in the environment.
 declare -A _CFG_SEEN=()
 
+# Echoes <s> without its leading and trailing whitespace.
 _cfg_trim() {
   local s="$1"
   s="${s#"${s%%[![:space:]]*}"}"
@@ -47,12 +34,9 @@ _cfg_trim() {
   printf '%s' "$s"
 }
 
-# Literal rewrite of the two prefixes a hand-written path is likely to start with.
-# Exactly these two, substituted as text: no expansion of anything else, and no
-# evaluation. Configs copied from the shipped example carried "$HOME" here.
-# shellcheck disable=SC2088  # the tildes below are literal patterns to MATCH,
-# not paths to expand — expanding them is precisely what this function refuses
-# to do, since config.conf is read and never evaluated.
+# Rewrites a leading "~/" or "$HOME/" as the home directory, substituted as text.
+# Exactly those two prefixes; nothing else in the value is touched.
+# shellcheck disable=SC2088  # literal patterns to match, not paths to expand
 _cfg_expand_home() {
   local v="$1"
   case "$v" in
@@ -63,6 +47,8 @@ _cfg_expand_home() {
   esac
 }
 
+# Records a fault in CFG_LOAD_PROBLEMS and logs it, prefixed by <where> when the
+# fault has a line number.
 _cfg_reject() {
   local where="$1" message="$2"
   CFG_LOAD_PROBLEMS+=("config.conf${where:+:$where} — $message")
@@ -70,34 +56,24 @@ _cfg_reject() {
 }
 
 # Validates one setting and assigns it. Returns 1 on anything unexpected, naming
-# the offending line; the caller keeps reading so one bad line does not hide the
-# next four.
+# the offending line; the caller keeps reading, so every fault is reported.
 config_set() {
   local key="$1" value="$2" line="$3"
 
-  # An empty name is not merely an unknown setting. `_CFG_SEEN[""]` is not a
-  # valid subscript for an associative array, and under this file's `set -e` that
-  # assignment killed config_load where it stood — taking the whole tool with it,
-  # since the configuration is loaded at source time. A single line starting with
-  # "=" made every command die on a raw bash error, `setup` and `uninstall`
-  # included: the two a broken configuration is supposed to leave reachable.
+  # Caught before anything else: an empty name is not a valid subscript for
+  # _CFG_SEEN below.
   if [[ -z "$key" ]]; then
     _cfg_reject "$line" "a setting name is missing before the '='."
     return 1
   fi
 
-  # "Last one wins" is a reasonable convention and refusing would break
-  # configurations that work today, so this is a warning and not a rejection. But
-  # it must be said: _config_backfill appends to the end of the file, which makes
-  # this precisely a place where a second assignment turns up, and
-  # BACKUP_RETENTION=3 followed by BACKUP_RETENTION=99 used to give 99 in silence.
+  # A setting assigned twice keeps the later value, with a warning.
   if [[ -n "${_CFG_SEEN[$key]:-}" ]]; then
     log_warn "config.conf:$line — $key is set more than once; this later value ('${value}') wins over the earlier one."
   fi
 
-  # Recorded before validation, so a setting the file DID name but named badly is
-  # reported as invalid and not, on top of that, as missing. An unrecognised key
-  # is never an essential one, so it cannot mask a genuine absence.
+  # Recorded before validation, so a setting the file named badly is reported as
+  # invalid and not also as missing.
   _CFG_SEEN["$key"]=1
 
   case "$key" in
@@ -113,9 +89,7 @@ config_set() {
     LOG_DIR)
       value=$(_cfg_expand_home "$value")
       if [[ "$value" != /* ]]; then
-        # Where the log file goes is not worth refusing to run over, and the
-        # example shipped with older versions put a shell expansion here. Warn and
-        # fall back rather than leave the user with a tool that will not start.
+        # The one path setting that falls back instead of being refused.
         local fallback="${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper"
         log_warn "config.conf:$line — LOG_DIR is not an absolute path ('${value}'); using $fallback instead."
         value="$fallback"
@@ -140,8 +114,8 @@ config_set() {
       ;;
 
     ARCHIVE_STORAGE_ID)
-      # Empty is meaningful here and only here: it means "accept whatever marker
-      # the storage carries", i.e. do not pin the destination to one volume.
+      # Empty is allowed here and nowhere else: it accepts whatever marker the
+      # storage carries, instead of pinning the destination to one volume.
       if [[ -n "$value" ]] && ! [[ "$value" =~ ^[A-Za-z0-9._-]{4,64}$ ]]; then
         _cfg_reject "$line" "ARCHIVE_STORAGE_ID must be a plain identifier of 4 to 64 characters (found '${value}')."
         return 1
@@ -158,7 +132,7 @@ config_set() {
       ;;
 
     ARCHIVE_MIN_FREE_MB)
-      # The one number allowed to be zero: zero disables the free-disk trigger.
+      # The one number allowed to be zero, which disables the free-disk trigger.
       if ! [[ "$value" =~ ^(0|[1-9][0-9]*)$ ]]; then
         _cfg_reject "$line" "ARCHIVE_MIN_FREE_MB must be a whole number of 0 or more (found '${value}')."
         return 1
@@ -172,9 +146,8 @@ config_set() {
         _cfg_reject "$line" "a USER_MAP entry needs a user key, as in USER_MAP.admin=Photos."
         return 1
       fi
-      # The value is pasted into "${ARCHIVE_DEST_PATH%/}/<folder>/...". An absolute
-      # value or a ".." component would send archived photos outside the external
-      # library entirely, which no legitimate folder name ever needs to do.
+      # The value is pasted into "${ARCHIVE_DEST_PATH%/}/<folder>/...", so an
+      # absolute path and any ".." component are refused.
       if [[ -z "$value" || "$value" == /* || "$value" == ".." || "$value" == "../"* \
             || "$value" == *"/../"* || "$value" == *"/.." ]]; then
         _cfg_reject "$line" "USER_MAP.$map_key must be a folder name inside the external library (found '${value}')."
@@ -206,20 +179,15 @@ config_load() {
   # `|| [[ -n "$raw" ]]` so a final line without a trailing newline is still read.
   while IFS= read -r raw || [[ -n "$raw" ]]; do
     n=$(( n + 1 ))
-    # A UTF-8 byte-order mark belongs to the file, not to the first setting. It
-    # is invisible, so the refusal it caused sent people looking in the wrong
-    # place entirely: "unknown setting 'IMMICH_UPLOAD_LOCATION'" followed by
-    # "IMMICH_UPLOAD_LOCATION is missing". Removed as punctuation, never
-    # interpreted — the same treatment already given to surrounding quotes. Only
-    # on the first line: anywhere else those bytes are part of a real name, and
-    # an unknown setting is exactly what they are.
+    # A UTF-8 byte-order mark belongs to the file, not to the first setting, and
+    # comes off as punctuation. First line only.
     (( n == 1 )) && raw="${raw#$'\xEF\xBB\xBF'}"
     line=$(_cfg_trim "$raw")
     [[ -z "$line" ]] && continue
     [[ "$line" == \#* ]] && continue
 
-    # The array declaration the previous format required. It carries no value of
-    # its own — the entries under it are read one by one — so it is simply noted.
+    # The array declaration a legacy config carries. It holds no value of its
+    # own, so it is noted and skipped.
     if [[ "$line" == 'declare -A USER_MAP' || "$line" == 'declare -A USER_MAP=()' ]]; then
       CFG_LEGACY_USER_MAP=true
       continue
@@ -234,8 +202,8 @@ config_load() {
     key=$(_cfg_trim "${line%%=*}")
     value=$(_cfg_trim "${line#*=}")
 
-    # One layer of surrounding quotes is punctuation and comes off. What is inside
-    # is taken literally, whatever it looks like.
+    # One layer of surrounding quotes comes off as punctuation. What is inside is
+    # taken literally, whatever it looks like.
     if (( ${#value} >= 2 )); then
       case "$value" in
         \"*\") value="${value:1:-1}" ;;
@@ -243,9 +211,8 @@ config_load() {
       esac
     fi
 
-    # Previous format: USER_MAP["admin"]="Photos". Read as data like everything
-    # else, so an existing install keeps working; setup rewrites it to
-    # USER_MAP.admin=Photos the next time it runs.
+    # The legacy form, USER_MAP["admin"]="Photos", read as data like everything
+    # else and normalised to the USER_MAP.admin=Photos key below.
     if [[ "$key" == 'USER_MAP['*']' ]]; then
       CFG_LEGACY_USER_MAP=true
       map_key="${key#USER_MAP[}"
@@ -260,9 +227,8 @@ config_load() {
     config_set "$key" "$value" "$n" || rc=1
   done < "$file"
 
-  # A setting the file never assigns is not covered by any check above. Two of
-  # these left empty were enough for a run to report success while archiving
-  # nothing, so their absence is a refusal, not a warning.
+  # An essential setting the file never assigns is not covered by any check
+  # above, so its absence is refused here.
   local k
   for k in "${_CFG_ESSENTIAL_KEYS[@]}"; do
     [[ -n "${_CFG_SEEN[$k]:-}" ]] && continue

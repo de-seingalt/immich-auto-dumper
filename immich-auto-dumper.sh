@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Resolve through a possible symlink (e.g. ~/.local/bin/immich-auto-dumper) so the
-# lib/, config.conf and cron/ paths below are found relative to the real install
-# dir, not the symlink's directory. Cron and PATH invocations go through that link.
+# Resolved through a possible symlink — ~/.local/bin/immich-auto-dumper, which
+# the cron lines and a PATH invocation go through — so lib/, config.conf and
+# cron/ are found in the real install directory.
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/config.conf"
 
@@ -16,14 +16,12 @@ source "$SCRIPT_DIR/lib/runlog.sh"
 source "$SCRIPT_DIR/lib/backup_db.sh"
 source "$SCRIPT_DIR/lib/archive.sh"
 
-# USER_MAP belongs to the tool, not to the file: the loader fills it, and declaring
-# it here means `${USER_MAP[x]:-...}` lookups never trip set -u even when the config
-# maps nobody.
+# Declared here and filled by the loader, so a `${USER_MAP[x]:-…}` lookup never
+# trips set -u even when the config maps nobody.
 declare -A USER_MAP=()
 
-# config.conf is READ, never executed — see lib/config.sh for why that matters.
-# A file that cannot be read leaves CONFIG_LOADED false; every command other than
-# setup and uninstall then refuses to run rather than act on half a configuration.
+# False when config.conf exists but could not be read whole. Every command other
+# than setup and uninstall then refuses to run.
 CONFIG_LOADED=true
 if [[ -f "$CONFIG_FILE" ]]; then
   config_load "$CONFIG_FILE" || CONFIG_LOADED=false
@@ -31,6 +29,7 @@ fi
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+# Prints the logo and the command reference.
 _usage() {
   ui_logo
   cat <<'EOF'
@@ -58,6 +57,7 @@ Flags:
 EOF
 }
 
+# Exits when there is no config.conf at all.
 _require_config() {
   if [[ ! -f "$CONFIG_FILE" ]]; then
     printf 'Error: config.conf not found. Run: immich-auto-dumper setup\n' >&2
@@ -65,12 +65,12 @@ _require_config() {
   fi
 }
 
-# Generates a random storage id (no external dependency).
+# Echoes a random storage id, with no external dependency.
 _new_storage_id() { cat /proc/sys/kernel/random/uuid; }
 
-# Absolute path used in cron lines: prefer the stable ~/.local/bin symlink created by
-# install.sh, and fall back to the script's own location. Cron has a minimal PATH, so
-# a bare command name would not resolve.
+# Echoes the absolute path the cron lines invoke: the stable ~/.local/bin
+# symlink, or the script's own location when that link is missing. Cron has a
+# minimal PATH, which a bare command name would not resolve against.
 _resolve_self_bin() {
   local link="$HOME/.local/bin/immich-auto-dumper"
   if [[ -x "$link" ]]; then
@@ -80,11 +80,10 @@ _resolve_self_bin() {
   fi
 }
 
-# Create (or repair) the stable ~/.local/bin/immich-auto-dumper symlink that PATH
-# invocations and cron lines rely on. Owned by setup — not the installer — so the
-# link is (re)established every time the user configures, even when the tool was
-# copied into place manually rather than installed via install.sh. Only prints when
-# it actually (re)creates the link, to stay quiet on routine re-runs.
+# Creates or repairs the ~/.local/bin/immich-auto-dumper symlink, and warns when
+# that directory is not in PATH. Owned by setup, so the link is re-established
+# every time the user configures, however the tool was put in place. Prints only
+# when it actually (re)creates the link.
 _ensure_symlink() {
   local target link current
   target="$(readlink -f "$SCRIPT_DIR/immich-auto-dumper.sh")"
@@ -106,18 +105,17 @@ _ensure_symlink() {
   fi
 }
 
-# Wizard dialog title prefix, so every step is clearly part of the same flow.
+# Echoes a wizard dialog title, prefixed so every step reads as one flow.
 _wiz_title() { printf 'immich-auto-dumper Setup — %s' "$1"; }
 
-# Normalizes a USER_MAP sub-folder: trims surrounding slashes and collapses repeats.
-# Inner slashes are kept, since an Immich import path may legitimately be nested
+# Normalises a USER_MAP sub-folder: surrounding slashes trimmed, repeated ones
+# collapsed. Inner slashes are kept, since an Immich import path may be nested
 # ("/external_library/family/alice" -> "family/alice").
 #
-# This matters because the value is pasted into paths as "${ARCHIVE_DEST_PATH%/}/$folder/...".
-# Immich stores its import paths with a trailing slash ("/external_library/Alice/"), so
-# the folder detected from one and accepted as-is used to yield "Alice/" — writing
-# "/external_library/Alice//2020/…" into asset.originalPath, where Immich's own library
-# scan records the single-slash form and would re-import the file as a duplicate.
+# The value is pasted into "${ARCHIVE_DEST_PATH%/}/$folder/…", and Immich stores
+# its import paths with a trailing slash, so a folder taken from one as-is would
+# put a double slash into asset.originalPath — where Immich's own library scan
+# records the single-slash form and re-imports the file as a duplicate.
 _sanitize_folder() {
   local f="$1"
   while [[ "$f" == *//* ]]; do f="${f//\/\///}"; done
@@ -125,9 +123,9 @@ _sanitize_folder() {
   printf '%s' "$f"
 }
 
-# Shallow (2-level) directory tree of the external library, shown in setup so the
-# user can see existing folders while choosing a name. Excludes our hidden marker
-# and backup dirs. Prints nothing if the path is empty or unreadable.
+# Echoes a two-level directory tree of the external library, indented, with the
+# tool's own hidden directories left out. Nothing when the path is empty or
+# unreadable.
 _ext_library_tree() {
   local dest="$1"
   [[ -d "$dest" ]] || return 0
@@ -136,17 +134,14 @@ _ext_library_tree() {
      | LC_ALL=C sort | sed -e 's|^\./||' -e 's|[^/]*/|  |g')
 }
 
-# _db_reachable now lives in lib/db.sh, beside the query helper it is built on and
-# the checks that have to tell "unreachable" from "answered no".
-
-# Interactive liveness gate before writing the storage marker: makes sure the
-# storage is actually active, so we never write the marker into an empty local
-# mount point. Auto-detects when possible (findmnt) and only asks when ambiguous.
+# Establishes that the storage is live before the marker is written into it,
+# which keeps the marker out of an inactive mount point. Detected with findmnt
+# where that is conclusive, and asked otherwise.
 # Returns 0 when it is safe to write, 1 when the user chose to skip.
 _ensure_storage_live() {
   local dest="$1"
   if archive_dest_is_mounted "$dest"; then
-    return 0   # confident: active non-root mount
+    return 0   # an active non-root mount: conclusive
   fi
   ui_menu "External storage" \
     "\"$dest\" is not detected as a separate active mount point.\n\nIs it a plain local folder, or a remote/removable mount (rclone, NFS, SMB, external disk) that needs to be active before archiving?" \
@@ -167,16 +162,17 @@ _ensure_storage_live() {
   done
 }
 
-# Reconciles the storage marker for the destination. Handles install, relocation,
-# recognition and conflict (case A). Sets the global STORAGE_ID_RESULT.
-# Prompts/echo go to the terminal (not captured) — we use a global on purpose.
+# Settles the storage marker for a destination, across the four cases: a fresh
+# install, a relocation, a storage already recognised, and a marker that belongs
+# to another volume. Sets STORAGE_ID_RESULT — a global, since this function's
+# output is the dialogs it draws on the terminal.
 _resolve_storage_marker() {
   local dest="$1" config_id="$2"
   local marker="${dest%/}/.immich-auto-dumper.id"
   local found_id
   found_id=$(timeout 10 cat "$marker" 2>/dev/null || true)
 
-  # Make write_archive_marker (which uses the global) target this destination.
+  # write_archive_marker writes to the global, so it is pointed here first.
   ARCHIVE_DEST_PATH="$dest"
 
   if [[ -n "$config_id" && "$found_id" == "$config_id" ]]; then
@@ -214,8 +210,8 @@ _resolve_storage_marker() {
     return 0
   fi
 
-  # No marker at destination: fresh install, relocation to an empty target, or
-  # storage temporarily offline.
+  # No marker at the destination: a fresh install, a relocation to an empty
+  # target, or storage that is offline right now.
   local id="${config_id:-$(_new_storage_id)}"
   if _ensure_storage_live "$dest"; then
     if write_archive_marker "$id"; then
@@ -234,20 +230,11 @@ _resolve_storage_marker() {
   return 0
 }
 
-# Recommended free-disk floor for the filesystem holding <path>: 10% of the disk,
-# clamped between 2 GB and 20 GB. When the disk size cannot be read it falls back
-# to that same 2 GiB floor rather than to 0.
-#
-# Zero is a perfectly good value when the USER picks it — it means "turn the
-# free-disk trigger off". What is wrong is a DEFAULT choosing it for them: an
-# unreadable disk made this echo 0, the backfill wrote ARCHIVE_MIN_FREE_MB=0 into
-# their config, and the safety net was disabled while being presented as the
-# recommended setting.
-#
-# Rounded down to a whole GiB: mb_to_input renders the suggestion with two decimals
-# ("10.84G"), and parsing that back loses a few MiB — enough for simply accepting the
-# pre-filled default to be flagged as "below the recommended floor". A whole-GiB
-# value round-trips exactly, and reads better in the prompt.
+# Echoes the recommended free-disk floor, in MiB, for the filesystem holding
+# <path>: 10% of the disk, clamped between 2 and 20 GiB and rounded down to a
+# whole GiB, which round-trips exactly through mb_to_input. A disk size that
+# cannot be read falls back to the same 2 GiB floor, never to 0 — zero is a value
+# only the user chooses, since it turns the free-disk trigger off.
 _recommended_min_free_mb() {
   local path="$1" total=0 mb=2048
   [[ -n "$path" && -d "$path" ]] && total=$(disk_total_bytes "$path")
@@ -260,8 +247,8 @@ _recommended_min_free_mb() {
   printf '%s' "$mb"
 }
 
-# Archive boundaries as stored in the config, in MiB. The deprecated *_GB keys are
-# still honored so an old config is read, not reported as incomplete.
+# The archive boundaries as the config holds them, in MiB, and 0 when neither the
+# *_MB key nor the deprecated *_GB one gives a usable number.
 _cfg_max_mb() {
   local v="${ARCHIVE_LIBRARY_MAX_MB:-}"
   [[ -z "$v" && "${ARCHIVE_LIBRARY_MAX_GB:-}" =~ ^[0-9]+$ ]] && v=$(( ARCHIVE_LIBRARY_MAX_GB * 1024 ))
@@ -277,43 +264,40 @@ _cfg_target_mb() {
 
 # ── Config review (existing installation) ─────────────────────────────────────
 #
-# Re-running setup on an installation that already has a config.conf should not
-# force the whole step-by-step again. The wizard first checks the saved config
-# against what this version of the tool expects and against the live Immich, shows
-# it back, and only then offers to reconfigure — so the user can see where they
-# stand instead of redoing everything "just in case".
+# With a config.conf already present, setup opens on a review of it: the saved
+# settings, checked against this version of the tool and against the live Immich,
+# shown back before anything is offered.
 
-# _CFG_ESSENTIAL_KEYS lives in lib/config.sh, next to the loader that enforces it.
-#
-# Settings with a safe default, so a config written by an older version — which
-# simply did not know about them — can be topped up in place instead of redone.
+# Settings with a safe default, which a config written by an older version can be
+# topped up with in place. The keys that have no default are in
+# _CFG_ESSENTIAL_KEYS, in lib/config.sh, next to the loader that enforces them.
 _CFG_BACKFILL_KEYS=(ARCHIVE_MIN_FREE_MB BACKUP_RETENTION LOG_DIR LOG_MAX_LINES)
 
 # Filled by _config_check: blocking findings, settings absent since an older
-# version, and remarks that need no action. CFG_USER_NAME caches the Immich user
-# names so the summary can label the USER_MAP keys (often opaque UUIDs).
+# version, and remarks that need no action. CFG_USER_NAME holds the Immich user
+# names, so the summary can label USER_MAP keys that are often opaque UUIDs.
 CFG_PROBLEMS=(); CFG_OUTDATED=(); CFG_NOTES=()
 declare -A CFG_USER_NAME=()
 
-# True when config.conf actually assigns <key> (as opposed to the variable merely
-# being set in the environment, or defaulted elsewhere in the script).
+# True when config.conf itself assigns <key> — not when the variable merely holds
+# a value from the environment or from a default elsewhere in the script.
 _config_has_key() { grep -qE "^[[:space:]]*${1}=" "$CONFIG_FILE" 2>/dev/null; }
 
-# Number of entries in USER_MAP. A config carrying `declare -A USER_MAP` with no
-# assignment leaves the array declared but UNSET, and `${#USER_MAP[@]}` on an unset
-# array aborts under `set -u` — which is exactly the config we need to report on.
+# Echoes the number of entries in USER_MAP, including 0 for an array that is
+# declared but unset, which `${#USER_MAP[@]}` would abort on under `set -u`.
 _user_map_count() {
   local n=0
   [[ -n "${USER_MAP[*]+x}" ]] && n=${#USER_MAP[@]}
   printf '%s' "$n"
 }
 
-# Validates the saved config against this version of the tool and the live Immich.
-# Every live check is best-effort: docker or the DB being unreachable downgrades the
-# verdict to a note, it never invents a problem. Always returns 0.
+# Checks the saved config against this version of the tool and the live Immich,
+# filling CFG_PROBLEMS, CFG_OUTDATED, CFG_NOTES and CFG_USER_NAME. A docker or a
+# database that cannot be reached downgrades a verdict to a note and never
+# invents a problem. Always returns 0.
 _config_check() {
-  # Whatever the loader refused is a config problem like any other, and belongs on
-  # the same screen — the log alone is not where someone running setup looks.
+  # Whatever the loader refused is a config problem like any other, and belongs
+  # on the same screen.
   CFG_PROBLEMS=("${CFG_LOAD_PROBLEMS[@]}")
   CFG_OUTDATED=(); CFG_NOTES=(); CFG_USER_NAME=()
 
@@ -347,15 +331,14 @@ _config_check() {
     CFG_PROBLEMS+=("BACKUP_RETENTION must be a positive whole number (found '${retention}').")
   fi
 
-  # Archiving has nowhere to put a user's photos without a mapping. The per-user check
-  # further down needs the DB; this one catches an empty map even when it is unreachable.
+  # An empty map is caught here, without the database; the per-user check further
+  # down needs it.
   if (( $(_user_map_count) == 0 )); then
     CFG_PROBLEMS+=("No user → folder mapping (USER_MAP is empty): archiving has no destination folder to use.")
   else
     # A folder with a stray leading/trailing/double slash builds paths like
     # "/external_library/Alice//2020/…" into asset.originalPath, which Immich's own
-    # library scan does not recognize as the file it sees. Earlier versions could
-    # write one when the folder was detected from an Immich import path.
+    # library scan does not recognize as the file it sees.
     local mk clean
     for mk in "${!USER_MAP[@]}"; do
       clean=$(_sanitize_folder "${USER_MAP[$mk]}")
@@ -365,10 +348,9 @@ _config_check() {
     done
 
     # Two users pointed at one folder archive into the same tree, where a single
-    # relative path names two different photos. The tool now refuses such an asset
-    # instead of destroying it, but the run stalls on every collision — so say so
-    # here, where it can still be fixed. A config hand-edited after setup, or written
-    # by a version without the wizard's guard, is how this state is reached.
+    # relative path names two different photos. An archive run refuses such an
+    # asset rather than destroying it, and stalls on every collision; this screen
+    # is where the config can still be fixed.
     local key_a key_b
     local -a seen_keys=("${!USER_MAP[@]}")
     local i j
@@ -385,9 +367,9 @@ _config_check() {
     CFG_PROBLEMS+=("Upload location '${IMMICH_UPLOAD_LOCATION}' has no library/ folder any more.")
   fi
 
-  # External storage: being unreachable right now is a state, not a config error — a
-  # removable or remote mount is allowed to be down — so it is only a note. A
-  # destination path that does not even exist on this host is a real problem.
+  # Storage that is unreachable right now is a state and only a note: a removable
+  # or remote mount is allowed to be down. A destination path that does not exist
+  # on this host at all is a problem.
   if [[ -n "${ARCHIVE_DEST_PATH:-}" ]]; then
     local dest_state=0
     archive_dest_ready 2>/dev/null || dest_state=$?
@@ -396,7 +378,7 @@ _config_check() {
     elif [[ ! -d "$ARCHIVE_DEST_PATH" ]]; then
       CFG_PROBLEMS+=("External library path '${ARCHIVE_DEST_PATH}' does not exist on this host.")
     elif (( dest_state >= 2 )); then
-      # Not the same as "not plugged in": something is answering badly.
+      # Not "not plugged in": something is answering badly.
       CFG_PROBLEMS+=("External storage state could not be established — ${_ARCHIVE_DEST_REASON}.")
     else
       CFG_NOTES+=("External storage not reachable right now (${_ARCHIVE_DEST_REASON}) — archiving stays paused until it is back.")
@@ -427,22 +409,18 @@ _config_check() {
   if (( schema_state == 1 )); then
     CFG_PROBLEMS+=("Immich's database schema no longer matches what this tool expects — review it before archiving again.")
   elif (( schema_state >= 2 )); then
-    # Not a schema problem. Saying so used to send people editing the tool.
+    # A note and not a problem: nothing was learned about the schema.
     CFG_NOTES+=("The schema could not be checked: the database stopped answering.")
   fi
 
-  # Every Immich user needs a destination folder: one added since the last setup
-  # would otherwise have no place for its archived photos.
+  # Every Immich user needs a destination folder, so one added since the last
+  # setup is reported here.
   local users_raw row uid uname label key
   local -a unmapped=()
-  # `|| true` here is an arbitrage, not an oversight: db_get_users propagates the
-  # 2 that means "the database did not answer", and this screen absorbs it on
-  # purpose. The config review must open even against a mute Immich — a user list
-  # that cannot be read downgrades the display, it does not invent a problem and
-  # it must not keep the user from seeing and fixing their configuration. The
-  # same reasoning covers db_get_external_libraries, db_detect_library_prefix,
-  # db_immich_backup_keep_last and db_asset_would_be_external: every one of them
-  # is on a setup or preview path. Nothing on the archiving path absorbs a 2.
+  # `|| true` absorbs the 2 that means "the database did not answer": this screen
+  # must open against a mute Immich, where a user list that cannot be read costs
+  # the labels and not the review. Every `|| true` on a setup or preview path in
+  # this file reads the same way; nothing on the archiving path absorbs a 2.
   users_raw=$(db_get_users 2>/dev/null || true)
   if [[ -n "$users_raw" ]]; then
     local -a _u=()
@@ -455,13 +433,12 @@ _config_check() {
       CFG_USER_NAME["$key"]="$uname"
       [[ -n "${USER_MAP["$key"]:-}" ]] || unmapped+=("$uname")
     done
-    # Naming the users only helps when some of them ARE mapped; an entirely empty map
-    # is already reported above, and listing every user there would just repeat it.
+    # Only when some users ARE mapped: an entirely empty map is reported above.
     (( ${#unmapped[@]} > 0 && $(_user_map_count) > 0 )) \
       && CFG_PROBLEMS+=("No destination folder configured for: ${unmapped[*]} — user(s) added in Immich since the last setup.")
   fi
 
-  # Only trustworthy while the storage is actually there (see db_check_path_consistency).
+  # Gated on the storage, which db_check_path_consistency depends on.
   if archive_dest_ready 2>/dev/null; then
     local report consistency_state=0
     report=$(db_check_path_consistency 2>/dev/null) || consistency_state=$?
@@ -472,8 +449,8 @@ _config_check() {
     fi
   fi
 
-  # Mirroring fewer dumps than Immich keeps locally silently drops dumps from the
-  # external storage while Immich still has them — worth saying, not a config error.
+  # Mirroring fewer dumps than Immich keeps locally drops dumps from the external
+  # storage while Immich still holds them: a note, not a config error.
   local keep
   keep=$(db_immich_backup_keep_last)
   if [[ -n "$keep" && "$retention" =~ ^[0-9]+$ ]] && (( retention < keep )); then
@@ -482,7 +459,7 @@ _config_check() {
   return 0
 }
 
-# One-line, human-readable rendering of cron_state.
+# Echoes cron_state as one human-readable line.
 _cron_state_label() {
   case "$(cron_state)" in
     active)   printf 'ACTIVE — archiving and DB backups run automatically' ;;
@@ -491,7 +468,8 @@ _cron_state_label() {
   esac
 }
 
-# Human-readable rendering of the saved config, including the live schedule state.
+# Echoes the saved config as the review screen shows it: one line per setting,
+# the live schedule state, and where each user's photos are archived.
 _config_summary() {
   local max_mb target_mb min_free
   max_mb=$(_cfg_max_mb); target_mb=$(_cfg_target_mb)
@@ -520,16 +498,15 @@ _config_summary() {
   fi
 }
 
-# Default value this version would use for a setting absent from an older config.
+# Echoes the value this version uses for a setting absent from an older config.
 _config_default_for() {
   case "$1" in
     ARCHIVE_MIN_FREE_MB) _recommended_min_free_mb "${IMMICH_UPLOAD_LOCATION:-}" ;;
     BACKUP_RETENTION)
       local keep=""
       probe_docker_cmd 2>/dev/null && _db_reachable && keep=$(db_immich_backup_keep_last)
-      # `${keep:-14}` only substitutes for an EMPTY value, so a "0" coming back from
-      # Immich would have been written into config.conf as if it were advice — and a
-      # retention of 0 deletes every mirrored dump. Validate, never just default.
+      # Validated, not merely defaulted: `${keep:-14}` substitutes for an empty
+      # value alone, and a retention of 0 deletes every mirrored dump.
       [[ "$keep" =~ ^[1-9][0-9]*$ ]] || keep=14
       printf '%s' "$keep"
       ;;
@@ -538,14 +515,10 @@ _config_default_for() {
   esac
 }
 
-# Appends the settings this version added to an existing config.conf, with their
-# default values. Only ever adds lines: the user's own values are never rewritten.
-#
-# Through a temporary copy and a rename, like every other write to this file: an
-# interruption mid-append would leave a truncated configuration, which the loader
-# now refuses outright — so the tool would simply stop starting. And it says what
-# it wrote, because a value that appears in a file on its own is a value nobody
-# chose.
+# Appends the settings in CFG_OUTDATED to config.conf with their defaults, and
+# logs each line it wrote. Only ever adds lines, so a value the user edited is
+# never rewritten. Through a temporary copy and a rename, like every other write
+# to this file.
 _config_backfill() {
   local k v tmp="$CONFIG_FILE.tmp"
   cp -f -- "$CONFIG_FILE" "$tmp" || return 1
@@ -565,8 +538,8 @@ _config_backfill() {
   done
 }
 
-# Renders cron/crontab.example with the real binary path and log dir, keeping only
-# the schedule lines. Cron has a minimal PATH, hence the absolute binary path.
+# Echoes cron/crontab.example with __BIN__ and __LOGDIR__ substituted, keeping
+# only its schedule lines. Returns 1 when the template is missing.
 _render_cron_lines() {
   local tpl="$SCRIPT_DIR/cron/crontab.example"
   [[ -f "$tpl" ]] || return 1
@@ -577,9 +550,9 @@ _render_cron_lines() {
     | grep -vE '^[[:space:]]*(#|$)' || true
 }
 
-# Schedule review. Shows what is actually scheduled right now, then offers the
-# action that fits that state — so the user is never asked to "install the cron
-# jobs" while those jobs are already running.
+# The wizard's schedule step: shows what is scheduled right now, listing the
+# crontab lines, then offers the actions that fit that state and runs the chosen
+# one through _start or _stop.
 _cron_review() {
   local state entries listing
   state=$(cron_state)
@@ -617,8 +590,9 @@ _cron_review() {
   esac
 }
 
-# Opening screen when a config already exists: show it, show the verdict of the
-# checks, and let the user choose. Sets SETUP_REVIEW_CHOICE to keep / full / cancel.
+# The opening screens when a config already exists: the saved settings, the
+# verdict of the checks, then the choice. Sets SETUP_REVIEW_CHOICE to keep, full
+# or cancel — with the step-by-step recommended first only when a check failed.
 SETUP_REVIEW_CHOICE=""
 _setup_review() {
   _config_check
@@ -657,8 +631,8 @@ _setup_review() {
   SETUP_REVIEW_CHOICE="$UI_VALUE"
 }
 
-# The "keep my config" path: never rewrites an answer the user already gave. It only
-# tops up settings this version added, then reviews the schedule.
+# The "keep my config" path: it offers to top up the settings this version added,
+# reviews the schedule, and rewrites no answer the user already gave.
 _setup_keep() {
   if (( ${#CFG_OUTDATED[@]} > 0 )); then
     local -a lines=()
@@ -686,20 +660,20 @@ _setup_keep() {
 
 # ── setup ─────────────────────────────────────────────────────────────────────
 
+# The configuration wizard, and the only writer of config.conf. It detects the
+# running Immich, asks the user to confirm what it found, writes the file, creates
+# each user's destination folder, then reviews the schedule.
 _setup() {
-  # Establish the ~/.local/bin symlink first: the cron lines generated later resolve
-  # through it (see _resolve_self_bin), and it lets the user call the tool by name.
+  # First, since the cron lines generated later resolve through this symlink.
   _ensure_symlink
 
   ui_detect
   ui_logo
   ui_banner "immich-auto-dumper — guided setup"
 
-  # An existing config is reviewed before anything else: the step-by-step below is
-  # only worth walking through when something is actually wrong, or when the user
-  # asks for it. The review deliberately runs before detect_docker_cmd (which exits
-  # when the daemon is unreachable) so the saved config can still be shown and the
-  # schedule still managed while Immich or Docker is down.
+  # An existing config is reviewed first, and before detect_docker_cmd, which
+  # exits when the daemon is unreachable: the saved config can be shown and the
+  # schedule managed while Immich or Docker is down.
   if [[ -f "$CONFIG_FILE" ]]; then
     _setup_review
     case "$SETUP_REVIEW_CHOICE" in
@@ -708,7 +682,7 @@ _setup() {
     esac
   fi
 
-  # Detect docker command first; everything below depends on it.
+  # Everything below depends on docker.
   detect_docker_cmd
 
   # ── 1. Containers (auto-detected) ───────────────────────────────────────────
@@ -720,7 +694,7 @@ _setup() {
     return 0
   fi
 
-  # DB credentials — read from the server container env when Immich exposes them.
+  # DB credentials, from the server container's environment when it exposes them.
   detect_db_credentials "$server_container"
   local db_user="${DET_DB_USER:-${IMMICH_DB_USER:-postgres}}"
   local db_name="${DET_DB_NAME:-${IMMICH_DB_NAME:-immich}}"
@@ -728,10 +702,8 @@ _setup() {
   IMMICH_DB_USER="$db_user"
   IMMICH_DB_NAME="$db_name"
 
-  # Several containers can match the patterns — two projects side by side on one
-  # host is ordinary. The first match still wins, but the operator is told there
-  # was a choice, and which way it went, so a wrong guess is visible here rather
-  # than discovered later against the wrong database.
+  # Several containers can match the patterns. The first match wins, and the
+  # dialog below names the candidates and says which way the choice went.
   local ambiguity="" n_db n_srv
   n_db=$(detect_candidate_count "$DET_DB_CANDIDATES")
   n_srv=$(detect_candidate_count "$DET_SERVER_CANDIDATES")
@@ -759,7 +731,8 @@ _setup() {
 
   detect_upload_mount "$server_container" "$db_library_prefix"
   local upload_location="$DET_UPLOAD_LOCATION"
-  # Derive the DB prefix from the upload mount when the DB held no sample asset.
+  # The DB prefix, derived from the upload mount when the database held no asset
+  # to read it from, and hard-coded as a last resort.
   if [[ -z "$db_library_prefix" && -n "$DET_UPLOAD_CONTAINER" ]]; then
     db_library_prefix="${DET_UPLOAD_CONTAINER%/}/library"
   fi
@@ -767,10 +740,9 @@ _setup() {
   IMMICH_DB_LIBRARY_PREFIX="$db_library_prefix"
 
   # ── 3. External library — REQUIRED ──────────────────────────────────────────
-  # immich-auto-dumper moves photos into an Immich external library that Immich
-  # keeps reading. With no external library it has nothing to do and cannot work.
-  # The Docker mount mode (:ro) is not a filter here — see detect_external_libraries.
-  # Host-side write access is verified later when the storage marker is written.
+  # With no external library mounted into the server container there is nowhere
+  # to archive to, and setup stops. Host-side write access is verified further
+  # down, when the storage marker is written.
   local -a ext_raw=() ext_list=()
   mapfile -t ext_raw < <(detect_external_libraries "$server_container" "$DET_UPLOAD_CONTAINER")
   local e
@@ -791,7 +763,7 @@ _setup() {
       return 0
     fi
   else
-    # Several external libraries: let the user choose the destination.
+    # Several external libraries: the user picks the destination.
     local -a menu_args=()
     local idx=1 host cont
     for e in "${ext_list[@]}"; do
@@ -838,13 +810,13 @@ _setup() {
     disk_used=$(( disk_total - disk_free )); (( disk_used < 0 )) && disk_used=0
   fi
 
-  # The library can never exceed the space available to it (free disk + its current
-  # size); past that the disk fills before MAX is reached and archiving never fires.
-  # This is the hard ceiling for MAX (0 = unknown disk → no ceiling check).
+  # The ceiling MAX is validated against: free disk plus the library's current
+  # size, the most it can ever reach before the disk itself fills. 0 when the disk
+  # is unknown, which skips that check.
   local lib_cap_mb=0
   (( disk_total > 0 )) && lib_cap_mb=$(( (disk_free + cur_lib_bytes) / 1048576 ))
 
-  # Seed sensible defaults: from an existing config, else from the disk size.
+  # Defaults, taken from an existing config and otherwise from the disk size.
   local def_max_mb="${ARCHIVE_LIBRARY_MAX_MB:-}" def_target_mb="${ARCHIVE_LIBRARY_TARGET_MB:-}"
   [[ -z "$def_max_mb"    && -n "${ARCHIVE_LIBRARY_MAX_GB:-}"    ]] && def_max_mb=$(( ARCHIVE_LIBRARY_MAX_GB * 1024 ))
   [[ -z "$def_target_mb" && -n "${ARCHIVE_LIBRARY_TARGET_GB:-}" ]] && def_target_mb=$(( ARCHIVE_LIBRARY_TARGET_GB * 1024 ))
@@ -856,15 +828,15 @@ _setup() {
     fi
   fi
   (( def_max_mb > 0 )) || def_max_mb=$(( 200 * 1024 ))
-  # Keep the suggested default within the ceiling, so it is never pre-rejected.
+  # Held within the ceiling, so the suggestion is never pre-rejected.
   (( lib_cap_mb > 0 && def_max_mb > lib_cap_mb )) && def_max_mb=$lib_cap_mb
   if [[ -z "$def_target_mb" ]] || (( def_target_mb <= 0 || def_target_mb >= def_max_mb )); then
     def_target_mb=$(( def_max_mb * 3 / 4 ))
   fi
 
   local max_mb="$def_max_mb" target_mb="$def_target_mb" gauge v
-  # Treat boundaries seeded from disk size (no existing config) as "not yet defined",
-  # so their first gauge shows a placeholder marker + a "set a … value" hint.
+  # A boundary seeded from the disk size counts as not yet defined, so its first
+  # gauge shows a placeholder marker and a "set a … value" hint.
   local max_user_set=false min_user_set=false
   [[ -n "${ARCHIVE_LIBRARY_MAX_MB:-}${ARCHIVE_LIBRARY_MAX_GB:-}" ]] && max_user_set=true
   [[ -n "${ARCHIVE_LIBRARY_TARGET_MB:-}${ARCHIVE_LIBRARY_TARGET_GB:-}" ]] && min_user_set=true
@@ -872,7 +844,7 @@ _setup() {
     local gmax gmin
     "$max_user_set" && gmax="$max_mb" || gmax=0
     "$min_user_set" && gmin="$target_mb" || gmin=0
-    # MAX ▼ — a % is taken on the whole disk.
+    # For MAX ▼, a % is taken on the whole disk.
     gauge=$(render_library_gauge "$disk_total" "$disk_used" "$cur_lib_bytes" "$gmax" "$gmin" max)
     ui_input "$(_wiz_title "MAX ▼ — start archiving above")" \
       "$gauge\n\nMAX ▼: when the library grows ABOVE this, archiving begins.\nEnter a size (200, 1.5G, 500M) or a % of the disk (e.g. 80%)." \
@@ -890,7 +862,7 @@ _setup() {
     (( target_mb >= max_mb )) && target_mb=$(( max_mb * 3 / 4 ))
 
     "$min_user_set" && gmin="$target_mb" || gmin=0
-    # MIN ▲ — a % is taken on MAX (the library's max potential size).
+    # For MIN ▲, a % is taken on MAX, the library's largest permitted size.
     gauge=$(render_library_gauge "$disk_total" "$disk_used" "$cur_lib_bytes" "$max_mb" "$gmin" min)
     ui_input "$(_wiz_title "MIN ▲ — archive down to")" \
       "$gauge\n\nMIN ▲: after archiving, the library is brought back DOWN to this size.\nEnter a size, or a % of MAX ▼ ($(mb_to_human "$max_mb")). Must be below MAX." \
@@ -911,10 +883,9 @@ _setup() {
   done
 
   # ── 6b. Free-disk safety net ─────────────────────────────────────────────────
-  # Independent of the library-size MAX above: also archive when TOTAL free disk
-  # space drops below this floor, so archiving still fires even if unrelated data
-  # (Postgres, Docker, logs...) — not the library — is what actually fills the disk.
-  # On by default (computed from disk size) unless the user disables it outright.
+  # The second trigger, independent of the MAX above: total free disk space below
+  # this floor. On by default, at the value _recommended_min_free_mb computes,
+  # and turned off by entering 0.
   local def_min_free_mb
   def_min_free_mb=$(_recommended_min_free_mb "$upload_location")
   local min_free_mb="${ARCHIVE_MIN_FREE_MB:-$def_min_free_mb}"
@@ -950,12 +921,10 @@ _setup() {
   done
 
   # ── 6c. How many DB dumps to mirror ─────────────────────────────────────────
-  # Immich dumps its database into UPLOAD_LOCATION/backups and rotates those dumps
-  # itself (its backup.database.keepLastAmount setting); this tool copies them to the
-  # external storage and rotates its own copies. The two counts are independent — the
-  # matching 14 defaults are a coincidence — so Immich's value is offered as the
-  # suggested default (read from its DB when possible) rather than hard-coded: mirror
-  # at least as many as Immich keeps and no dump is dropped while Immich still has it.
+  # Immich rotates the dumps it keeps in UPLOAD_LOCATION/backups; this tool
+  # rotates its own copies on the external storage. The two counts are
+  # independent, and Immich's is read from its database and offered as the
+  # suggested default.
   local immich_keep=""
   _db_reachable && immich_keep=$(db_immich_backup_keep_last)
   local def_retention="${BACKUP_RETENTION:-}"
@@ -992,15 +961,14 @@ _setup() {
   local -a user_paths=()
   local users_raw=""
   if _db_reachable; then
-    # Setup path: see the note in _config_check. A mute database costs the
-    # pre-filled folder suggestions, not the wizard.
+    # A mute database costs the pre-filled folder suggestions, not the wizard.
     users_raw=$(db_get_users 2>/dev/null || true)
   fi
 
-  # Pre-fill each user's folder from an external library already pointing under
-  # ARCHIVE_CONTAINER_PATH in Immich: import path "/external_library/Test" → folder "Test".
-  # Keyed like USER_MAP (storageLabel, else ownerId). First matching path wins;
-  # libraries with no/empty import path are ignored (fall back to the user name).
+  # A folder suggestion per user, taken from a library Immich already points under
+  # ARCHIVE_CONTAINER_PATH: import path "/external_library/Alice" → folder
+  # "Alice". Keyed as USER_MAP is, on storageLabel and otherwise on ownerId. The
+  # first matching path wins, and a library with no import path is ignored.
   declare -A prefill_folder=()
   if _db_reachable; then
     local libs_raw lrow l_owner l_label l_path l_key l_rel
@@ -1021,14 +989,12 @@ _setup() {
     fi
   fi
   if [[ -n "$users_raw" ]]; then
-    # Read the rows into an array first. A `while read ... done <<< "$users_raw"`
-    # loop would redirect the whole body's stdin to the here-string, so the
-    # ui_input prompt below (text backend) would read EOF instead of the user's
-    # answer. Iterating an array keeps stdin pointing at the terminal.
+    # The rows go into an array first: a `while read … done <<< "$users_raw"`
+    # loop would redirect the whole body's stdin to the here-string, and the
+    # ui_input prompt below would read EOF instead of the user's answer.
     local -a _users=()
     mapfile -t _users <<< "$users_raw"
-    # Existing external-library folders, shown in each prompt so the user can reuse a
-    # consistent name (and see what they'll point Immich at afterwards).
+    # The folders already on the external library, shown in each prompt.
     local lib_tree tree_note=""
     lib_tree=$(_ext_library_tree "$archive_dest")
     [[ -n "$lib_tree" ]] && tree_note="\n\nFolders currently on the external library:\n${lib_tree}"
@@ -1041,9 +1007,9 @@ _setup() {
       user_name_by_key["$key"]="$name"
       local current_mapped="${USER_MAP["$key"]:-}"
       local detected="${prefill_folder["$key"]:-}"
-      # Default priority: an existing config choice, else a folder detected from this
-      # user's Immich external library, else the human-readable user name (not the
-      # storageLabel, which is often opaque for users other than the first admin).
+      # The pre-filled answer, in order of preference: this config's own choice,
+      # a folder detected from the user's Immich library, then the user's name —
+      # not the storageLabel, which is often an opaque UUID.
       local default_folder="${current_mapped:-${detected:-$name}}"
       local detected_note=""
       [[ -z "$current_mapped" && -n "$detected" ]] \
@@ -1055,16 +1021,14 @@ _setup() {
           "$default_folder" || { ui_info "Setup" "Cancelled — nothing was written and no jobs were scheduled."; return 0; }
         folder_answer=$(_sanitize_folder "$UI_VALUE")
         if [[ -z "$folder_answer" ]]; then
-          # An empty folder would archive straight into the root of the external
-          # library, mixing every user's photos together and leaving no per-user path
-          # to register in Immich.
+          # An empty folder would archive into the root of the external library,
+          # leaving no per-user path to register in Immich.
           ui_info "Folder required" "Enter a sub-folder name for $name's archived photos — it cannot be empty."
           continue
         fi
-        # Two users sharing one folder merge their two libraries into it, and the
-        # same relative path below it then names two different photos. The second
-        # one archived finds the first already at its destination — the collision
-        # that used to be read as "already archived" and cost the original photo.
+        # Two users sharing one folder merge their libraries into it, where one
+        # relative path names two different photos. Refused here, as it is in
+        # _config_check.
         local clash="" taken_key
         if [[ -n "${new_user_map[*]+x}" ]]; then
           for taken_key in "${!new_user_map[@]}"; do
@@ -1080,18 +1044,19 @@ _setup() {
         break
       done
       new_user_map["$key"]="$folder_answer"
-      # Remember the real archive path for this user (name + destination folder),
-      # shown in the summary instead of the opaque storageLabel key.
+      # The line the summary shows: the user's name and the real archive path,
+      # rather than the storageLabel key.
       user_paths+=("  $name : ${archive_dest%/}/$folder_answer")
     done
   fi
 
-  # Advanced knobs keep sensible defaults (or existing config); no extra prompts.
+  # The log settings are never prompted for: an existing config's values, or
+  # these defaults.
   local log_dir="${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper}"
   local log_max_lines="${LOG_MAX_LINES:-1000}"
 
-  # Schema / path-consistency checks (non-blocking). Only a real mismatch is
-  # reported as one: an unanswering database says nothing about the schema.
+  # Schema and path-consistency checks, neither of which blocks the wizard. Only
+  # a real mismatch is reported: a mute database says nothing about the schema.
   if _db_reachable; then
     local wiz_schema_state=0
     db_check_schema 2>/dev/null || wiz_schema_state=$?
@@ -1136,16 +1101,15 @@ _setup() {
     return 0
   fi
 
-  # One line per user, no array declaration: config.conf is read, not executed,
-  # and `declare -A` was the last thing in it that needed a shell to make sense.
+  # One USER_MAP.<key>=<folder> line per user, and no array declaration:
+  # config.conf is read and not executed.
   local user_map_block="" k
   for k in "${!new_user_map[@]}"; do
     user_map_block+="USER_MAP.${k}=${new_user_map[$k]}"$'\n'
   done
 
-  # Written to a temporary file and renamed into place. A `cat >` interrupted
-  # mid-write left a truncated configuration — which the loader now refuses
-  # outright, so the tool would simply stop starting.
+  # Written to a temporary file and renamed into place, so an interruption
+  # mid-write cannot leave a truncated configuration behind.
   cat > "$CONFIG_FILE.tmp" <<CONF
 # immich-auto-dumper — configuration
 # Generated on $(date '+%Y-%m-%d %H:%M:%S')
@@ -1188,10 +1152,10 @@ CONF
     return 1
   fi
 
-  # An external library can only point at a path that already exists, so create each
-  # user's destination folder now if missing. We never touch Immich's own config; any
-  # user without a library already pointed under our path gets copy-paste instructions
-  # in the final report below.
+  # An Immich external library can only point at a path that already exists, so
+  # each user's destination folder is created here. Immich's own configuration is
+  # never touched: a user with no library pointed under the archive path gets
+  # instructions in the report below.
   local -a fld_created=() fld_existed=() fld_failed=() immich_todo=()
   local k folder host_dir uname cpath
   for k in "${!new_user_map[@]}"; do
@@ -1209,14 +1173,14 @@ CONF
     else
       fld_failed+=("$host_dir")
     fi
-    # No external library detected pointing here → the admin must set it up in Immich.
+    # No library detected pointing here: it has to be added in Immich.
     [[ -z "${prefill_folder[$k]:-}" ]] && immich_todo+=("$uname  →  $cpath")
   done
 
   _cron_review
 
-  # Persistent terminal trace (plain stdout, survives the whiptail screen) so the
-  # user keeps a record of the outcome and any remaining manual Immich steps.
+  # On plain stdout, so it survives the whiptail screen and leaves the user a
+  # record of the outcome and of any Immich step still to take.
   printf '\n========================================\n'
   printf 'immich-auto-dumper setup: SUCCESS\n'
   printf '========================================\n'
@@ -1242,6 +1206,9 @@ CONF
 
 # ── status ────────────────────────────────────────────────────────────────────
 
+# Reports the state of everything the tool depends on and of what it last did.
+# Writes nothing, and always prints every line, including when a check could not
+# be made.
 _status() {
   echo "=== immich-auto-dumper status ==="
 
@@ -1251,7 +1218,7 @@ _status() {
     lib_bytes=$(dir_size_bytes "$library_path")
     disk_total=$(disk_total_bytes "${IMMICH_UPLOAD_LOCATION}")
     disk_free=$(disk_free_bytes "${IMMICH_UPLOAD_LOCATION}")
-    # Boundaries are stored in MiB; honor the deprecated *_GB keys for old configs.
+    # In MiB, with the deprecated *_GB keys honoured.
     local s_max_mb="${ARCHIVE_LIBRARY_MAX_MB:-}" s_target_mb="${ARCHIVE_LIBRARY_TARGET_MB:-}"
     [[ -z "$s_max_mb"    && -n "${ARCHIVE_LIBRARY_MAX_GB:-}"    ]] && s_max_mb=$(( ARCHIVE_LIBRARY_MAX_GB * 1024 ))
     [[ -z "$s_target_mb" && -n "${ARCHIVE_LIBRARY_TARGET_GB:-}" ]] && s_target_mb=$(( ARCHIVE_LIBRARY_TARGET_GB * 1024 ))
@@ -1267,9 +1234,8 @@ _status() {
         "$(mb_to_human "$s_min_free_mb")" "$(bytes_to_human "${disk_free:-0}")"
     fi
 
-    # Same ceiling check `setup` makes when validating MAX (free disk + current
-    # library = the most the library can ever reach before the disk itself fills).
-    # Re-checked here because unrelated processes can erode that ceiling over time.
+    # The same ceiling setup validates MAX against, re-checked here: unrelated
+    # data on the disk erodes it over time.
     if (( disk_total > 0 && s_max_mb > 0 )) && (( disk_free + lib_bytes < s_max_mb * 1048576 )); then
       if (( s_min_free_mb > 0 )); then
         printf 'WARNING              : library cannot reach its %s max before the disk fills — relying on the free-disk safety net above.\n' \
@@ -1292,9 +1258,7 @@ _status() {
     *) printf 'External storage     : UNVERIFIABLE  (%s) — %s\n' "${ARCHIVE_DEST_PATH:-?}" "$_ARCHIVE_DEST_REASON" ;;
   esac
 
-  # Schema + path consistency vs Immich DB. Every line is always printed, including
-  # when nothing could be checked: skipping the line altogether left a status report
-  # that looked entirely healthy while the database was down.
+  # Schema and path consistency against Immich's database.
   local schema_state=0
   if ! probe_docker_cmd 2>/dev/null; then
     printf 'Schema check         : not verified (Docker unreachable)\n'
@@ -1312,7 +1276,7 @@ _status() {
   if ! probe_docker_cmd 2>/dev/null; then
     printf 'Path consistency     : not verified (Docker unreachable)\n'
   elif ! "$storage_ready"; then
-    # The offline-asset signal only means anything when the files are reachable.
+    # The offline-asset signal means nothing while the files are unreachable.
     printf 'Path consistency     : not verified (external storage not reachable)\n'
   else
     local consistency_state=0
@@ -1333,8 +1297,8 @@ _status() {
     printf 'DB backups           : .immich-backup/ directory absent\n'
   fi
 
-  # Distinguish "stopped" (entries commented out, `start` re-enables them) from
-  # "never installed" (nothing scheduled at all) — they need different actions.
+  # "disabled" and "not installed" are reported apart: they need different
+  # actions from the user.
   case "$(cron_state)" in
     active)   printf 'Cron jobs            : active\n' ;;
     disabled) printf 'Cron jobs            : disabled (entries commented out — run "immich-auto-dumper start" to re-enable)\n' ;;
@@ -1349,8 +1313,8 @@ _status() {
 
     if [[ -n "$last_archive" ]]; then
       local ts detail
-      # `|| true`: under `set -o pipefail` a grep that matches nothing fails the whole
-      # assignment, which would abort `status` over a cosmetic detail.
+      # `|| true`: under pipefail a grep matching nothing would fail the
+      # assignment and abort status over a cosmetic detail.
       ts=$(printf '%s' "$last_archive" | grep -oP '(?<=\[)[^\]]+' | head -1 || true)
       detail=$(printf '%s' "$last_archive" | sed 's/.*Archive complete\. //')
       printf 'Last archive         : %s — %s\n' "$ts" "$detail"
@@ -1379,8 +1343,8 @@ _status() {
     *)      printf 'Lock                 : inactive\n' ;;
   esac
 
-  # Unfinished work has to be visible without opening a file: is there a run that
-  # did not complete, since when, how much is waiting, and how much is stuck.
+  # Unfinished work, without opening a file: whether a run did not complete,
+  # since when, how much is waiting and how much is stuck.
   local rl_pending rl_blocked rl_divergent rl_unreadable rl_files rl_oldest
   read -r rl_pending rl_blocked rl_divergent rl_unreadable rl_files rl_oldest < <(runlog_summary)
   if (( rl_files == 0 )); then
@@ -1405,6 +1369,8 @@ _status() {
 
 # ── start ─────────────────────────────────────────────────────────────────────
 
+# Installs the schedule: re-enables the entries a previous `stop` commented out,
+# then appends any that are still missing.
 _start() {
   local rendered logdir
   if ! rendered=$(_render_cron_lines) || [[ -z "$rendered" ]]; then
@@ -1414,12 +1380,10 @@ _start() {
   logdir="${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper}"
   mkdir -p "$logdir" 2>/dev/null || true
 
-  # Re-enable any entries a previous 'stop' commented out (symmetric to disable_cron),
-  # then append any that are still missing. Without the un-comment step, a commented
-  # line would match the substring check below and 'start' after 'stop' would no-op.
-  # Only un-comment lines whose payload looks like a cron schedule (starts with a
-  # digit, '*' or '@'), so a plain user comment mentioning immich-auto-dumper is
-  # never turned into an invalid crontab line.
+  # The un-comment step, symmetric to disable_cron: without it, a commented line
+  # would match the substring check below and `start` after `stop` would do
+  # nothing. Only a line whose payload looks like a cron schedule is touched, so
+  # a user's own comment naming the tool is never turned into a crontab line.
   local current
   current=$(crontab -l 2>/dev/null | sed 's|^#\([0-9*@].*immich-auto-dumper.*\)|\1|' || true)
 
@@ -1443,10 +1407,11 @@ _start() {
 
 # ── stop ──────────────────────────────────────────────────────────────────────
 
+# Comments the schedule out and waits, for up to a minute, on any operation
+# already running.
 _stop() {
-  # disable_cron only reports on live schedules, so tell the two "nothing to do" cases
-  # apart instead of claiming the crontab holds no entry when it simply holds no
-  # *enabled* one.
+  # disable_cron reports on live schedules alone, so the two "nothing to do"
+  # cases are told apart here.
   if disable_cron; then
     echo "Cron jobs disabled."
   elif [[ "$(cron_state)" == "disabled" ]]; then
@@ -1475,6 +1440,8 @@ _stop() {
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+# Parses the flags and the command, refuses to run any command but setup and
+# uninstall without a readable config, then dispatches.
 main() {
   local dry_run=false
   local force=false
@@ -1486,13 +1453,11 @@ main() {
     case "$arg" in
       --dry-run) dry_run=true ;;
       --force)   force=true ;;
-      # Belongs to `uninstall`, which hands it straight to uninstall.sh. Listed so
-      # the guard below does not reject it.
+      # Belongs to `uninstall`, which hands it straight to uninstall.sh. Named
+      # here so the guard below does not reject it.
       -y|--yes)  args+=("$arg") ;;
-      # A flag that is not recognised was collected as a command argument and then
-      # ignored. `dump_now --force --dryrun` consequently archived for real, with no
-      # DRY-RUN prefix anywhere in its output — the one typo the flag exists to
-      # protect against. A misspelled safety flag must stop the run, not start it.
+      # Any other unrecognised flag stops the run: a misspelled safety flag must
+      # never be collected as an argument and ignored.
       -*)
         printf 'Unknown option: %s\n\n' "$arg" >&2
         _usage >&2
@@ -1504,12 +1469,11 @@ main() {
 
   cmd="${args[0]:-}"
 
-  # setup creates the config; uninstall must work even when no config exists.
+  # setup creates the config, and uninstall works without one, so both stay
+  # reachable when a configuration is missing or unreadable. Every other command
+  # refuses rather than act on half a configuration.
   if [[ "$cmd" != "setup" && "$cmd" != "uninstall" && -n "$cmd" ]]; then
     _require_config
-    # Acting on a configuration that could not be read whole is how a run reported
-    # success while doing nothing. setup and uninstall stay reachable, since those
-    # are what a broken config needs.
     if ! "$CONFIG_LOADED"; then
       printf 'Error: config.conf could not be read (see the errors above).\n' >&2
       printf 'Fix those lines, or run: immich-auto-dumper setup\n' >&2
@@ -1536,17 +1500,16 @@ main() {
       _stop
       ;;
     dump_now)
-      # Without --force: automatic, threshold-based run (used by cron).
-      # With --force: manual dump that ignores MAX and archives down to TARGET.
+      # Threshold-based without --force, and ignoring MAX with it.
       archive_run "${dry_flag[@]}" "${force_flag[@]}"
       ;;
     sync_now)
       backup_db_run "${dry_flag[@]}"
       ;;
     test_run)
-      # Verbose simulation of a forced dump + DB-backup sync. Forced so candidates
-      # are listed even when the library is below MAX. Run both halves regardless of
-      # either's outcome so a non-zero return under `set -e` never hides a preview.
+      # A forced dump and a dump-sync, both simulated. Forced, so candidates are
+      # listed even with the library below MAX, and both halves run whatever the
+      # other returns, so neither can hide the other's preview.
       archive_run --force --dry-run || true
       backup_db_run --dry-run || true
       ;;
@@ -1554,8 +1517,8 @@ main() {
       archive_rollback "${args[1]:-}"
       ;;
     uninstall)
-      # Hand off to the standalone uninstaller (self-relocates before deleting the
-      # install dir). Pass through any -y/--yes flag.
+      # Handed to the standalone uninstaller, which relocates itself before
+      # deleting the install directory, with any -y/--yes passed through.
       exec bash "$SCRIPT_DIR/uninstall.sh" "${args[@]:1}"
       ;;
     *)

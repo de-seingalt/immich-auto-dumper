@@ -1,53 +1,24 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2034  # the DET_* globals are this file's whole output:
-# it is sourced at runtime through $SCRIPT_DIR, which shellcheck cannot follow.
-# ──────────────────────────────────────────────────────────────────────────────
-# Auto-detection of Immich settings from the running Docker installation.
-#
-# immich-auto-dumper exists only to move photos out of Immich's internal library
-# and into an Immich *external library* that Immich keeps reading. Every value it
-# needs is therefore already defined by the running Immich install: container
-# names, the upload location, the external library mounts, the DB credentials and
-# the asset path prefix. These helpers read that ground truth (via `docker
-# inspect` and the database) so the wizard can pre-fill — and usually fully
-# determine — each value, asking the user only to confirm or to choose between
-# real alternatives.
-#
-# All functions set DET_* globals and/or echo results; none are interactive.
-# ──────────────────────────────────────────────────────────────────────────────
+# shellcheck disable=SC2034  # the DET_* globals are this file's output
+# Reads Immich's settings off the running Docker installation: container names,
+# upload location, external-library mounts, DB credentials, asset path prefix.
+# Every function sets DET_* globals and/or echoes its result; none is interactive.
 
-# Field separator for the mount listing below. A host path is free to contain a
-# "|" — that is the defect F12 fixed for database rows, and the same one was
-# sitting here on mount points. No path can contain \x01.
+# Field separator for the mount listing below. No path can contain \x01.
 DET_FIELD_SEP=$'\x01'
 
-# Raw "Type<SEP>Source<SEP>Destination" line per mount of a container.
-#
-# Note: only host paths (Source) and container paths (Destination) are read. A
-# Docker ":ro" mount mode is deliberately ignored — it restricts the *container*
-# (so the Immich app cannot write to an external library), but immich-auto-dumper
-# moves files through the *host* filesystem, not through Docker. Whether the tool
-# can write there is a host-side question, verified during setup when the storage
-# marker file is written into ARCHIVE_DEST_PATH.
+# Echoes one "Type<SEP>Source<SEP>Destination" line per mount of a container.
+# Only the host path (Source) and the container path (Destination) are read; the
+# mount mode is not.
 _inspect_mounts() {
   $DOCKER_CMD inspect \
     --format '{{range .Mounts}}{{.Type}}{{printf "\x01"}}{{.Source}}{{printf "\x01"}}{{.Destination}}{{"\n"}}{{end}}' \
     "$1" 2>/dev/null || true
 }
 
-# detect_immich_containers
 # Sets DET_SERVER_CONTAINER and DET_DB_CONTAINER (empty when not found), plus
 # DET_DB_CANDIDATES / DET_SERVER_CANDIDATES: every running container that matched,
-# newline-separated.
-#
-# The choice stays automatic — `head -1` — but it stops being silent. On a host
-# running two Postgres containers (two projects side by side is ordinary, and it
-# is the case on the test VM) the first one simply won, and nothing anywhere said
-# there had been a choice to make. The candidates are reported by the caller, so
-# the operator sees immediately whether the tool picked the wrong one and can fix
-# config.conf or rename a container. A proper menu is the right answer the day
-# this happens for real; adding an interactive dialog to the most fragile part of
-# the code is not what this pass is for.
+# newline-separated. The first match wins; the caller reports the candidates.
 DET_DB_CANDIDATES=""; DET_SERVER_CANDIDATES=""
 detect_immich_containers() {
   DET_SERVER_CONTAINER=""; DET_DB_CONTAINER=""
@@ -67,15 +38,14 @@ detect_immich_containers() {
   DET_SERVER_CONTAINER=$(printf '%s\n' "$DET_SERVER_CANDIDATES" | grep -v '^$' | head -1 || true)
 }
 
-# How many running containers matched, for the caller to decide whether there was
-# an ambiguity worth reporting.
+# Echoes how many non-empty lines a candidates list holds.
 detect_candidate_count() {
   printf '%s\n' "$1" | grep -cv '^$' || true
 }
 
 # detect_db_credentials <server_container>
-# Sets DET_DB_USER / DET_DB_NAME from the server container environment when Immich
-# exposes them (DB_USERNAME / DB_DATABASE_NAME); empty otherwise.
+# Sets DET_DB_USER / DET_DB_NAME from the server container's environment
+# (DB_USERNAME / DB_DATABASE_NAME); empty when it does not expose them.
 detect_db_credentials() {
   DET_DB_USER=""; DET_DB_NAME=""
   local env
@@ -93,8 +63,8 @@ detect_upload_mount() {
   local mounts type src dst
   mounts=$(_inspect_mounts "$container")
 
-  # Best signal: the mount whose container path is the parent of the DB library
-  # prefix (e.g. prefix /data/library -> mount dest /data).
+  # First try: the mount whose container path is the parent of the DB library
+  # prefix (prefix /data/library -> mount dest /data).
   if [[ -n "$prefix" ]]; then
     local want="${prefix%/library}"
     while IFS="$DET_FIELD_SEP" read -r type src dst; do
@@ -127,12 +97,8 @@ detect_upload_mount() {
 
 # detect_external_libraries <server_container> <upload_container_path>
 # Echoes one "host_path<SEP>container_path" line per external-library candidate:
-# bind mounts that are neither the upload mount nor Immich/system internals.
-#
-# The Docker mount mode (:ro / :rw) is intentionally NOT used to filter: ":ro"
-# only stops the Immich container from writing (often set on purpose). This tool
-# writes through the host filesystem, so host-side write access is what matters,
-# and that is verified when the storage marker is written during setup.
+# bind mounts that are neither the upload mount nor Immich/system internals. The
+# mount mode is not part of the filter.
 detect_external_libraries() {
   local container="$1" upload_dst="$2"
   local mounts type src dst

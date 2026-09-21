@@ -1,18 +1,14 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2034  # the C_* colours and UI_VALUE are consumed by the
-# main script, sourced at runtime through $SCRIPT_DIR.
+# shellcheck disable=SC2034  # the C_* colours and UI_VALUE are this file's output
 # ──────────────────────────────────────────────────────────────────────────────
-# UI abstraction layer.
+# UI abstraction layer: the interactive primitives the setup wizard is built on.
 #
-# Provides a single set of interactive primitives used by the setup wizard. When
-# `whiptail` is available and we are attached to a terminal, prompts are rendered
-# as native dialog boxes (arrow-key navigation, pre-filled defaults, colors).
-# Otherwise we fall back to colored plain-text prompts that work everywhere
-# (bare TTY, SSH, minimal images) with no extra dependency.
+# Two backends. With `whiptail` available and a terminal on stdout, prompts are
+# native dialog boxes; otherwise they are coloured plain-text prompts, which need
+# no extra dependency.
 #
-# All prompts return their result in the global UI_VALUE and use exit status 0
-# for "confirmed" / 1 for "cancelled", so callers can react to a cancel without
-# the value being swallowed by a command-substitution subshell.
+# Every prompt leaves its result in the global UI_VALUE and returns 0 for
+# "confirmed", 1 for "cancelled".
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── Color palette (text fallback) ─────────────────────────────────────────────
@@ -25,7 +21,7 @@ else
   C_RED=''; C_GREEN=''; C_YELLOW=''; C_BLUE=''; C_CYAN=''; C_MAGENTA=''
 fi
 
-# Pleasant newt theme so the whiptail dialogs are not the default red.
+# Colour theme applied to every whiptail dialog.
 export NEWT_COLORS='
 root=,blue
 border=white,blue
@@ -52,8 +48,8 @@ fullscale=white,cyan
 # Selected backend: "whiptail" or "text". Set by ui_detect.
 UI_BACKEND="text"
 
-# Detect the best available backend. whiptail needs an interactive terminal on
-# stdout to draw into.
+# Picks the backend: whiptail when it is installed and stdout is a terminal for
+# it to draw into, text otherwise.
 ui_detect() {
   if command -v whiptail &>/dev/null && [[ -t 1 ]]; then
     UI_BACKEND="whiptail"
@@ -70,9 +66,8 @@ readonly _UI_W=78
 
 # ── Primitives ────────────────────────────────────────────────────────────────
 
-# ui_logo  — ASCII splash shown at the start of an interactive entry point
-# (setup wizard, usage screen). Printed to the raw terminal, so it runs
-# regardless of the whiptail/text backend choice.
+# ui_logo  — ASCII splash for an interactive entry point. Printed to the raw
+# terminal, whichever backend is in use.
 ui_logo() {
   printf '%s' "$C_CYAN"
   cat <<'EOF'
@@ -102,15 +97,13 @@ ui_section() {
   fi
 }
 
-# ui_info <title> <text>  — purely informational message. Sized to its body (some
-# of these carry a config summary or a list of problems, which a fixed height clips).
+# ui_info <title> <text>  — informational message, the box sized to its body.
 ui_info() {
   local title="$1" text="$2"
   if [[ "$UI_BACKEND" == "whiptail" ]]; then
     local flags=()
     _wt_geometry "$text" 7
-    # A body taller than the terminal (a config summary, a long list of findings) is
-    # made scrollable — clipping it would hide exactly what the user opened it for.
+    # A body taller than the terminal is made scrollable rather than clipped.
     (( _UI_CLIPPED )) && flags+=(--scrolltext)
     whiptail --title "$title" "${flags[@]}" --msgbox "$text" "$_UI_HEIGHT" "$_UI_W" || true
   else
@@ -118,9 +111,8 @@ ui_info() {
   fi
 }
 
-# ui_em <text>  — emphasize a value the user must double-check (manually entered
-# ones, which can break the script). Real bold in the text backend; whiptail
-# cannot style body text, so it is wrapped in guillemets to still stand out.
+# ui_em <text>  — emphasises a value in a dialog body: bold in the text backend,
+# wrapped in guillemets under whiptail, which cannot style body text.
 ui_em() {
   if [[ "$UI_BACKEND" == "text" ]]; then
     printf '%s%s%s' "$C_BOLD" "$1" "$C_RESET"
@@ -129,28 +121,23 @@ ui_em() {
   fi
 }
 
-# ui_note <text>  — light inline note (text backend prints dim; whiptail no-op,
-# since the same info is embedded into the relevant dialog's body text).
+# ui_note <text>  — inline note, printed dim by the text backend and a no-op
+# under whiptail.
 ui_note() {
   [[ "$UI_BACKEND" == "text" ]] && printf '%b\n' "${C_DIM}$1${C_RESET}"
   return 0
 }
 
-# Estimate a whiptail box height that fits <body> without a scrollbar. Counts both
-# real newlines and literal "\n" sequences (whiptail renders both as breaks), adds
-# <extra> rows for borders/buttons/input field, and caps to the terminal height.
-#
-# _wt_geometry sets _UI_HEIGHT and _UI_CLIPPED (1 when the cap kicked in, i.e. the
-# body does not fit and the caller should make the box scrollable rather than
-# silently lose its last lines). _wt_height is the echoing wrapper used where only
-# the height matters.
+# Box geometry for a whiptail dialog. _wt_geometry sets _UI_HEIGHT, the height
+# that fits <body> plus <extra> rows of borders, buttons and input field, and
+# _UI_CLIPPED, 1 when the terminal height capped it and the caller should make
+# the box scrollable. _wt_height is the echoing wrapper for callers that only
+# need the height.
 _UI_HEIGHT=8
 _UI_CLIPPED=0
 
-# Terminal height in rows. $LINES is set by INTERACTIVE shells only, so inside a script
-# it is almost always empty and `${LINES:-24}` silently pinned every box to 24 rows —
-# on a shorter terminal the dialog was then taller than the screen. Ask the terminal
-# itself, and fall back to 24 only when it cannot say.
+# Terminal height in rows, asked of the terminal itself: $LINES is set by
+# interactive shells only, and is empty inside a script. 24 when it cannot say.
 _ui_term_lines() {
   local n="${LINES:-}"
   [[ "$n" =~ ^[0-9]+$ ]] || n=$( { tput lines; } 2>/dev/null || true )
@@ -158,15 +145,14 @@ _ui_term_lines() {
   [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 10 )) || n=24
   printf '%s' "$n"
 }
-# How many rows one logical line actually occupies once whiptail has wrapped it
-# to <width>. Wrapping is done on words, as whiptail does: a word that does not
-# fit starts a new row, and a word longer than the box is broken across rows. An
+# Sets _UI_ROWS to the number of rows one logical line occupies once whiptail has
+# wrapped it to <width>. Wrapped on words, as whiptail does: a word that does not
+# fit starts a new row, one longer than the box is broken across rows, and an
 # empty line still occupies one row.
 #
-# `read -ra` rather than an unquoted expansion, so a body containing `*` is split
-# into words without being expanded against the filesystem. The answer goes into
-# a global rather than stdout: a command substitution would fork a subshell per
-# LINE, and not forking per dialog is the point of doing this in bash at all.
+# `read -ra` splits into words without expanding a `*` against the filesystem.
+# The answer goes into a global and not to stdout, which saves a subshell per
+# line.
 _UI_ROWS=1
 _wt_rows() {
   local text="$1" width="$2"
@@ -180,7 +166,7 @@ _wt_rows() {
       col=$(( col + 1 + len ))
       continue
     fi
-    # Starts a fresh row — and spans several when it is longer than the box.
+    # Starts a fresh row, and spans several when it is longer than the box.
     rows=$(( rows + (len + width - 1) / width ))
     col=$(( len % width ))
     (( col == 0 )) && col=$width
@@ -194,22 +180,13 @@ _wt_geometry() {
   local lines h maxh
   _UI_CLIPPED=0
 
-  # This counted LOGICAL lines and whiptail renders WRAPPED ones. A body of 8
-  # logical lines that wrapped to 11 was given a box sized for 8, whiptail cut
-  # the end off — and because the computed height stayed under the terminal cap,
-  # _UI_CLIPPED stayed 0 and --scrolltext was not added either. Both safety nets
-  # failed together, silently. On the real review screen that is what turned
-  # "For information:" into a heading followed by nothing, and the same mechanism
-  # can swallow the CFG_PROBLEMS list — the blocking problems the screen exists
-  # to show.
-  #
-  # Still pure parameter expansion and builtins, no subprocess per dialog, which
-  # was the point of the version this replaces. ${#word} counts CHARACTERS and
-  # not bytes under a UTF-8 locale, so the accents and the ▼/▲ of the summary are
-  # measured correctly.
+  # The rows counted are the WRAPPED ones whiptail draws, not the logical lines
+  # it is given. Pure parameter expansion and builtins, with no subprocess per
+  # dialog; ${#word} counts characters and not bytes under a UTF-8 locale, so
+  # accents and the ▼/▲ markers measure correctly.
   #
   # whiptail renders a literal "\n" as a break exactly like a real one, so the
-  # two are normalised before counting instead of being counted separately.
+  # two are normalised before counting.
   local normalised="${body//\\n/$'\n'}"
   local usable=$(( _UI_W - 4 ))
   (( usable < 1 )) && usable=1
@@ -318,19 +295,19 @@ ui_menu() {
 
 # ── Size parsing & formatting ─────────────────────────────────────────────────
 #
-# All archive boundaries are stored internally as integer MEBIBYTES (MiB) so that
-# bash integer arithmetic keeps working while still allowing fractional GB input
-# (e.g. 0.5 GB = 512 MiB). 1 GiB = 1024 MiB, 1 MiB = 1024^2 bytes.
+# Every archive boundary is stored as an integer number of MEBIBYTES, which keeps
+# bash integer arithmetic usable while still accepting a fractional-GB input
+# (0.5 GB = 512 MiB). 1 GiB = 1024 MiB, 1 MiB = 1024^2 bytes.
 
 # parse_size_to_mb <input> [<total_bytes>]
-# Accepts: "200" (bare = GiB), "1.5G"/"1.5GB", "500M"/"500MB", "2T", "80%".
-# A comma decimal separator is accepted ("0,5"). Echoes an integer number of MiB,
-# or nothing on a parse error (or a "%" with no usable disk total).
+# Accepts "200" (bare = GiB), "1.5G"/"1.5GB", "500M"/"500MB", "2T" and "80%", a
+# comma decimal separator included. Echoes a whole number of MiB, or nothing on a
+# parse error and on a "%" with no usable disk total.
 parse_size_to_mb() {
   local input="${1// /}" total_bytes="${2:-0}"
   input="${input//,/.}"
-  # bc both computes and rounds to a whole number of MiB, printed with %s. Passing
-  # bc's float output to printf %f would break under a ',' decimal locale (fr_FR).
+  # bc computes and rounds, and its output is printed with %s: printf %f would
+  # reject a dotted decimal under a ',' locale.
   local num
   if [[ "$input" =~ ^([0-9]+(\.[0-9]+)?)%$ ]]; then
     num="${BASH_REMATCH[1]}"
@@ -347,7 +324,7 @@ parse_size_to_mb() {
     esac
     printf '%s\n' "$(echo "scale=6; v=$num * $mult; scale=0; (v+0.5)/1" | bc)"
   elif [[ "$input" =~ ^([0-9]+(\.[0-9]+)?)$ ]]; then
-    # Bare number = GiB, for backward compatibility with the old prompts.
+    # A bare number is read as GiB.
     num="${BASH_REMATCH[1]}"
     printf '%s\n' "$(echo "scale=6; v=$num * 1024; scale=0; (v+0.5)/1" | bc)"
   fi
@@ -363,8 +340,8 @@ mb_to_human() {
   fi
 }
 
-# mb_to_input <mb>  — compact value to pre-fill an input box ("200G", "1.5G",
-# "512M"). The parser accepts the result back verbatim.
+# mb_to_input <mb>  — compact value pre-filling an input box ("200G", "1.5G",
+# "512M"), which parse_size_to_mb accepts back verbatim.
 mb_to_input() {
   local mb="${1:-0}"
   if (( mb == 0 )); then
@@ -372,7 +349,7 @@ mb_to_input() {
   elif (( mb % 1024 == 0 )); then
     printf '%dG\n' "$(( mb / 1024 ))"
   elif (( mb >= 1024 )); then
-    # Trim trailing zeros from the GB form (1.50 -> 1.5).
+    # The GB form without its trailing zeros: 1.50 -> 1.5.
     local g; g=$(echo "scale=2; $mb / 1024" | bc)
     g="${g%0}"; g="${g%.}"
     printf '%sG\n' "$g"
@@ -383,11 +360,11 @@ mb_to_input() {
 
 # ── Disk / library gauge ──────────────────────────────────────────────────────
 #
-# A horizontal bar visualizing, on the scale of the whole disk, how much of it is
+# A horizontal bar showing, on the scale of the whole disk, how much of it is
 # used, how much the Immich library occupies, and where the MAX (start archiving)
-# and MIN (archive down to) boundaries fall. Unicode block characters are used
-# when the locale supports UTF-8, with a plain-ASCII fallback otherwise.
+# and MIN (archive down to) boundaries fall.
 
+# Unicode block characters when the locale is UTF-8, plain ASCII otherwise.
 if [[ "$(locale charmap 2>/dev/null)" == *UTF-8* \
    || "${LC_ALL:-}${LC_CTYPE:-}${LANG:-}" == *[Uu][Tt][Ff]* ]]; then
   GAUGE_UTF=1
@@ -395,8 +372,8 @@ else
   GAUGE_UTF=0
 fi
 
-# Overwrite, in-place, <len(text)> characters of the named variable starting at
-# column <col>, clamping so the text never overflows the string width.
+# Overwrites, in place, as many characters of the named variable as <text> holds,
+# starting at column <col> and clamped so the text never overflows the string.
 _gauge_place() {
   local -n _v="$1"; local c="$2" t="$3" len=${#3} w=${#_v}
   (( c + len > w )) && c=$(( w - len ))
@@ -405,17 +382,17 @@ _gauge_place() {
 }
 
 # render_library_gauge <disk_total> <disk_used> <lib_bytes> <max_mb> <min_mb> [focus]
-# focus ∈ {max,min,""}: when set, the matching marker gets a "set a … value" hint;
-# a 0/undefined value also gets a placeholder position (MAX at far right −1 block,
-# MIN on the leftmost current-library cell). Echoes a multi-line visualization.
+# Echoes the multi-line gauge: a header line of figures, the bar with its two
+# markers, and a legend. focus ∈ {max,min,""} labels one marker with a "set a …
+# value" hint, for a boundary the user has not chosen yet.
 render_library_gauge() {
   local disk_total="${1:-0}" disk_used="${2:-0}" lib_bytes="${3:-0}"
   local max_mb="${4:-0}" min_mb="${5:-0}" focus="${6:-}"
   local W=50
   local max_bytes=$(( max_mb * 1048576 )) min_bytes=$(( min_mb * 1048576 ))
 
-  # Scale to the real disk; fall back to a padded span around the values when the
-  # disk size is unknown (e.g. upload path not local), so the bar still makes sense.
+  # Scaled to the real disk, or to a padded span around the values when the disk
+  # size is unknown.
   local scale="$disk_total"
   if (( scale <= 0 )); then
     scale=$max_bytes
@@ -428,17 +405,16 @@ render_library_gauge() {
   local _c
   _gcol() { _c=$(( $1 * W / scale )); (( _c < 0 )) && _c=0; (( _c > W )) && _c=W; return 0; }
 
-  # Library is proportional but always >=1 block, drawn at the right edge of the
-  # used region (just before free); other-data fills the rest of the used region.
+  # The library is proportional but always at least one block, drawn at the right
+  # edge of the used region; other data fills the rest of that region.
   local lib_blocks used_c
   _gcol "$lib_bytes"; lib_blocks=$_c; (( lib_blocks < 1 )) && lib_blocks=1
   _gcol "$disk_used"; used_c=$_c; (( used_c < lib_blocks )) && used_c=$lib_blocks
   (( used_c > W )) && used_c=$W
   local lib_start=$(( used_c - lib_blocks )) lib_end=$used_c
 
-  # Thresholds are library sizes, measured from the START of the library block
-  # (offset by the other-data already on disk), so each marker tracks its real
-  # value on the disk scale — independent of how few cells the current size spans.
+  # Both thresholds are library sizes, so their columns are measured from the
+  # start of the library block, offset by the other data already on the disk.
   local other_bytes=$(( disk_used - lib_bytes )); (( other_bytes < 0 )) && other_bytes=0
   local min_c max_c
   _gcol $(( other_bytes + max_bytes )); max_c=$_c
@@ -453,9 +429,7 @@ render_library_gauge() {
     g_full='#'; g_other='+'; g_grow='.'; g_free='-'; g_dn='v'; g_up='^'; g_lb='['; g_rb=']'
   fi
 
-  # Bands: other data ▒ | current library █ | headroom up to MAX ░ | free (blank).
-  # The ░ band makes the current size (█) visibly distinct from the archiving
-  # ceiling, and the MAX marker lands at the right edge of that band.
+  # Four bands: other data ▒, current library █, headroom up to MAX ░, then free.
   local grow_end=$max_c
   (( max_mb <= 0 )) && grow_end=$lib_end   # no MAX configured: no headroom band
   (( grow_end < lib_end )) && grow_end=$lib_end
@@ -467,10 +441,10 @@ render_library_gauge() {
     else                           bar+="$g_free"; fi
   done
 
-  # Marker columns. A defined value sits one cell back, over the last filled cell of
-  # its band (the boundary it marks) — cleaner. An undefined value (0) gets a
-  # placeholder: MAX at the far right minus one block, MIN on the leftmost cell of
-  # the current-library block. MAX (▼) rides above the bar, MIN (▲) below it.
+  # Marker columns. A defined value sits one cell back, over the last filled cell
+  # of its band. An undefined one (0) gets a placeholder: MAX at the far right
+  # minus one block, MIN on the leftmost cell of the library block. MAX (▼) rides
+  # above the bar, MIN (▲) below it.
   local max_mk min_mk
   if (( max_mb > 0 )); then max_mk=$(( max_c > 0 ? max_c - 1 : 0 )); else max_mk=$(( W - 2 )); fi
   if (( min_mb > 0 )); then min_mk=$(( min_c > 0 ? min_c - 1 : 0 )); else min_mk=$lib_start; fi
@@ -483,8 +457,7 @@ render_library_gauge() {
   _gauge_place toprow "$max_mk" "$g_dn"
   _gauge_place botrow "$min_mk" "$g_up"
 
-  # Label the marker being set so it's obvious which arrow the user is moving. Skip
-  # the label when it wouldn't fit, to avoid garbled overlap with the bar edges.
+  # The marker named by <focus> carries a label, dropped when it does not fit.
   if [[ "$focus" == "max" ]]; then
     local lbl='set a MAX value ->'
     (( max_mk >= ${#lbl} )) && _gauge_place toprow $(( max_mk - ${#lbl} )) "$lbl"

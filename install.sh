@@ -58,31 +58,20 @@ _check_cmd() {
 }
 _check_cmd git
 
-# True only when /dev/tty can actually be opened. `[[ -r /dev/tty ]]` is not enough:
-# the device node exists and tests readable even in a process with no controlling
-# terminal (`ssh host 'cmd'`, a cron job, a pipeline), where every open() then fails
-# with "No such device or address" — which used to abort the installer right where it
-# hands off to the wizard. Trying the open is the only reliable test.
+# True when /dev/tty can actually be opened — tested by opening it.
 _have_tty() { { : </dev/tty; } 2>/dev/null; }
 
 _git() { git -C "$INSTALL_DIR" "$@"; }
 
-# True when INSTALL_DIR holds no installation yet (absent or empty). Such a dir is
-# safe to `git clone` into; anything else is treated as an existing installation.
+# True when INSTALL_DIR holds no installation yet: absent, or an empty directory.
 _dir_is_empty() {
   [[ ! -e "$INSTALL_DIR" ]] && return 0
   [[ -d "$INSTALL_DIR" && -z "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]]
 }
 
-# Force the working tree to exactly match origin/<BRANCH>, discarding local edits to
-# tracked files. Ignored files (config.conf, logs) are left intact.
-#
-# Those edits used to go without a word. config.conf is git-ignored so it was
-# never at risk, but a patched lib/ or a hand-fixed script was — and the person
-# who made the change is exactly the person who needs to hear about it. In
-# interactive use it asks; under -y / ASSUME_YES it goes ahead and lists what it
-# discarded, because the documented non-interactive path must not start waiting
-# for an answer nobody is there to give.
+# Lists the local edits to tracked files that the update is about to discard, and
+# asks whether to go on. Under -y / ASSUME_YES, or with no terminal, it lists them
+# and continues. Ignored files (config.conf, logs) are never concerned.
 _warn_local_changes() {
   local dirty
   dirty=$(_git status --porcelain --untracked-files=no 2>/dev/null || true)
@@ -113,15 +102,13 @@ _sync_to_branch() {
   _warn_local_changes
   _git checkout -f -B "$BRANCH" "origin/${BRANCH}"
   _git reset --hard "origin/${BRANCH}"
-  # Ignore executable-bit changes so the chmod below never dirties the tree and
-  # blocks future updates.
+  # Executable-bit changes are ignored from here on.
   _git config core.fileMode false || true
   printf 'Updated to %s (%s).\n' "$BRANCH" "$(_git rev-parse --short HEAD)"
 }
 
-# Adopt an existing, non-git INSTALL_DIR into git: init a repo in place, point it at
-# origin, then sync. Existing tracked files are overwritten by origin/main; ignored
-# files (config.conf) are untouched.
+# Adopts an existing, non-git INSTALL_DIR into git: a repo initialised in place,
+# with origin pointed at REPO. The caller syncs it afterwards.
 _adopt_into_git() {
   printf 'Existing files are not a git checkout — adopting them into git...\n'
   _git init -q
@@ -181,13 +168,8 @@ fi
 
 chmod +x "$INSTALL_DIR/immich-auto-dumper.sh"
 
-# Configuration. The wizard creates config.conf and owns the ~/.local/bin symlink.
-# When a config already exists, setup opens on a review screen instead of the
-# step-by-step: it validates the saved config against this version of the tool and
-# the live Immich, shows it back, reports the cron status, and only then offers to
-# reconfigure. So it is always worth launching interactively — there is no blind
-# "re-run the wizard?" question here any more. --yes and a missing terminal still
-# skip it, since neither can answer the review.
+# Hands off to the wizard, which creates config.conf and owns the ~/.local/bin
+# symlink. Skipped under --yes and when there is no terminal to answer it.
 if [[ "$ASSUME_YES" != "1" ]] && _have_tty; then
   if [[ -f "$INSTALL_DIR/config.conf" ]]; then
     printf '\nChecking your configuration...\n\n'
