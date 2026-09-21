@@ -39,7 +39,8 @@ just live somewhere cheaper.
 > 7 days old is present. After upgrading Immich, run `immich-auto-dumper test_run`
 > (which changes nothing) before letting it run again.
 
-Curious how it works under the hood? Read the [technical documentation](docs/TECHNICAL.md).
+Step-by-step instructions live in the [user guide](docs/GUIDE.md). Curious how it works
+under the hood? Read the [technical documentation](docs/TECHNICAL.md).
 
 ---
 
@@ -65,7 +66,8 @@ Curious how it works under the hood? Read the [technical documentation](docs/TEC
 - External storage **mounted on the host and into the Immich server container**, and
   registered in Immich as an **external library** — the setup wizard walks you through
   every step of this.
-- Standard tools: `docker`, `bc`, `df`, `du` (all preinstalled on most systems).
+- Standard tools: `docker`, `bc`, `sha256sum`, `df`, `du` (all preinstalled on most
+  systems).
 
 ### Step 1 — Install
 
@@ -113,7 +115,8 @@ Immich library now: 142.3 GB (31%)  ·  disk used: 256 GB (56%)  ·  disk total:
 ```
 
 Sizes accept GB (`200`, `1.5G`), MB (`500M`) or percentages (`80%`). Everything is
-saved to `config.conf` — re-run `setup` any time to change it.
+saved to `config.conf`, which is read as plain data and never executed — re-run `setup`
+any time to change it, or [edit it by hand](docs/guide/configuration.md#editing-configconf-by-hand).
 
 **Re-running `setup` later never makes you redo everything.** With a config already in
 place it opens on a review instead of the questionnaire: it shows your saved settings,
@@ -161,15 +164,17 @@ immich-auto-dumper <command> [--dry-run] [--force]
 | Command | What it does |
 |---|---|
 | `setup` | Configuration wizard (safe to re-run any time). |
-| `status` | Library size, storage readiness, backups, cron state, last runs. |
+| `status` | Library size, storage readiness, backups, cron state, last runs, unfinished work. |
 | `start` / `stop` | Enable / disable the scheduled runs. |
 | `dump_now` | Archive now **if** the library exceeds `MAX` or free disk drops below `FREE`. |
 | `dump_now --force` | Archive now regardless of `MAX`, down to `TARGET`. |
 | `sync_now` | Mirror the DB backups to external storage now. |
 | `test_run` | Full simulation — shows what would happen, changes nothing. |
+| `rollback <run-id>` | Undo one archive run: bring its files back into the library. |
 | `uninstall` | Remove the tool (your photos, Immich and the storage are untouched). |
 
 `--dry-run` can be added to `dump_now`/`sync_now` to preview a single operation.
+Full reference: [commands](docs/GUIDE.md#commands).
 
 ## Good to know
 
@@ -180,7 +185,10 @@ immich-auto-dumper <command> [--dry-run] [--force]
 - **After an Immich upgrade**, run `immich-auto-dumper test_run` once: if the new
   version changed its database layout, the tool refuses to run and tells you, rather
   than guessing.
+- **Changed your mind?** `immich-auto-dumper rollback <run-id>` brings one run's files back
+  into the library. It's explicit, never automatic, and safe to re-run.
 - **Logs** live in `~/.local/state/immich-auto-dumper/`.
+- **Something looks wrong?** See [troubleshooting](docs/guide/troubleshooting.md).
 
 ## Updating
 
