@@ -36,6 +36,16 @@ archive_build_dest_path() {
 # read by the candidate loop. Declared here so both see the same array.
 declare -A ARCHIVE_IN_FLIGHT=()
 
+# Bytes the last move actually took off the library disk. It is an OUTPUT of
+# _archive_move_file, not of its callee, and the candidate loop sums it after
+# every asset. Only _archive_process_asset used to set it, and a dry run never
+# reaches that function — so the first simulation with real work to do died on
+# `ARCHIVE_LAST_FREED_BYTES: unbound variable`, since an unbound name inside
+# $(( )) kills the shell under `set -u` whatever the caller wraps it in. Seeded
+# here so no path can leave it unset, and reset at each entry point below so a
+# failed move can never report the previous asset's figure.
+ARCHIVE_LAST_FREED_BYTES=0
+
 # ── Per-asset pipeline, journalled and resumable ──────────────────────────────
 
 # Where Immich currently says the asset is, answered against what the journal
@@ -284,6 +294,11 @@ _archive_move_file() {
   local src_host_path="$2"
   local update_fn="$3"
   local dry_run="${4:-false}"
+
+  # Reset at the entry point, not only in the journalled pipeline below: every
+  # early return in this function (dry run, unrecordable path, unreadable source)
+  # ends the call without ever reaching it.
+  ARCHIVE_LAST_FREED_BYTES=0
 
   local dst_host
   dst_host=$(archive_build_dest_path "$src_host_path")
@@ -686,23 +701,18 @@ archive_run() {
     return 0
   fi
 
-  # Phase one of every real run: finish what earlier runs started. It comes BEFORE
-  # the thresholds are even looked at, because a half-archived asset is a liability
-  # whether or not the library is over its limit today. It is deliberately not a
-  # reason to refuse a fresh archive either: the moment the disk fills up is exactly
-  # when the tool has to keep working.
-  if "$dry_run"; then
-    local pending blocked divergent unreadable nfiles oldest
-    read -r pending blocked divergent unreadable nfiles oldest < <(runlog_summary)
-    if (( nfiles > 0 )); then
-      log_info "DRY-RUN: $nfiles earlier run(s) left work behind ($pending to resume, $blocked blocked, $divergent divergent, $unreadable unreadable); a real run would resume them first."
-    fi
-  else
-    archive_reconcile
-    # Rotated here too: most nightly runs end a few lines below with "nothing to
-    # archive", and would otherwise never get round to it.
-    runlog_rotate
-  fi
+  # ── Decide first, act afterwards ────────────────────────────────────────────
+  #
+  # Measuring the library and reading the thresholds writes nothing, so the whole
+  # decision is taken before anything irreversible can happen. That split is what
+  # lets ONE gate stand in front of every act that touches a photo or a database
+  # row — reconciliation included.
+  #
+  # Reconciliation used to run here, above the recent-dump check. It drives the
+  # very same pipeline as a fresh archive (copy, UPDATE originalPath, adopt into
+  # the external library, delete the source), yet it was exempt from the safety
+  # net that check exists to be: on the cron path, an asset left its internal
+  # library for good and the run then announced "nothing to archive" and exited 0.
 
   # Drive archiving by the library's actual size (du of library/), compared against
   # absolute boundaries. This is independent of any unrelated data sharing the same
@@ -738,13 +748,17 @@ archive_run() {
     return 1
   fi
 
+  # Whether this run has candidates to archive, and — when it has none — the line
+  # that says why. The verdict is worked out here and acted on further down, so
+  # the gate below sees it before a single file has moved.
+  local will_archive=false idle_reason=""
   if "$force"; then
     # Manual forced dump: bypass the MAX trigger but still respect the target floor.
     log_info "Forced archive: ignoring MAX threshold, archiving down to target $(bytes_to_human "$target_bytes")."
     if (( lib_bytes <= target_bytes )); then
-      log_info "Library already at or below target — nothing to archive."
-      release_lock
-      return 0
+      idle_reason="Library already at or below target — nothing to archive."
+    else
+      will_archive=true
     fi
   else
     if (( max_bytes <= 0 )); then
@@ -753,25 +767,74 @@ archive_run() {
       return 1
     fi
     if (( lib_bytes <= max_bytes )) && ! "$low_free_disk"; then
-      log_info "Library within limit (max $(bytes_to_human "$max_bytes")) and free disk above floor — nothing to archive."
-      release_lock
-      return 0
-    fi
-    if (( lib_bytes > max_bytes )); then
-      log_info "Archive triggered: library exceeds max $(bytes_to_human "$max_bytes")."
+      idle_reason="Library within limit (max $(bytes_to_human "$max_bytes")) and free disk above floor — nothing to archive."
     else
-      log_info "Archive triggered: free disk ($(bytes_to_human "$disk_free_bytes_now")) below safety floor ($(bytes_to_human "$min_free_bytes")), even though the library is within its max."
+      will_archive=true
+      if (( lib_bytes > max_bytes )); then
+        log_info "Archive triggered: library exceeds max $(bytes_to_human "$max_bytes")."
+      else
+        log_info "Archive triggered: free disk ($(bytes_to_human "$disk_free_bytes_now")) below safety floor ($(bytes_to_human "$min_free_bytes")), even though the library is within its max."
+      fi
     fi
   fi
 
-  # Safety: never modify the database unless a recent (<7 days) Immich DB backup
-  # exists. Archiving rewrites "originalPath" rows, so a fresh dump is the safety net.
-  # Skipped in dry-run: it writes nothing, and test_run must still preview candidates.
-  if ! "$dry_run" && ! _recent_usable_dump; then
-    log_error "No recent, usable DB backup (<7 days) in $IMMICH_UPLOAD_LOCATION/backups — archive aborted."
-    log_error "Immich writes its dumps there; check its backup job before archiving again."
+  # Work left behind by an earlier run counts as work: resuming it moves files and
+  # rewrites rows exactly as archiving does.
+  local has_unfinished=false
+  [[ -n "$(runlog_unfinished_files)" ]] && has_unfinished=true
+
+  # ── The gate ────────────────────────────────────────────────────────────────
+  #
+  # Archiving rewrites "originalPath" rows, so a recent (<7 days) Immich dump is
+  # what makes those rewrites recoverable. Asked ONCE, here, in front of both the
+  # fresh archive and the resumption of an earlier one.
+  #
+  # It only fires when there is something to do. Without that condition an install
+  # whose Immich backup job is broken would log an ERROR and exit 1 every night it
+  # had nothing to archive — noise in a log that has to stay readable, and noise
+  # ends up hiding the signal.
+  #
+  # Refusing to resume is safe: every state an entry can be parked in is a safe
+  # one. At `copie` the file is at the destination and the database still points
+  # at the source; at `base_a_jour` the database points at the copy and the source
+  # is still on disk. Nothing is lost by waiting for a dump.
+  #
+  # A dry run is exempt, as before: it writes nothing, and test_run must keep
+  # previewing candidates.
+  if "$will_archive" || "$has_unfinished"; then
+    if ! "$dry_run" && ! _recent_usable_dump; then
+      log_error "No recent, usable DB backup (<7 days) in $IMMICH_UPLOAD_LOCATION/backups — nothing was archived and no unfinished run was resumed."
+      log_error "Immich writes its dumps there; check its backup job before archiving again."
+      release_lock
+      return 1
+    fi
+  fi
+
+  # Deliberately outside the gate: deleting old `.done` journals is the documented
+  # retention of finished runs, it touches no photo and no row, and a run refused
+  # for want of a dump must not stop doing its housekeeping. Still skipped in a
+  # dry run, which writes nothing at all.
+  "$dry_run" || runlog_rotate
+
+  # Phase one of every real run: finish what earlier runs started. It comes before
+  # the thresholds are acted on, because a half-archived asset is a liability
+  # whether or not the library is over its limit today. It is deliberately not a
+  # reason to refuse a fresh archive either: the moment the disk fills up is exactly
+  # when the tool has to keep working.
+  if "$dry_run"; then
+    local pending blocked divergent unreadable nfiles oldest
+    read -r pending blocked divergent unreadable nfiles oldest < <(runlog_summary)
+    if (( nfiles > 0 )); then
+      log_info "DRY-RUN: $nfiles earlier run(s) left work behind ($pending to resume, $blocked blocked, $divergent divergent, $unreadable unreadable); a real run would resume them first."
+    fi
+  else
+    archive_reconcile
+  fi
+
+  if ! "$will_archive"; then
+    log_info "$idle_reason"
     release_lock
-    return 1
+    return 0
   fi
 
   local bytes_to_free=$(( lib_bytes - target_bytes ))
