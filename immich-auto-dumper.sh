@@ -1408,8 +1408,21 @@ _status() {
 
 # ── start ─────────────────────────────────────────────────────────────────────
 
-# Installs the schedule: re-enables the entries a previous `stop` commented out,
-# then appends any that are still missing.
+# Installs the schedule, replacing whatever this tool had put in the crontab
+# before: its own entries are taken out, live or commented out by a previous
+# `stop`, and the freshly rendered ones are put back.
+#
+# Replacing and not topping up. The old version only ever appended a line it
+# could not find, comparing the rendered text verbatim; after a move or a change
+# of LOG_DIR neither rendered line matched, both were appended, and the entries
+# of the previous path stayed live alongside them. The schedule then fired every
+# job twice, one of the two still writing to the old log directory, and nothing
+# but `cron_entries` showed it. "Re-install the entries" in _cron_review is
+# exactly the action that walked into this.
+#
+# An entry counts as this tool's when its payload begins like a cron schedule,
+# the same discriminator disable_cron uses, so a line the user wrote themselves
+# that merely mentions the tool is never taken out.
 _start() {
   local rendered logdir
   if ! rendered=$(_render_cron_lines) || [[ -z "$rendered" ]]; then
@@ -1419,29 +1432,36 @@ _start() {
   logdir="${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/immich-auto-dumper}"
   mkdir -p "$logdir" 2>/dev/null || true
 
-  # The un-comment step, symmetric to disable_cron: without it, a commented line
-  # would match the substring check below and `start` after `stop` would do
-  # nothing. Only a line whose payload looks like a cron schedule is touched, so
-  # a user's own comment naming the tool is never turned into a crontab line.
-  local current
-  current=$(crontab -l 2>/dev/null | sed 's|^#\([0-9*@].*immich-auto-dumper.*\)|\1|' || true)
+  local current ours kept
+  current=$(crontab -l 2>/dev/null || true)
+  ours=$(printf '%s\n' "$current" | grep -E '^#?[0-9*@].*immich-auto-dumper' || true)
+  kept=$(printf '%s\n' "$current" | grep -vE '^#?[0-9*@].*immich-auto-dumper' || true)
 
-  local new_entries="" line
+  # What the rewrite actually changes, counted before it happens, so the closing
+  # line says which of the three things just took place.
+  local previous added=0 removed=0 line
+  previous=$(printf '%s\n' "$ours" | sed 's|^#||' || true)
   while IFS= read -r line; do
-    [[ "$line" =~ ^# || -z "$line" ]] && continue
-    if ! printf '%s\n' "$current" | grep -qF -- "$line"; then
-      new_entries+="$line"$'\n'
-    fi
+    [[ -n "$line" ]] || continue
+    printf '%s\n' "$previous" | grep -qF -- "$line" || added=$(( added + 1 ))
   done <<< "$rendered"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    printf '%s\n' "$rendered" | grep -qF -- "$line" || removed=$(( removed + 1 ))
+  done <<< "$previous"
 
-  if [[ -z "$new_entries" ]]; then
-    printf '%s\n' "$current" | crontab -
+  local out=""
+  if [[ -n "$kept" ]]; then out="$kept"$'\n'; fi
+  out+="$rendered"$'\n'
+  printf '%s' "$out" | crontab -
+
+  if (( removed > 0 )); then
+    printf 'Cron jobs installed (%d superseded entry(ies) removed).\n' "$removed"
+  elif (( added > 0 )); then
+    echo "Cron jobs installed."
+  else
     echo "Cron jobs enabled."
-    return 0
   fi
-
-  printf '%s\n%s' "$current" "$new_entries" | crontab -
-  echo "Cron jobs installed."
 }
 
 # ── stop ──────────────────────────────────────────────────────────────────────
