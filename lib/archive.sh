@@ -484,7 +484,16 @@ archive_reconcile() {
       _archive_process_asset "$asset" "$src" "$dst" "$src_db" "$dst_db" \
                              "$sha" "$size" "$etat" "$attempts" db_update_asset_path || rc=$?
       case $rc in
-        0) resumed=$(( resumed + 1 )) ;;
+        0) # The sidecars go where their asset went. archive_run does this for a
+           # fresh candidate; without it here, an asset finished by a resume ends
+           # up external while its .xmp and .json stay in the library, and nothing
+           # looks at them again — the entry is no longer pending, and the asset
+           # is no longer a candidate. Safe after the source was removed: the
+           # candidates are derived from the path, and only the sidecars
+           # themselves are tested for existence. Never a dry run: reconciliation
+           # is not reached at all when one is asked for.
+           _archive_move_sidecar "$src" false || true
+           resumed=$(( resumed + 1 )) ;;
         1) skipped=$(( skipped + 1 )) ;;
         *) stuck=$((   stuck   + 1 )) ;;
       esac
