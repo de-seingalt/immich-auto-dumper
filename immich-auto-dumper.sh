@@ -1400,7 +1400,7 @@ _start() {
   local current
   current=$(crontab -l 2>/dev/null | sed 's|^#\([0-9*@].*immich-auto-dumper.*\)|\1|' || true)
 
-  local new_entries=""
+  local new_entries="" line
   while IFS= read -r line; do
     [[ "$line" =~ ^# || -z "$line" ]] && continue
     if ! printf '%s\n' "$current" | grep -qF -- "$line"; then
