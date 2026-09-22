@@ -321,6 +321,35 @@ runlog_rotate() {
   done
 }
 
+# Echoes the direction a journal records: "archive" for a run that moved files
+# out to the external storage, "rollback" for one that brought them back.
+#
+# Read from the first record that names it rather than from the file name, which
+# an operator can rename, and falling back to the name only for a journal that
+# holds no readable record at all. An empty answer means neither could be
+# established, which a caller standing in front of a destructive step must treat
+# as a refusal and not as an "archive".
+runlog_sens() {
+  local file="$1" line sens=""
+  [[ -f "$file" ]] || return 0
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    sens=$(_runlog_field "$line" sens) || sens=""
+    if [[ -n "$sens" ]]; then
+      printf '%s' "$sens"
+      return 0
+    fi
+  done < "$file"
+  # No record names it — an .active journal opened and never written to. The id
+  # is then the only evidence there is.
+  local base; base=$(basename "$file")
+  case "$base" in
+    rollback-*) printf 'rollback' ;;
+    run-*)      printf 'archive'  ;;
+  esac
+  return 0
+}
+
 # Resolves a run id given by the operator to its file, whatever its state.
 # Echoes the path, or nothing and 1 when there is no single match.
 runlog_resolve() {

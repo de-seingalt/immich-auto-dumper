@@ -605,6 +605,23 @@ archive_rollback() {
     return 1
   fi
 
+  # A rollback undoes an ARCHIVE, and only an archive. runlog_resolve answers for
+  # any journal in runs/, a rollback's own included, and a rollback journal
+  # records its entries with src and dst swapped — so replaying one would pass
+  # every check below and then copy the library file back out to the external
+  # path and try to delete the original. Refused on the direction the journal
+  # itself carries, and refused too when that direction cannot be established.
+  local sens; sens=$(runlog_sens "$file")
+  if [[ "$sens" != "archive" ]]; then
+    if [[ "$sens" == "rollback" ]]; then
+      log_error "'$run_id' is the journal of a rollback, not of an archive — there is nothing to undo in it."
+      log_error "To undo a rollback, archive again: immich-auto-dumper dump_now"
+    else
+      log_error "Cannot tell what '$run_id' records — rollback refused."
+    fi
+    return 1
+  fi
+
   check_prereqs
 
   local dest_state=0
