@@ -1535,7 +1535,10 @@ main() {
         _usage >&2
         exit 1
       fi
-      archive_rollback "${dry_flag[@]}" "${args[1]:-}"
+      # Everything after the command is handed over, not just the first word: a
+      # second run id must reach the refusal in archive_rollback rather than be
+      # dropped here, which is the same mistake as dropping the flag.
+      archive_rollback "${dry_flag[@]}" "${args[@]:1}"
       ;;
     uninstall)
       # Handed to the standalone uninstaller, which relocates itself before
