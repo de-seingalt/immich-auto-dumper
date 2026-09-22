@@ -283,6 +283,24 @@ _cfg_target_mb() {
 # _CFG_ESSENTIAL_KEYS, in lib/config.sh, next to the loader that enforces them.
 _CFG_BACKFILL_KEYS=(ARCHIVE_MIN_FREE_MB BACKUP_RETENTION LOG_DIR LOG_MAX_LINES)
 
+# Essential settings that are allowed to carry no value. ARCHIVE_STORAGE_ID is
+# the only one: empty, it accepts whatever marker the storage carries instead of
+# pinning the destination to one volume. The loader says so explicitly
+# (lib/config.sh), and config.conf.example ships it empty with "Leave empty;
+# setup fills it in" written next to it — so reporting it as a blocking problem
+# sent anyone who followed that instruction to a review screen accusing their
+# own example file.
+_CFG_EMPTY_OK_KEYS=(ARCHIVE_STORAGE_ID)
+
+# True when <key> may legitimately hold no value.
+_cfg_empty_ok() {
+  local k
+  for k in "${_CFG_EMPTY_OK_KEYS[@]}"; do
+    [[ "$k" == "$1" ]] && return 0
+  done
+  return 1
+}
+
 # Filled by _config_check: blocking findings, settings absent since an older
 # version, and remarks that need no action. CFG_USER_NAME holds the Immich user
 # names, so the summary can label USER_MAP keys that are often opaque UUIDs.
@@ -319,7 +337,7 @@ _config_check() {
   for k in "${_CFG_ESSENTIAL_KEYS[@]}"; do
     if ! _config_has_key "$k"; then
       CFG_PROBLEMS+=("$k is missing from config.conf.")
-    elif [[ -z "${!k:-}" ]]; then
+    elif [[ -z "${!k:-}" ]] && ! _cfg_empty_ok "$k"; then
       CFG_PROBLEMS+=("$k is empty.")
     fi
   done
