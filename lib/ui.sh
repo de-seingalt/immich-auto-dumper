@@ -130,9 +130,14 @@ ui_note() {
 
 # Box geometry for a whiptail dialog. _wt_geometry sets _UI_HEIGHT, the height
 # that fits <body> plus <extra> rows of borders, buttons and input field, and
-# _UI_CLIPPED, 1 when the terminal height capped it and the caller should make
-# the box scrollable. _wt_height is the echoing wrapper for callers that only
-# need the height.
+# _UI_CLIPPED, 1 when the terminal height capped it and the caller must make the
+# box scrollable.
+#
+# Every caller calls it directly, and none wraps it in a command substitution:
+# `h=$(_wt_height …)` used to run it in a subshell, where it set _UI_CLIPPED on a
+# copy of the variable that died with the subshell. The flag was always 0 on the
+# way back, so three of the four dialogs clipped their body in silence. There is
+# no echoing wrapper left to reintroduce that.
 _UI_HEIGHT=8
 _UI_CLIPPED=0
 
@@ -156,9 +161,19 @@ _ui_term_lines() {
 _UI_ROWS=1
 _wt_rows() {
   local text="$1" width="$2"
+  (( width < 1 )) && width=1
+  # `read -ra` drops the leading blanks and collapses every run of them, so a
+  # line that aligns a column with spaces — which nearly every body here does —
+  # comes out of the packing loop far shorter than whiptail draws it. The
+  # literal line already needs this many rows, blanks included, and the packed
+  # count is only allowed to raise that number, never to lower it.
+  local raw=$(( (${#text} + width - 1) / width ))
   local -a words=()
   read -ra words <<< "$text"
-  if (( ${#words[@]} == 0 )); then _UI_ROWS=1; return 0; fi
+  if (( ${#words[@]} == 0 )); then
+    _UI_ROWS=$(( raw > 1 ? raw : 1 ))
+    return 0
+  fi
   local rows=0 col=0 word len
   for word in "${words[@]}"; do
     len=${#word}
@@ -171,6 +186,7 @@ _wt_rows() {
     col=$(( len % width ))
     (( col == 0 )) && col=$width
   done
+  (( rows < raw )) && rows=$raw
   (( rows < 1 )) && rows=1
   _UI_ROWS=$rows
 }
@@ -208,18 +224,15 @@ _wt_geometry() {
   (( h < 8 )) && h=8
   _UI_HEIGHT="$h"
 }
-_wt_height() {
-  _wt_geometry "$1" "${2:-7}"
-  printf '%s' "$_UI_HEIGHT"
-}
-
 # ui_input <title> <body> <default>  — free-text entry with a pre-filled default.
 # Sets UI_VALUE; returns 1 if the user cancelled.
 ui_input() {
   local title="$1" body="$2" default="${3:-}"
   if [[ "$UI_BACKEND" == "whiptail" ]]; then
-    local out rc=0 h; h=$(_wt_height "$body" 8)
-    out=$(whiptail --title "$title" --inputbox "$body" "$h" "$_UI_W" "$default" 3>&1 1>&2 2>&3) || rc=$?
+    local out rc=0 flags=()
+    _wt_geometry "$body" 8
+    (( _UI_CLIPPED )) && flags+=(--scrolltext)
+    out=$(whiptail --title "$title" "${flags[@]}" --inputbox "$body" "$_UI_HEIGHT" "$_UI_W" "$default" 3>&1 1>&2 2>&3) || rc=$?
     (( rc == 0 )) || return 1
     UI_VALUE="$out"
   else
@@ -241,11 +254,13 @@ ui_input() {
 ui_yesno() {
   local title="$1" body="$2" default="${3:-yes}" yes_label="${4:-}" no_label="${5:-}"
   if [[ "$UI_BACKEND" == "whiptail" ]]; then
-    local flags=() h; h=$(_wt_height "$body" 6)
+    local flags=()
+    _wt_geometry "$body" 6
+    (( _UI_CLIPPED )) && flags+=(--scrolltext)
     [[ "$default" == "no" ]] && flags+=(--defaultno)
     [[ -n "$yes_label" ]] && flags+=(--yes-button "$yes_label")
     [[ -n "$no_label"  ]] && flags+=(--no-button "$no_label")
-    whiptail --title "$title" "${flags[@]}" --yesno "$body" "$h" "$_UI_W"
+    whiptail --title "$title" "${flags[@]}" --yesno "$body" "$_UI_HEIGHT" "$_UI_W"
     return $?
   else
     printf '%b\n' "${C_CYAN}${body}${C_RESET}"
@@ -267,9 +282,10 @@ ui_yesno() {
 ui_menu() {
   local title="$1" body="$2"; shift 2
   if [[ "$UI_BACKEND" == "whiptail" ]]; then
-    local n=$(( $# / 2 )) out rc=0 h
-    h=$(_wt_height "$body" $(( n + 7 )))
-    out=$(whiptail --title "$title" --menu "$body" "$h" "$_UI_W" "$n" "$@" 3>&1 1>&2 2>&3) || rc=$?
+    local n=$(( $# / 2 )) out rc=0 flags=()
+    _wt_geometry "$body" $(( n + 7 ))
+    (( _UI_CLIPPED )) && flags+=(--scrolltext)
+    out=$(whiptail --title "$title" "${flags[@]}" --menu "$body" "$_UI_HEIGHT" "$_UI_W" "$n" "$@" 3>&1 1>&2 2>&3) || rc=$?
     (( rc == 0 )) || return 1
     UI_VALUE="$out"
   else
