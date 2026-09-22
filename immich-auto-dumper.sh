@@ -90,7 +90,15 @@ _ensure_symlink() {
   local target link current
   target="$(readlink -f "$SCRIPT_DIR/immich-auto-dumper.sh")"
   link="$HOME/.local/bin/immich-auto-dumper"
-  mkdir -p "$HOME/.local/bin"
+  # Bare, this took the whole wizard down under `set -e` before anything was
+  # saved. The link is a convenience — the tool runs perfectly well when called
+  # by its path — so a home that cannot be written to is said out loud and the
+  # rest of setup carries on.
+  if ! mkdir -p "$HOME/.local/bin" 2>/dev/null; then
+    printf '\033[31mWARNING: cannot create %s/.local/bin — no symlink was made.\033[0m\n' "$HOME"
+    printf '\033[31mThe tool still runs from: %s\033[0m\n' "$target"
+    return 0
+  fi
 
   current=""
   [[ -e "$link" || -L "$link" ]] && current="$(readlink -f "$link" 2>/dev/null || true)"

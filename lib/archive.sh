@@ -789,7 +789,15 @@ _archive_move_sidecar() {
       log_warn "Cannot read sidecar to fingerprint it, source kept: $sidecar"
       continue
     fi
-    mkdir -p "$(dirname "$dst_sidecar")"
+    # Guarded like the asset's own mkdir: bare, a destination that has gone
+    # read-only or vanished between the two copies would abort the whole run
+    # here under `set -e`, in the middle of an archive, leaving the journal
+    # .active with no closing summary. Every other filesystem failure on this
+    # path keeps the source and moves on, and so does this one.
+    if ! mkdir -p "$(dirname "$dst_sidecar")" 2>/dev/null; then
+      log_warn "Cannot create the destination folder for the sidecar, source kept: $dst_sidecar"
+      continue
+    fi
     if ! _transfer_and_verify host "$sidecar" "$dst_sidecar" "$sc_sha"; then
       log_warn "Sidecar not archived, source kept: $sidecar"
       continue

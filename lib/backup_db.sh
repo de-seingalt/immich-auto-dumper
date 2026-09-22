@@ -87,7 +87,14 @@ backup_db_run() {
     return 0
   fi
 
-  mkdir -p "$dest_dir"
+  # Bare, this aborted the whole command under `set -e` while holding the lock,
+  # with nothing said about why. There is no copy to make without the directory,
+  # so it is a clean refusal rather than a warning.
+  if ! mkdir -p "$dest_dir" 2>/dev/null; then
+    log_error "Cannot create the destination folder for the database dumps: $dest_dir"
+    release_lock
+    return 1
+  fi
 
   # A destination of the same size counts as the same dump, already mirrored, and
   # is left alone. A size comparison and not a fingerprint: nothing is deleted on
