@@ -5,6 +5,7 @@ Bringing archived photos back into Immich's internal library. Back to the
 
 ```bash
 immich-auto-dumper rollback <run-id>
+immich-auto-dumper rollback <run-id> --dry-run
 ```
 
 ## What it undoes
@@ -42,6 +43,24 @@ immich-auto-dumper rollback run-20260920T020000
 ```
 
 The newest 30 completed runs are kept, so a run from months ago may no longer be there.
+
+## Looking first
+
+`--dry-run` walks the same run and asks the same three questions of every asset: does
+Immich still point where this run left it, is the archived copy still readable, and is it
+still the file that was written. Those are reads, so the preview stops at the first write
+and tells you what the real rollback would accept and what it would refuse.
+
+```
+DRY-RUN: nothing will be restored, removed, or written to the DB.
+DRY-RUN: would restore asset 3f2a… → /srv/immich/library/admin/2024/IMG_0042.jpg
+DRY-RUN: Asset 9c1e… is not where this run left it (Immich says: source) — would be refused, nothing touched.
+DRY-RUN: would bring back 11 asset(s) of run-20260920T020000.done, 1 refused. Nothing was moved.
+```
+
+It writes nothing at all: no journal of its own, no mark in the run being previewed, no
+file moved. The storage still has to be reachable, since reading the archived copies is
+most of what the preview does.
 
 ## What you need
 

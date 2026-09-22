@@ -551,15 +551,39 @@ _sidecar_candidates() {
     | awk '!seen[$0]++'
 }
 
-# immich-auto-dumper rollback <run-id> — undoes one identified archive run, and
-# is never automatic.
+# immich-auto-dumper rollback <run-id> [--dry-run] — undoes one identified
+# archive run, and is never automatic.
 #
 # Every entry that completed is walked backwards: copy in, verify, point the
 # database at the source, remove the external copy. Under the same guards as
 # archiving, and any asset whose current state does not match what the journal
 # says is refused and reported. Returns non-zero when anything was refused.
+#
+# --dry-run walks the same entries and runs the same three checks, which are all
+# reads, and stops at the first write. So the preview answers the question that
+# matters before an irreversible command: not what this run archived, but
+# whether undoing it would be accepted today.
 archive_rollback() {
-  local run_id="${1:-}"
+  local dry_run=false run_id="" arg
+  for arg in "$@"; do
+    case "$arg" in
+      --dry-run) dry_run=true ;;
+      # As in archive_run: an unrecognised flag ends the command rather than
+      # being dropped, which is exactly how --dry-run used to be lost here.
+      -*)
+        log_error "Unknown argument for the rollback: '$arg' — nothing was done."
+        return 1
+        ;;
+      *)
+        if [[ -n "$run_id" ]]; then
+          log_error "Only one run can be rolled back at a time ('$run_id' then '$arg') — nothing was done."
+          return 1
+        fi
+        run_id="$arg"
+        ;;
+    esac
+  done
+
   if [[ -z "$run_id" ]]; then
     log_error "Which run? Usage: immich-auto-dumper rollback <run-id>"
     log_error "Run ids are listed by: immich-auto-dumper status"
@@ -585,11 +609,19 @@ archive_rollback() {
     return 1
   fi
 
+  "$dry_run" && log_info "DRY-RUN: nothing will be restored, removed, or written to the DB."
   log_info "Rolling back $(basename "$file")."
   # The rollback keeps a journal of its own, leaving the original run's file as
-  # the record of what that run did.
+  # the record of what that run did. A dry run opens none: it has nothing to
+  # record, and an empty rollback journal would show up in status as a rollback
+  # that happened.
   RUNLOG_DIRECTION="rollback"
-  runlog_open "rollback" || true
+  "$dry_run" || runlog_open "rollback" || true
+
+  # What a refusal is called depends on whether it already happened. A preview
+  # that said "refused, nothing touched" would read as a rollback that ran.
+  local tag="" verb="refused"
+  if "$dry_run"; then tag="DRY-RUN: "; verb="would be refused"; fi
 
   local asset etat attempts size sha src src_db dst dst_db
   local undone=0 refused=0 already=0
@@ -614,19 +646,28 @@ archive_rollback() {
     local position
     position=$(_archive_db_position "$asset" "$src_db" "$dst_db")
     if [[ "$position" != "destination" ]]; then
-      log_error "Asset $asset is not where this run left it (Immich says: $position) — refused, nothing touched."
+      log_error "${tag}Asset $asset is not where this run left it (Immich says: $position) — $verb, nothing touched."
       refused=$(( refused + 1 ))
       continue
     fi
 
     local current=""
     if ! current=$(file_fingerprint "$dst"); then
-      log_error "Cannot read the archived copy of asset $asset: $dst — refused."
+      log_error "${tag}Cannot read the archived copy of asset $asset: $dst — $verb."
       refused=$(( refused + 1 )); continue
     fi
     if [[ "$current" != "$sha" ]]; then
-      log_error "The archived copy of asset $asset has changed since it was written: $dst — refused."
+      log_error "${tag}The archived copy of asset $asset has changed since it was written: $dst — $verb."
       refused=$(( refused + 1 ))
+      continue
+    fi
+
+    # Everything above this line reads; everything below it writes. So the
+    # preview stops exactly here, having already run the three checks that
+    # decide whether the real rollback would accept this asset.
+    if "$dry_run"; then
+      log_info "DRY-RUN: would restore asset $asset → $src"
+      undone=$(( undone + 1 ))
       continue
     fi
 
@@ -652,14 +693,22 @@ archive_rollback() {
     undone=$(( undone + 1 ))
   done < <(runlog_read "$file")
 
-  runlog_close
-  runlog_rotate
+  if ! "$dry_run"; then
+    runlog_close
+    runlog_rotate
+  fi
   release_lock
   RUNLOG_DIRECTION="archive"
 
   local already_note=""
   (( already > 0 )) && already_note=", $already already undone by an earlier rollback"
-  log_info "Rollback of $(basename "$file"): $undone asset(s) brought back, $refused refused${already_note}."
+  # Worded apart from the real summary, which reads as history: a simulation must
+  # never leave a line in the log that says work was done.
+  if "$dry_run"; then
+    log_info "DRY-RUN: would bring back $undone asset(s) of $(basename "$file"), $refused refused${already_note}. Nothing was moved."
+  else
+    log_info "Rollback of $(basename "$file"): $undone asset(s) brought back, $refused refused${already_note}."
+  fi
   (( refused == 0 ))
 }
 

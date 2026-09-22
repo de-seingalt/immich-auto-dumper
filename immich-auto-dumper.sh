@@ -47,11 +47,13 @@ Commands:
   rollback   Undo one archive run: bring its files back into the Immich library and
              point the database at them again. Takes a run id, as listed by status.
              Never happens on its own — it is a decision, on one identified run.
+             Add --dry-run to see what would come back, and what would be refused,
+             without restoring anything.
   uninstall  Remove the tool's local footprint (keeps Immich and external storage intact)
 
 Flags:
   --dry-run  Suppress all destructive operations (cp, rm, DB UPDATE).
-             Compatible with dump_now and sync_now.
+             Compatible with dump_now, sync_now and rollback.
   --force    Manual override for dump_now: ignore the MAX threshold and archive
              down to TARGET even if the library is below MAX.
 EOF
@@ -1514,7 +1516,15 @@ main() {
       backup_db_run --dry-run || true
       ;;
     rollback)
-      archive_rollback "${args[1]:-}"
+      # --force has no meaning here: a rollback undoes one run exactly as its
+      # journal recorded it, with nothing to override. Refused rather than
+      # accepted and dropped, which is the defect --dry-run had.
+      if "$force"; then
+        printf 'Error: rollback has no --force. It undoes one identified run, as recorded.\n\n' >&2
+        _usage >&2
+        exit 1
+      fi
+      archive_rollback "${dry_flag[@]}" "${args[1]:-}"
       ;;
     uninstall)
       # Handed to the standalone uninstaller, which relocates itself before

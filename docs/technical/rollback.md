@@ -50,6 +50,21 @@ path with `cat >` without looking at what was there.
 The rollback keeps **its own journal** (`RUNLOG_DIRECTION=rollback`): it is an operation in
 its own right, and the original file stays a truthful record of what that run did.
 
+### `--dry-run`
+
+Steps 1 to 4 run unchanged, lock included. The storage check is not ceremony here: reading
+the archived copies is most of what the preview does. Holding the lock is deliberate too —
+a real run moving the database underneath would make every answer the preview gives stale.
+
+What a preview does not do is write. No journal is opened, no `annule` mark is placed, no
+`runlog_rotate` deletes an old `.done`. The `annule` mark is the important one: it is what
+makes a rollback idempotent, so a simulation that placed it would convince the real
+rollback that the work was already undone.
+
+The cut is at the first write. The three per-entry checks below are all reads, so the
+preview runs every one of them and reports the same refusals the real rollback would raise,
+worded in the conditional.
+
 ## What it walks, and what it refuses
 
 Only entries that actually completed — state `source_supprimee` — have anything to undo.
