@@ -972,6 +972,11 @@ _setup() {
   # "Alice". Keyed as USER_MAP is, on storageLabel and otherwise on ownerId. The
   # first matching path wins, and a library with no import path is ignored.
   declare -A prefill_folder=()
+  # Every folder that user already has a library for, newline-separated, not just
+  # the one suggested: a user may own several libraries, and the report at the end
+  # has to know whether the folder actually chosen is among them. Folder names come
+  # from _sanitize_folder, so they never contain a newline.
+  declare -A prefill_all=()
   if _db_reachable; then
     local libs_raw lrow l_owner l_label l_path l_key l_rel
     libs_raw=$(db_get_external_libraries 2>/dev/null || true)
@@ -984,9 +989,11 @@ _setup() {
         [[ -z "$l_path" ]] && continue
         [[ "$l_path" != "${archive_container_path%/}"/* ]] && continue
         l_key="${l_label:-$l_owner}"
-        [[ -n "${prefill_folder["$l_key"]:-}" ]] && continue
         l_rel=$(_sanitize_folder "${l_path#"${archive_container_path%/}"/}")
-        [[ -n "$l_rel" ]] && prefill_folder["$l_key"]="$l_rel"
+        [[ -z "$l_rel" ]] && continue
+        prefill_all["$l_key"]="${prefill_all["$l_key"]:-}${l_rel}"$'\n'
+        [[ -n "${prefill_folder["$l_key"]:-}" ]] && continue
+        prefill_folder["$l_key"]="$l_rel"
       done
     fi
   fi
@@ -1175,8 +1182,12 @@ CONF
     else
       fld_failed+=("$host_dir")
     fi
-    # No library detected pointing here: it has to be added in Immich.
-    [[ -z "${prefill_folder[$k]:-}" ]] && immich_todo+=("$uname  →  $cpath")
+    # No library detected pointing at THIS folder: it has to be added in Immich.
+    # Asking only whether the user has some library under the archive path would
+    # pass a user who was offered one folder and typed another, and the run that
+    # followed would park every one of their assets.
+    [[ $'\n'"${prefill_all[$k]:-}" != *$'\n'"$folder"$'\n'* ]] \
+      && immich_todo+=("$uname  →  $cpath")
   done
 
   _cron_review
@@ -1196,12 +1207,12 @@ CONF
   fi
   if (( ${#immich_todo[@]} > 0 )); then
     printf '\nACTION REQUIRED in Immich (Administration → Libraries):\n'
-    printf 'These users have no external library pointed under %s yet.\n' "${archive_container_path%/}"
+    printf 'These users have no external library pointed at the folder chosen for them.\n'
     printf 'For each, add an External Library with the import path below and assign the owner\n'
     printf '(until then, Immich will not display the archived photos):\n'
     local t; for t in "${immich_todo[@]}"; do printf '  - %s\n' "$t"; done
   else
-    printf '\nAll users already have an external library pointed under %s.\n' "${archive_container_path%/}"
+    printf '\nAll users already have an external library pointed at the folder chosen for them.\n'
   fi
   printf '========================================\n\n'
 }
