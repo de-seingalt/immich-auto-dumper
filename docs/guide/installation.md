@@ -119,7 +119,8 @@ tool and its journals.
 | Cron output | `~/.local/state/immich-auto-dumper/cron.log` |
 
 `config.conf` is editable by hand. It is read as plain data and never executed, so nothing
-in it can run — see [the settings reference](../technical/configuration.md).
+in it can run, and comments belong on their own line — see
+[the settings reference](../technical/configuration.md).
 
 ---
 

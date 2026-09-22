@@ -6,16 +6,18 @@
 # substitution, no variable expansion, no shell syntax of any kind. Surrounding
 # quotes are optional and simply stripped. The two exceptions, substituted as
 # plain text in path settings, are a leading "~/" and a leading "$HOME/".
+# A comment is a line that starts with "#". A "#" after a value belongs to that
+# value, so comments live on their own line — as they do throughout this file.
 # Any setting not listed below is rejected by name, as is a value the setting
 # cannot hold — the tool refuses to run rather than act on half a configuration.
 
 # --- Immich ---
-IMMICH_UPLOAD_LOCATION="/path/to/immich/upload"  # Host path to UPLOAD_LOCATION
-IMMICH_DB_LIBRARY_PREFIX="/data/library"         # Absolute prefix of "originalPath" in the DB.
-                                                 # Auto-detected by setup: /data/library on current
-                                                 # Immich images, /usr/src/app/upload/library on
-                                                 # older ones — which is also the last-resort value
-                                                 # when nothing can be detected.
+# Host path to UPLOAD_LOCATION.
+IMMICH_UPLOAD_LOCATION="/path/to/immich/upload"
+# Absolute prefix of "originalPath" in the DB. Auto-detected by setup:
+# /data/library on current Immich images, /usr/src/app/upload/library on older
+# ones — which is also the last-resort value when nothing can be detected.
+IMMICH_DB_LIBRARY_PREFIX="/data/library"
 IMMICH_DB_CONTAINER="immich_postgres"
 IMMICH_SERVER_CONTAINER="immich_server"
 IMMICH_DB_NAME="immich"
@@ -40,14 +42,17 @@ ARCHIVE_STORAGE_ID=""
 # and stores the result here in MiB, so fractional-GB limits are possible.
 # (The older ARCHIVE_LIBRARY_MAX_GB / ARCHIVE_LIBRARY_TARGET_GB keys are still
 #  honored for backward compatibility if the *_MB keys are absent.)
-ARCHIVE_LIBRARY_MAX_MB=204800      # archiving starts when library/ exceeds this (=200 GiB)
-ARCHIVE_LIBRARY_TARGET_MB=153600   # archiving runs until library/ drops to this (=150 GiB)
+# Archiving starts when library/ exceeds this (204800 MiB = 200 GiB).
+ARCHIVE_LIBRARY_MAX_MB=204800
+# Archiving runs until library/ drops to this (153600 MiB = 150 GiB).
+ARCHIVE_LIBRARY_TARGET_MB=153600
 
 # Also archive (down to TARGET) if total free disk space on this filesystem drops
 # below this, regardless of library size — a safety net against other processes
 # (Postgres, Docker, logs...) filling the disk before the library ever hits MAX.
 # `setup` computes a recommended default from the disk size; 0 disables it.
-ARCHIVE_MIN_FREE_MB=10240           # e.g. 10 GiB
+# 10240 MiB = 10 GiB.
+ARCHIVE_MIN_FREE_MB=10240
 
 # --- DB backup ---
 # How many Immich database dumps to keep in $ARCHIVE_DEST_PATH/.immich-backup/.
@@ -56,7 +61,8 @@ ARCHIVE_MIN_FREE_MB=10240           # e.g. 10 GiB
 # defaults are a coincidence). `setup` reads Immich's value and suggests it, so the
 # mirror never drops a dump Immich still holds; keeping fewer than Immich does means
 # the oldest exist in one place only.
-BACKUP_RETENTION=14                # Number of dumps kept on the external storage
+# Number of dumps kept on the external storage.
+BACKUP_RETENTION=14
 
 # --- User → external folder mapping ---
 # One line per user, generated automatically by "setup"; can be edited manually.

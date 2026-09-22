@@ -176,6 +176,10 @@ passing.
 You can. It lives at `~/.local/share/immich-auto-dumper/config.conf` and it is read as
 plain data, never executed.
 
+Put comments on their own line. A `#` after a value is part of the value, since a folder
+name or a path is allowed to contain one — so `BACKUP_RETENTION=14  # keep two weeks` is
+read as the value `14  # keep two weeks`, and refused. The error says so when it happens.
+
 The user mapping looks like this:
 
 ```

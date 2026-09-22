@@ -224,7 +224,15 @@ config_load() {
       key="USER_MAP.$map_key"
     fi
 
-    config_set "$key" "$value" "$n" || rc=1
+    if ! config_set "$key" "$value" "$n"; then
+      rc=1
+      # The likeliest reason a value the tool cannot use carries a "#" after a
+      # blank: an end-of-line comment, which this file keeps as part of the
+      # value. Said here rather than left for the reader to infer from a
+      # rejection that quotes the comment back at them.
+      [[ "$value" == *[[:space:]]#* ]] && _cfg_reject "$n" \
+        "a '#' after a value is part of that value — put comments on their own line."
+    fi
   done < "$file"
 
   # An essential setting the file never assigns is not covered by any check

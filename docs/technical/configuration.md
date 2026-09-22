@@ -19,6 +19,11 @@ ever evaluated**. That non-interpretation is the entire point.
 What is stripped, as punctuation rather than interpreted:
 
 - one layer of surrounding quotes, single or double;
+- a whole line whose first non-blank character is `#`. Only a whole line: a `#` after a
+  value is an ordinary character of that value, because a folder or a path may legitimately
+  contain one and truncating it silently would be a worse failure than refusing it. A
+  setting that swallowed an end-of-line comment is therefore rejected on its own merits,
+  with a hint naming the cause;
 - a UTF-8 byte-order mark, on the first line only — anywhere else those bytes are part of
   a real name, and an unknown setting is exactly what they are. A BOM is invisible, so the
   refusal it caused sent people looking in the wrong place entirely.
