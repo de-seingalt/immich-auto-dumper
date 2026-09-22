@@ -357,21 +357,35 @@ mb_to_human() {
 }
 
 # mb_to_input <mb>  — compact value pre-filling an input box ("200G", "1.5G",
-# "512M"), which parse_size_to_mb accepts back verbatim.
+# "512M"). What it writes always reads back through parse_size_to_mb as the very
+# same number of MiB.
+#
+# That round-trip is the whole contract, because the value it produces pre-fills
+# a box the user is meant to accept by pressing Enter: a form that parsed back
+# to something else would quietly store a boundary other than the one the gauge
+# has just shown. Two decimals of GiB cannot name every whole MiB — 2990 used to
+# render as "2.91G" and read back as 2980 — so the short form is used only when
+# it is exact, and the exact MiB form carries the rest.
 mb_to_input() {
   local mb="${1:-0}"
   if (( mb == 0 )); then
     printf ''
-  elif (( mb % 1024 == 0 )); then
+    return 0
+  fi
+  if (( mb % 1024 == 0 )); then
     printf '%dG\n' "$(( mb / 1024 ))"
-  elif (( mb >= 1024 )); then
+    return 0
+  fi
+  if (( mb >= 1024 )); then
     # The GB form without its trailing zeros: 1.50 -> 1.5.
     local g; g=$(echo "scale=2; $mb / 1024" | bc)
     g="${g%0}"; g="${g%.}"
-    printf '%sG\n' "$g"
-  else
-    printf '%dM\n' "$mb"
+    if [[ "$(parse_size_to_mb "${g}G")" == "$mb" ]]; then
+      printf '%sG\n' "$g"
+      return 0
+    fi
   fi
+  printf '%dM\n' "$mb"
 }
 
 # ── Disk / library gauge ──────────────────────────────────────────────────────
